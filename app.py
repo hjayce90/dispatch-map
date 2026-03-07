@@ -19,8 +19,6 @@ TIME_COL_INDEX = 21   # V열
 CACHE_FILE = "geocode_cache.csv"
 DRIVER_FILE = "drivers.csv"
 MAP_DIR = "saved_maps"
-
-# 반드시 실제 배포 주소로 맞춰주세요
 APP_URL = "https://dispatch-map.streamlit.app"
 
 os.makedirs(MAP_DIR, exist_ok=True)
@@ -241,22 +239,20 @@ def add_layer_toggle_buttons(m):
     </style>
 
     <div class="layer-toggle-box">
-      <button type="button" onclick="toggleAllLayers_{map_name}(true)">전체선택</button>
-      <button type="button" onclick="toggleAllLayers_{map_name}(false)">전체해제</button>
+      <button onclick="toggleAllLayers_{map_name}(true)">전체선택</button>
+      <button onclick="toggleAllLayers_{map_name}(false)">전체해제</button>
     </div>
     """
 
     script_html = f"""
     <script>
-      function toggleAllLayers_{map_name}(showFlag) {{
-        var labels = document.querySelectorAll('.leaflet-control-layers-overlays label');
-
-        labels.forEach(function(label) {{
-          var checkbox = label.querySelector('input.leaflet-control-layers-selector');
-          if (!checkbox) return;
-
-          if (checkbox.checked !== showFlag) {{
-            label.click();
+      function toggleAllLayers_{map_name}(checked) {{
+        var selectors = document.querySelectorAll(
+          '.leaflet-control-layers-overlays input.leaflet-control-layers-selector'
+        );
+        selectors.forEach(function(cb) {{
+          if (cb.checked !== checked) {{
+            cb.click();
           }}
         }});
       }}
@@ -265,29 +261,6 @@ def add_layer_toggle_buttons(m):
 
     m.get_root().html.add_child(folium.Element(button_html))
     m.get_root().script.add_child(folium.Element(script_html))
-
-def add_standalone_map_fix(m, bounds=None):
-    map_name = m.get_name()
-
-    fit_bounds_js = ""
-    if bounds:
-        fit_bounds_js = f"{map_name}.fitBounds({bounds});"
-
-    script_html = f"""
-    <script>
-      window.addEventListener("load", function() {{
-        setTimeout(function() {{
-          try {{
-            {map_name}.invalidateSize(true);
-            {fit_bounds_js}
-          }} catch (e) {{
-            console.log("standalone map fix error:", e);
-          }}
-        }}, 800);
-      }});
-    </script>
-    """
-    m.get_root().html.add_child(folium.Element(script_html))
 
 # =========================
 # 시작
@@ -526,12 +499,7 @@ if uploaded_file:
     else:
         center_lat, center_lon = 37.55, 126.98
 
-    m = folium.Map(
-        location=[center_lat, center_lon],
-        zoom_start=10,
-        control_scale=True,
-        prefer_canvas=False
-    )
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=10)
 
     route_list = list(valid_result["route"].dropna().unique())
     route_color_map = {
@@ -637,21 +605,6 @@ if uploaded_file:
     folium.LayerControl(collapsed=False, position="topright").add_to(m)
     add_layer_toggle_buttons(m)
 
-    if len(valid_grouped) > 0:
-        lat_list = [c[0] for c in valid_grouped["coords"] if c is not None]
-        lon_list = [c[1] for c in valid_grouped["coords"] if c is not None]
-
-        if lat_list and lon_list:
-            bounds = [
-                [min(lat_list), min(lon_list)],
-                [max(lat_list), max(lon_list)]
-            ]
-            add_standalone_map_fix(m, bounds)
-        else:
-            add_standalone_map_fix(m)
-    else:
-        add_standalone_map_fix(m)
-
     marker_count = len(valid_grouped)
     st.write(f"지도에 찍힌 핀 수: {marker_count}")
 
@@ -668,24 +621,19 @@ if uploaded_file:
 
     st_folium(m, width=None, height=1000)
 
+    map_html = m.get_root().render()
+
     map_path = os.path.join(MAP_DIR, html_filename)
-
-    # 완전한 standalone HTML 저장
-    m.save(map_path)
-
-    # 저장된 파일 내용을 그대로 다운로드
-    with open(map_path, "rb") as f:
-        html_bytes = f.read()
+    with open(map_path, "w", encoding="utf-8") as f:
+        f.write(map_html)
 
     st.download_button(
         label=f"지도 다운로드 (HTML) - {html_filename}",
-        data=html_bytes,
+        data=map_html,
         file_name=html_filename,
         mime="text/html"
     )
 
     share_url = f"{APP_URL}/?map={html_filename}"
-
     st.subheader("지도 공유 링크")
     st.code(share_url)
-    st.caption("이 링크를 카카오톡으로 보내면 같은 지도를 바로 열 수 있습니다. 단, 서버 재시작 시 저장 파일이 사라질 수 있습니다.")
