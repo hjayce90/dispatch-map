@@ -19,7 +19,7 @@ TIME_COL_INDEX = 21   # V열
 CACHE_FILE = "geocode_cache.csv"
 DRIVER_FILE = "drivers.csv"
 MAP_DIR = "saved_maps"
-APP_URL = "https://dispatch-map.streamlit.app"  # 본인 배포 주소로 맞춰주세요
+APP_URL = "https://dispatch-map.streamlit.app"  # 본인 배포 주소
 
 os.makedirs(MAP_DIR, exist_ok=True)
 
@@ -269,7 +269,6 @@ if uploaded_file:
     route_total_map = result.groupby("route")["stop_order"].max().to_dict()
     truck_request_map = result.groupby("route")["truck_request_id"].first().to_dict()
 
-    # 루트별 총 수량
     route_qty_map = (
         result.groupby("route", as_index=True)
         .agg(
@@ -279,7 +278,6 @@ if uploaded_file:
         )
     )
 
-    # 라인 tooltip용: "트럭요청ID 0/0/1"
     route_line_label = {
         route: f"{truck_request_map.get(route, '')} {int(row['ae_sum'])}/{int(row['af_sum'])}/{int(row['ag_sum'])}"
         for route, row in route_qty_map.iterrows()
@@ -346,7 +344,6 @@ if uploaded_file:
     grouped = pd.concat([grouped_normal, camp_markers], ignore_index=True, sort=False)
     grouped = grouped.sort_values(["route", "first_stop"]).reset_index(drop=True)
 
-    # 좌표 변환
     result["coords"] = result["address"].apply(lambda x: geocode_kakao(x, KAKAO_API_KEY, cache))
     grouped["coords"] = grouped["address"].apply(lambda x: geocode_kakao(x, KAKAO_API_KEY, cache))
 
@@ -363,9 +360,6 @@ if uploaded_file:
         .reset_index(drop=True)
     )
 
-    # =========================
-    # 기사 배정
-    # =========================
     st.subheader("기사 배정")
     st.caption("route / truck_request_id / 총정차수 / 소형 / 중+대 / 기사")
 
@@ -406,9 +400,6 @@ if uploaded_file:
     grouped["assigned_driver"] = grouped["route"].map(route_driver_map)
     route_summary["assigned_driver"] = route_summary["route"].map(route_driver_map)
 
-    # =========================
-    # 기사 필터
-    # =========================
     st.subheader("기사별 필터")
     driver_filter_options = ["전체", "미배정"] + drivers
     selected_filter = st.selectbox("지도 표시 대상", driver_filter_options)
@@ -429,9 +420,6 @@ if uploaded_file:
     valid_result = map_result[map_result["coords"].notna()].copy()
     valid_grouped = map_grouped[map_grouped["coords"].notna()].copy()
 
-    # =========================
-    # 배정 결과표
-    # =========================
     st.subheader("배정 결과표")
     st.dataframe(assignment_df, use_container_width=True)
 
@@ -443,9 +431,6 @@ if uploaded_file:
         mime="text/csv"
     )
 
-    # =========================
-    # 지도
-    # =========================
     st.subheader("지도")
     st.write(f"캐시 주소 수: {len(cache)}")
     st.write(f"현재 필터: {selected_filter}")
@@ -467,7 +452,6 @@ if uploaded_file:
 
     route_debug = []
 
-    # 루트별 레이어 생성
     for route in route_list:
         truck_request_id = truck_request_map.get(route, "")
 
@@ -478,7 +462,6 @@ if uploaded_file:
 
         route_df_all = map_result[map_result["route"] == route].sort_values("stop_order")
 
-        # 캠프 제외한 일반 stop만 라인 생성
         route_df_line = map_result[
             (map_result["route"] == route) &
             (map_result["is_camp"] == False) &
@@ -515,7 +498,6 @@ if uploaded_file:
                 tooltip=route_line_label.get(route, truck_request_id)
             ).add_to(route_group)
 
-        # 루트별 마커
         route_grouped = valid_grouped[valid_grouped["route"] == route].copy()
 
         for _, row in route_grouped.iterrows():
@@ -595,6 +577,9 @@ if uploaded_file:
         mime="text/html"
     )
 
-    share_url = f"{APP_URL}/?map={html_filename}"
+    share_url = f"{APP_URL}?map={html_filename}"
+
     st.subheader("지도 공유 링크")
-    st.code(share_url)
+    st.success("아래 링크를 복사해서 바로 공유하시면 됩니다.")
+    st.markdown(f"### [🔗 지도 바로 열기]({share_url})")
+    st.text_input("공유 URL", value=share_url, key="share_url_box")
