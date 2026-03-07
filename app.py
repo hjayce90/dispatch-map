@@ -242,20 +242,22 @@ def add_layer_toggle_buttons(m):
     </style>
 
     <div class="layer-toggle-box">
-      <button onclick="toggleAllLayers_{map_name}(true)">전체선택</button>
-      <button onclick="toggleAllLayers_{map_name}(false)">전체해제</button>
+      <button type="button" onclick="toggleAllLayers_{map_name}(true)">전체선택</button>
+      <button type="button" onclick="toggleAllLayers_{map_name}(false)">전체해제</button>
     </div>
     """
 
     script_html = f"""
     <script>
-      function toggleAllLayers_{map_name}(checked) {{
-        var selectors = document.querySelectorAll(
-          '.leaflet-control-layers-overlays input.leaflet-control-layers-selector'
-        );
-        selectors.forEach(function(cb) {{
-          if (cb.checked !== checked) {{
-            cb.click();
+      function toggleAllLayers_{map_name}(showFlag) {{
+        var labels = document.querySelectorAll('.leaflet-control-layers-overlays label');
+
+        labels.forEach(function(label) {{
+          var checkbox = label.querySelector('input.leaflet-control-layers-selector');
+          if (!checkbox) return;
+
+          if (checkbox.checked !== showFlag) {{
+            label.click();
           }}
         }});
       }}
@@ -642,3 +644,4 @@ if uploaded_file:
     st.subheader("지도 공유 링크")
     st.code(share_url)
     st.caption("이 링크를 카카오톡으로 보내면 같은 지도를 바로 열 수 있습니다. 단, 서버 재시작 시 저장 파일이 사라질 수 있습니다.")
+
