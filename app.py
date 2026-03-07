@@ -2,6 +2,7 @@ import os
 import re
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import folium
 from folium.features import DivIcon
@@ -17,6 +18,12 @@ KAKAO_API_KEY = "080375c5f09bbb8c7db9f368bc752d33"
 TIME_COL_INDEX = 21   # V열
 CACHE_FILE = "geocode_cache.csv"
 DRIVER_FILE = "drivers.csv"
+MAP_DIR = "saved_maps"
+
+# 배포된 실제 주소로 바꿔주세요
+APP_URL = "https://dispatch-map.streamlit.app"
+
+os.makedirs(MAP_DIR, exist_ok=True)
 
 uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx"])
 
@@ -38,6 +45,25 @@ ROUTE_COLORS = [
     "#00acc1",
     "#c0ca33",
 ]
+
+# =========================
+# 공유 링크로 직접 지도 열기
+# 예: https://dispatch-map.streamlit.app/?map=20260309.html
+# =========================
+query_params = st.query_params
+shared_map = query_params.get("map")
+
+if shared_map:
+    shared_map_path = os.path.join(MAP_DIR, shared_map)
+
+    if os.path.exists(shared_map_path):
+        st.subheader(f"공유 지도: {shared_map}")
+        with open(shared_map_path, "r", encoding="utf-8") as f:
+            shared_html = f.read()
+        components.html(shared_html, height=1000, scrolling=True)
+    else:
+        st.error("저장된 공유 지도를 찾을 수 없습니다. 서버 재시작 등으로 파일이 사라졌을 수 있습니다.")
+    st.stop()
 
 # =========================
 # 공통 함수
@@ -600,7 +626,8 @@ if uploaded_file:
 
     map_html = m.get_root().render()
 
-    with open(html_filename, "w", encoding="utf-8") as f:
+    map_path = os.path.join(MAP_DIR, html_filename)
+    with open(map_path, "w", encoding="utf-8") as f:
         f.write(map_html)
 
     st.download_button(
@@ -609,3 +636,9 @@ if uploaded_file:
         file_name=html_filename,
         mime="text/html"
     )
+
+    share_url = f"{APP_URL}/?map={html_filename}"
+
+    st.subheader("지도 공유 링크")
+    st.code(share_url)
+    st.caption("이 링크를 카카오톡으로 보내면 같은 지도를 바로 열 수 있습니다. 단, 서버 재시작 시 저장 파일이 사라질 수 있습니다.")
