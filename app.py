@@ -626,15 +626,18 @@ if uploaded_file:
 
     st_folium(m, width=None, height=1000)
 
-    map_html = m.get_root().render()
+        map_path = os.path.join(MAP_DIR, html_filename)
 
-    map_path = os.path.join(MAP_DIR, html_filename)
-    with open(map_path, "w", encoding="utf-8") as f:
-        f.write(map_html)
+    # HTML 파일을 완전한 문서 형태로 저장
+    m.save(map_path)
+
+    # 다운로드용 바이트 읽기
+    with open(map_path, "rb") as f:
+        html_bytes = f.read()
 
     st.download_button(
         label=f"지도 다운로드 (HTML) - {html_filename}",
-        data=map_html,
+        data=html_bytes,
         file_name=html_filename,
         mime="text/html"
     )
@@ -644,4 +647,3 @@ if uploaded_file:
     st.subheader("지도 공유 링크")
     st.code(share_url)
     st.caption("이 링크를 카카오톡으로 보내면 같은 지도를 바로 열 수 있습니다. 단, 서버 재시작 시 저장 파일이 사라질 수 있습니다.")
-
