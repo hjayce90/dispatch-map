@@ -20,7 +20,7 @@ CACHE_FILE = "geocode_cache.csv"
 DRIVER_FILE = "drivers.csv"
 MAP_DIR = "saved_maps"
 
-# 본인 Streamlit 배포 주소로 바꿔주세요
+# 반드시 실제 배포 주소로 맞춰주세요
 APP_URL = "https://dispatch-map.streamlit.app"
 
 os.makedirs(MAP_DIR, exist_ok=True)
@@ -63,6 +63,7 @@ if shared_map:
         components.html(shared_html, height=1000, scrolling=True)
     else:
         st.error("저장된 공유 지도를 찾을 수 없습니다. 서버 재시작 등으로 파일이 사라졌을 수 있습니다.")
+
     st.stop()
 
 # =========================
@@ -266,6 +267,17 @@ def add_layer_toggle_buttons(m):
 
     m.get_root().html.add_child(folium.Element(button_html))
     m.get_root().script.add_child(folium.Element(script_html))
+
+def build_full_map_html(m):
+    figure = folium.Figure()
+    figure.add_child(m)
+    return figure.render()
+
+def save_full_map_html(m, file_path):
+    full_html = build_full_map_html(m)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(full_html)
+    return full_html
 
 # =========================
 # 시작
@@ -627,12 +639,8 @@ if uploaded_file:
     st_folium(m, width=None, height=1000)
 
     map_path = os.path.join(MAP_DIR, html_filename)
-
-    # 문자열 render 대신 완전한 HTML 문서로 저장
-    m.save(map_path)
-
-    with open(map_path, "rb") as f:
-        html_bytes = f.read()
+    full_html = save_full_map_html(m, map_path)
+    html_bytes = full_html.encode("utf-8")
 
     st.download_button(
         label=f"지도 다운로드 (HTML) - {html_filename}",
