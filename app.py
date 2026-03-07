@@ -48,7 +48,6 @@ ROUTE_COLORS = [
 
 # =========================
 # 공유 링크로 직접 지도 열기
-# 예: https://dispatch-map.streamlit.app/?map=20260309.html
 # =========================
 query_params = st.query_params
 shared_map = query_params.get("map")
@@ -57,7 +56,6 @@ if shared_map:
     shared_map_path = os.path.join(MAP_DIR, shared_map)
 
     if os.path.exists(shared_map_path):
-        st.subheader(f"공유 지도: {shared_map}")
         with open(shared_map_path, "r", encoding="utf-8") as f:
             shared_html = f.read()
         components.html(shared_html, height=1000, scrolling=True)
@@ -268,16 +266,28 @@ def add_layer_toggle_buttons(m):
     m.get_root().html.add_child(folium.Element(button_html))
     m.get_root().script.add_child(folium.Element(script_html))
 
-def build_full_map_html(m):
-    figure = folium.Figure()
-    figure.add_child(m)
-    return figure.render()
+def add_standalone_map_fix(m, bounds=None):
+    map_name = m.get_name()
 
-def save_full_map_html(m, file_path):
-    full_html = build_full_map_html(m)
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(full_html)
-    return full_html
+    fit_bounds_js = ""
+    if bounds:
+        fit_bounds_js = f"{map_name}.fitBounds({bounds});"
+
+    script_html = f"""
+    <script>
+      window.addEventListener("load", function() {{
+        setTimeout(function() {{
+          try {{
+            {map_name}.invalidateSize(true);
+            {fit_bounds_js}
+          }} catch (e) {{
+            console.log("standalone map fix error:", e);
+          }}
+        }}, 800);
+      }});
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(script_html))
 
 # =========================
 # 시작
@@ -516,7 +526,12 @@ if uploaded_file:
     else:
         center_lat, center_lon = 37.55, 126.98
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=10)
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=10,
+        control_scale=True,
+        prefer_canvas=False
+    )
 
     route_list = list(valid_result["route"].dropna().unique())
     route_color_map = {
@@ -622,6 +637,21 @@ if uploaded_file:
     folium.LayerControl(collapsed=False, position="topright").add_to(m)
     add_layer_toggle_buttons(m)
 
+    if len(valid_grouped) > 0:
+        lat_list = [c[0] for c in valid_grouped["coords"] if c is not None]
+        lon_list = [c[1] for c in valid_grouped["coords"] if c is not None]
+
+        if lat_list and lon_list:
+            bounds = [
+                [min(lat_list), min(lon_list)],
+                [max(lat_list), max(lon_list)]
+            ]
+            add_standalone_map_fix(m, bounds)
+        else:
+            add_standalone_map_fix(m)
+    else:
+        add_standalone_map_fix(m)
+
     marker_count = len(valid_grouped)
     st.write(f"지도에 찍힌 핀 수: {marker_count}")
 
@@ -639,8 +669,13 @@ if uploaded_file:
     st_folium(m, width=None, height=1000)
 
     map_path = os.path.join(MAP_DIR, html_filename)
-    full_html = save_full_map_html(m, map_path)
-    html_bytes = full_html.encode("utf-8")
+
+    # 완전한 standalone HTML 저장
+    m.save(map_path)
+
+    # 저장된 파일 내용을 그대로 다운로드
+    with open(map_path, "rb") as f:
+        html_bytes = f.read()
 
     st.download_button(
         label=f"지도 다운로드 (HTML) - {html_filename}",
