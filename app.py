@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -178,6 +179,58 @@ def make_stop_div_icon(route_color: str, stop_text: str):
     """
     return DivIcon(html=html, icon_size=(24, 24), icon_anchor=(12, 12))
 
+def make_assigned_triangle_icon(route_color: str, stop_text: str):
+    html = f"""
+    <div style="
+        position: relative;
+        width: 0;
+        height: 0;
+        border-left: 14px solid transparent;
+        border-right: 14px solid transparent;
+        border-bottom: 26px solid {route_color};
+        filter: drop-shadow(0 0 3px rgba(0,0,0,0.45));
+    ">
+        <div style="
+            position:absolute;
+            top:7px;
+            left:-8px;
+            width:16px;
+            text-align:center;
+            color:#ffffff;
+            font-size:10px;
+            font-weight:700;
+            line-height:1;
+        ">{stop_text}</div>
+    </div>
+    """
+    return DivIcon(html=html, icon_size=(28, 26), icon_anchor=(14, 22))
+
+def make_assigned_triangle_camp_icon(route_color: str, number_text: str):
+    html = f"""
+    <div style="
+        position: relative;
+        width: 0;
+        height: 0;
+        border-left: 14px solid transparent;
+        border-right: 14px solid transparent;
+        border-bottom: 26px solid {route_color};
+        filter: drop-shadow(0 0 3px rgba(0,0,0,0.45));
+    ">
+        <div style="
+            position:absolute;
+            top:7px;
+            left:-8px;
+            width:16px;
+            text-align:center;
+            color:#ffffff;
+            font-size:10px;
+            font-weight:700;
+            line-height:1;
+        ">{number_text}</div>
+    </div>
+    """
+    return DivIcon(html=html, icon_size=(28, 26), icon_anchor=(14, 22))
+
 def format_time_value(value):
     if pd.isna(value):
         return ""
@@ -204,6 +257,14 @@ def format_time_value(value):
         pass
 
     return text
+
+def safe_int(v):
+    try:
+        if pd.isna(v):
+            return 0
+        return int(float(v))
+    except Exception:
+        return 0
 
 # =========================
 # 시작
@@ -266,6 +327,14 @@ if uploaded_file:
 
     result = pd.DataFrame(parsed)
 
+    if len(result) == 0:
+        st.warning("유효한 주소 데이터가 없습니다.")
+        st.stop()
+
+    result["ae"] = pd.to_numeric(result["ae"], errors="coerce").fillna(0)
+    result["af"] = pd.to_numeric(result["af"], errors="coerce").fillna(0)
+    result["ag"] = pd.to_numeric(result["ag"], errors="coerce").fillna(0)
+
     route_total_map = result.groupby("route")["stop_order"].max().to_dict()
     truck_request_map = result.groupby("route")["truck_request_id"].first().to_dict()
 
@@ -279,7 +348,7 @@ if uploaded_file:
     )
 
     route_line_label = {
-        route: f"{truck_request_map.get(route, '')} {int(row['ae_sum'])}/{int(row['af_sum'])}/{int(row['ag_sum'])}"
+        route: f"{truck_request_map.get(route, '')} {safe_int(row['ae_sum'])}/{safe_int(row['af_sum'])}/{safe_int(row['ag_sum'])}"
         for route, row in route_qty_map.iterrows()
     }
 
@@ -307,11 +376,11 @@ if uploaded_file:
     if len(grouped_normal) > 0:
         grouped_normal["route_total"] = grouped_normal["route"].map(route_total_map)
         grouped_normal["label"] = grouped_normal.apply(
-            lambda r: f"{int(r['first_stop'])}/{int(r['route_total'])} - {int(r['ae_sum'])}.{int(r['af_sum'])}.{int(r['ag_sum'])}",
+            lambda r: f"{safe_int(r['first_stop'])}/{safe_int(r['route_total'])} - {safe_int(r['ae_sum'])}.{safe_int(r['af_sum'])}.{safe_int(r['ag_sum'])}",
             axis=1
         )
         grouped_normal["hover_text"] = grouped_normal.apply(
-            lambda r: f"{r['first_time']} {int(r['ae_sum'])}/{int(r['af_sum'])}/{int(r['ag_sum'])}".strip(),
+            lambda r: f"{r['first_time']} {safe_int(r['ae_sum'])}/{safe_int(r['af_sum'])}/{safe_int(r['ag_sum'])}".strip(),
             axis=1
         )
     else:
@@ -329,7 +398,7 @@ if uploaded_file:
         camp_markers["ag_sum"] = camp_markers["ag"]
         camp_markers["route_total"] = camp_markers["route"].map(route_total_map)
         camp_markers["label"] = camp_markers.apply(
-            lambda r: f"{int(r['first_stop'])}/{int(r['route_total'])} - CAMP",
+            lambda r: f"{safe_int(r['first_stop'])}/{safe_int(r['route_total'])} - CAMP",
             axis=1
         )
         camp_markers["hover_text"] = camp_markers.apply(
@@ -344,6 +413,7 @@ if uploaded_file:
     grouped = pd.concat([grouped_normal, camp_markers], ignore_index=True, sort=False)
     grouped = grouped.sort_values(["route", "first_stop"]).reset_index(drop=True)
 
+    # 좌표 변환
     result["coords"] = result["address"].apply(lambda x: geocode_kakao(x, KAKAO_API_KEY, cache))
     grouped["coords"] = grouped["address"].apply(lambda x: geocode_kakao(x, KAKAO_API_KEY, cache))
 
@@ -351,7 +421,6 @@ if uploaded_file:
         result.groupby(["route", "truck_request_id"], as_index=False)
         .agg(
             총정차수=("address", "count"),
-            캠프수=("is_camp", "sum"),
             소형합=("ae", "sum"),
             중형합=("af", "sum"),
             대형합=("ag", "sum"),
@@ -359,9 +428,13 @@ if uploaded_file:
         .sort_values("route")
         .reset_index(drop=True)
     )
+    route_summary["총합"] = route_summary["소형합"] + route_summary["중형합"] + route_summary["대형합"]
 
+    # =========================
+    # 기사 배정
+    # =========================
     st.subheader("기사 배정")
-    st.caption("route / truck_request_id / 총정차수 / 소형 / 중+대 / 기사")
+    st.caption("route / truck_request_id / 총정차수 / 소형 / 중형 / 대형 / 총합 / 기사")
 
     assignment_rows = []
 
@@ -369,14 +442,16 @@ if uploaded_file:
         route = row["route"]
         truck_request_id = row["truck_request_id"]
 
-        c1, c2, c3, c4, c5, c6 = st.columns([1.2, 1.2, 0.8, 0.8, 0.8, 1.4])
+        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.0, 1.3, 0.9, 0.8, 0.8, 0.8, 0.9, 1.4])
         c1.write(str(route))
         c2.write(str(truck_request_id))
-        c3.write(int(row["총정차수"]))
-        c4.write(int(row["소형합"]))
-        c5.write(int(row["중형합"] + row["대형합"]))
+        c3.write(safe_int(row["총정차수"]))
+        c4.write(safe_int(row["소형합"]))
+        c5.write(safe_int(row["중형합"]))
+        c6.write(safe_int(row["대형합"]))
+        c7.write(safe_int(row["총합"]))
 
-        selected_driver = c6.selectbox(
+        selected_driver = c8.selectbox(
             f"기사선택_{route}",
             options=[""] + drivers,
             index=0,
@@ -386,10 +461,11 @@ if uploaded_file:
         assignment_rows.append({
             "route": route,
             "truck_request_id": truck_request_id,
-            "총정차수": int(row["총정차수"]),
-            "소형합": int(row["소형합"]),
-            "중형합": int(row["중형합"]),
-            "대형합": int(row["대형합"]),
+            "총정차수": safe_int(row["총정차수"]),
+            "소형합": safe_int(row["소형합"]),
+            "중형합": safe_int(row["중형합"]),
+            "대형합": safe_int(row["대형합"]),
+            "총합": safe_int(row["총합"]),
             "assigned_driver": selected_driver
         })
 
@@ -400,6 +476,9 @@ if uploaded_file:
     grouped["assigned_driver"] = grouped["route"].map(route_driver_map)
     route_summary["assigned_driver"] = route_summary["route"].map(route_driver_map)
 
+    # =========================
+    # 기사별 필터
+    # =========================
     st.subheader("기사별 필터")
     driver_filter_options = ["전체", "미배정"] + drivers
     selected_filter = st.selectbox("지도 표시 대상", driver_filter_options)
@@ -407,34 +486,23 @@ if uploaded_file:
     if selected_filter == "전체":
         map_result = result.copy()
         map_grouped = grouped.copy()
-        map_route_summary = route_summary.copy()
     elif selected_filter == "미배정":
         map_result = result[result["assigned_driver"].fillna("") == ""].copy()
         map_grouped = grouped[grouped["assigned_driver"].fillna("") == ""].copy()
-        map_route_summary = route_summary[route_summary["assigned_driver"].fillna("") == ""].copy()
     else:
         map_result = result[result["assigned_driver"] == selected_filter].copy()
         map_grouped = grouped[grouped["assigned_driver"] == selected_filter].copy()
-        map_route_summary = route_summary[route_summary["assigned_driver"] == selected_filter].copy()
 
     valid_result = map_result[map_result["coords"].notna()].copy()
     valid_grouped = map_grouped[map_grouped["coords"].notna()].copy()
 
-    st.subheader("배정 결과표")
-    st.dataframe(assignment_df, use_container_width=True)
-
-    csv_data = assignment_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        "배정 결과 CSV 다운로드",
-        data=csv_data,
-        file_name="route_assignment.csv",
-        mime="text/csv"
-    )
-
+    # =========================
+    # 지도 (최우선)
+    # =========================
     st.subheader("지도")
     st.write(f"캐시 주소 수: {len(cache)}")
     st.write(f"현재 필터: {selected_filter}")
-    st.caption("오른쪽 상단 LayerControl에서 루트별로 켜고 끌 수 있습니다. HTML 다운로드 파일에서도 동일하게 동작합니다.")
+    st.caption("기사 미배정은 루트별 색상+원형+실선, 기사 배정 후에는 같은 기사면 같은 색상+삼각형+점선으로 표시됩니다.")
 
     if len(valid_result) > 0:
         center_lat = valid_result.iloc[0]["coords"][0]
@@ -450,7 +518,14 @@ if uploaded_file:
         for i, route in enumerate(route_list)
     }
 
-    route_debug = []
+    driver_list = [
+        d for d in valid_result["assigned_driver"].fillna("").unique().tolist()
+        if str(d).strip() != ""
+    ]
+    driver_color_map = {
+        driver: ROUTE_COLORS[(i + len(route_list)) % len(ROUTE_COLORS)]
+        for i, driver in enumerate(driver_list)
+    }
 
     for route in route_list:
         truck_request_id = truck_request_map.get(route, "")
@@ -459,8 +534,6 @@ if uploaded_file:
             name=f"{route} | {truck_request_id}",
             show=True
         )
-
-        route_df_all = map_result[map_result["route"] == route].sort_values("stop_order")
 
         route_df_line = map_result[
             (map_result["route"] == route) &
@@ -473,13 +546,13 @@ if uploaded_file:
             lat, lon = row["coords"]
             line_points.append([lat, lon])
 
-        route_debug.append({
-            "route": route,
-            "truck_request_id": truck_request_id,
-            "전체정차수": len(route_df_all),
-            "라인용좌표수(캠프제외)": len(route_df_line),
-            "라인생성여부": "Y" if len(line_points) >= 2 else "N"
-        })
+        route_driver = route_driver_map.get(route, "")
+        is_assigned_route = str(route_driver).strip() != ""
+
+        if is_assigned_route:
+            line_color = driver_color_map.get(route_driver, "#1e88e5")
+        else:
+            line_color = route_color_map.get(route, "#1e88e5")
 
         if len(line_points) >= 2:
             folium.PolyLine(
@@ -487,22 +560,31 @@ if uploaded_file:
                 color="#111111",
                 weight=8,
                 opacity=0.55,
-                tooltip=route_line_label.get(route, truck_request_id)
+                tooltip=route_line_label.get(route, truck_request_id),
+                dash_array="10, 8" if is_assigned_route else None
             ).add_to(route_group)
 
             folium.PolyLine(
                 line_points,
-                color=route_color_map[route],
+                color=line_color,
                 weight=5,
                 opacity=0.95,
-                tooltip=route_line_label.get(route, truck_request_id)
+                tooltip=route_line_label.get(route, truck_request_id),
+                dash_array="10, 8" if is_assigned_route else None
             ).add_to(route_group)
 
         route_grouped = valid_grouped[valid_grouped["route"] == route].copy()
 
         for _, row in route_grouped.iterrows():
             lat, lon = row["coords"]
-            route_color = route_color_map.get(route, "#1e88e5")
+            driver_name = row.get("assigned_driver", "")
+            is_assigned_pin = str(driver_name).strip() != ""
+
+            if is_assigned_pin:
+                pin_color = driver_color_map.get(driver_name, "#1e88e5")
+            else:
+                pin_color = route_color_map.get(route, "#1e88e5")
+
             is_camp = bool(row["is_camp"])
 
             if is_camp:
@@ -513,14 +595,19 @@ if uploaded_file:
                 <b>기사:</b> {row.get('assigned_driver', '')}<br>
                 <b>캠프명:</b> {row['company_name']}<br>
                 <b>주소:</b> {row['address']}<br>
-                <b>순서:</b> {int(row['first_stop'])}/{int(row['route_total'])}
+                <b>순서:</b> {safe_int(row['first_stop'])}/{safe_int(row['route_total'])}
                 """
+
+                if is_assigned_pin:
+                    icon_obj = make_assigned_triangle_camp_icon(pin_color, camp_no)
+                else:
+                    icon_obj = make_camp_div_icon(camp_no)
 
                 folium.Marker(
                     [lat, lon],
                     popup=popup_html,
                     tooltip=row["hover_text"],
-                    icon=make_camp_div_icon(camp_no)
+                    icon=icon_obj
                 ).add_to(route_group)
 
             else:
@@ -531,16 +618,21 @@ if uploaded_file:
                 <b>업체ID:</b> {row['company_id']}<br>
                 <b>업체명:</b> {row['company_name']}<br>
                 <b>주소:</b> {row['address']}<br>
-                <b>순서:</b> {int(row['first_stop'])}/{int(row['route_total'])}<br>
-                <b>건수:</b> {row['stop_count']}<br>
-                <b>물량:</b> {int(row['ae_sum'])}.{int(row['af_sum'])}.{int(row['ag_sum'])}
+                <b>순서:</b> {safe_int(row['first_stop'])}/{safe_int(row['route_total'])}<br>
+                <b>건수:</b> {safe_int(row['stop_count'])}<br>
+                <b>물량:</b> {safe_int(row['ae_sum'])}.{safe_int(row['af_sum'])}.{safe_int(row['ag_sum'])}
                 """
+
+                if is_assigned_pin:
+                    icon_obj = make_assigned_triangle_icon(pin_color, str(safe_int(row["first_stop"])))
+                else:
+                    icon_obj = make_stop_div_icon(pin_color, str(safe_int(row["first_stop"])))
 
                 folium.Marker(
                     [lat, lon],
                     popup=popup_html,
                     tooltip=row["hover_text"],
-                    icon=make_stop_div_icon(route_color, str(int(row["first_stop"])))
+                    icon=icon_obj
                 ).add_to(route_group)
 
         route_group.add_to(m)
@@ -550,18 +642,7 @@ if uploaded_file:
     marker_count = len(valid_grouped)
     st.write(f"지도에 찍힌 핀 수: {marker_count}")
 
-    st.subheader("루트별 좌표 상태")
-    st.dataframe(pd.DataFrame(route_debug), use_container_width=True)
-
-    failed_rows = map_result[map_result["coords"].isna()][["route", "truck_request_id", "stop_order", "company_name", "address", "is_camp"]].copy()
-    if len(failed_rows) > 0:
-        st.subheader("좌표 변환 실패 목록")
-        st.dataframe(failed_rows, use_container_width=True)
-
-    st.subheader("루트 요약")
-    st.dataframe(map_route_summary, use_container_width=True)
-
-    st_folium(m, width=None, height=1000)
+    st_folium(m, width=None, height=900)
 
     # HTML 저장 + 다운로드
     map_html = m.get_root().render()
@@ -583,3 +664,38 @@ if uploaded_file:
     st.success("아래 링크를 복사해서 바로 공유하시면 됩니다.")
     st.markdown(f"### [🔗 지도 바로 열기]({share_url})")
     st.text_input("공유 URL", value=share_url, key="share_url_box")
+
+    # =========================
+    # 기사별 할당표
+    # =========================
+    st.subheader("기사 할당표")
+
+    assigned_only = assignment_df.copy()
+    assigned_only["assigned_driver"] = assigned_only["assigned_driver"].fillna("").astype(str)
+
+    assigned_summary = (
+        assigned_only[assigned_only["assigned_driver"].str.strip() != ""]
+        .groupby("assigned_driver", as_index=False)
+        .agg(
+            담당루트수=("route", "count"),
+            소형합=("소형합", "sum"),
+            중형합=("중형합", "sum"),
+            대형합=("대형합", "sum"),
+            총박스합계=("총합", "sum")
+        )
+        .sort_values(["assigned_driver"])
+        .reset_index(drop=True)
+    )
+
+    if len(assigned_summary) == 0:
+        st.info("아직 기사 배정이 없습니다.")
+    else:
+        st.dataframe(assigned_summary, use_container_width=True)
+
+    csv_data = assignment_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        "기사 배정표 CSV 다운로드",
+        data=csv_data,
+        file_name="route_assignment.csv",
+        mime="text/csv"
+    )
