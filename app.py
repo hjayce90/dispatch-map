@@ -158,12 +158,17 @@ def extract_camp_number(name: str) -> str:
     return "C"
 
 def route_index_to_label(n: int) -> str:
-    # 1 -> A, 26 -> Z, 27 -> AA
     label = ""
     while n > 0:
         n, rem = divmod(n - 1, 26)
         label = chr(65 + rem) + label
     return label
+
+def short_driver_name(name: str) -> str:
+    text = str(name).strip()
+    if not text:
+        return ""
+    return text[-2:]
 
 def make_camp_div_icon(number_text: str):
     html = f"""
@@ -443,7 +448,6 @@ if uploaded_file:
         how="left"
     )
 
-    # 라우트 prefix (A, B, C ... / AA ...)
     all_routes_sorted = sorted(result["route"].dropna().astype(str).unique().tolist())
     route_prefix_map = {
         route: route_index_to_label(i + 1)
@@ -456,7 +460,6 @@ if uploaded_file:
         axis=1
     )
 
-    # route 전체 집 수
     route_total_map = result.groupby("route")["house_order"].max().to_dict()
     truck_request_map = result.groupby("route")["truck_request_id"].first().to_dict()
 
@@ -546,16 +549,9 @@ if uploaded_file:
     grouped = pd.concat([grouped_normal, camp_markers], ignore_index=True, sort=False)
     grouped = grouped.sort_values(["route", "house_order"]).reset_index(drop=True)
 
-    # 좌표 변환
     result["coords"] = result["address"].apply(lambda x: geocode_kakao(x, KAKAO_API_KEY, cache))
     grouped["coords"] = grouped["address"].apply(lambda x: geocode_kakao(x, KAKAO_API_KEY, cache))
 
-    # =========================
-    # 기사 배정표용 요약
-    # 같은 주소는 한 스톱
-    # 시작시간 = 가장 이른 시간
-    # 종료시간 = 가장 늦은 시간
-    # =========================
     route_time_summary = (
         result.groupby(["route"], as_index=False)
         .agg(
@@ -601,12 +597,8 @@ if uploaded_file:
     route_summary["시작시간"] = route_summary["start_min"].apply(min_to_hhmm)
     route_summary["종료시간"] = route_summary["end_max"].apply(min_to_hhmm)
 
-    # =========================
-    # 지도 (최상단 핵심)
-    # =========================
     st.subheader("지도")
 
-    # 기사 배정 먼저 생성
     st.subheader("기사 배정")
     st.caption("route / 구분 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
 
@@ -655,7 +647,6 @@ if uploaded_file:
     result["assigned_driver"] = result["route"].map(route_driver_map)
     grouped["assigned_driver"] = grouped["route"].map(route_driver_map)
 
-    # 기사별 필터
     st.subheader("기사별 필터")
     driver_filter_options = ["전체", "미배정"] + drivers
     selected_filter = st.selectbox("지도 표시 대상", driver_filter_options)
@@ -675,7 +666,7 @@ if uploaded_file:
 
     st.write(f"캐시 주소 수: {len(cache)}")
     st.write(f"현재 필터: {selected_filter}")
-    st.caption("미할당: 루트별 색 + 원형핀 + 실선 / 할당됨: 기사별 같은 색 + 삼각핀 + 점선 / 핀번호: A1, A2 ...")
+    st.caption("미할당: 루트별 색 + 원형핀 + 실선 / 할당됨: 기사별 같은 색 + 삼각핀 + 점선 / 핀번호: 미할당은 A1, 할당은 기사명 뒤 2글자")
 
     if len(valid_result) > 0:
         center_lat = valid_result.iloc[0]["coords"][0]
@@ -801,11 +792,11 @@ if uploaded_file:
                 <b>물량:</b> {safe_int(row['ae_sum'])}.{safe_int(row['af_sum'])}.{safe_int(row['ag_sum'])}
                 """
 
-                pin_text = str(row.get("pin_label", ""))
-
                 if is_assigned_pin:
+                    pin_text = short_driver_name(driver_name)
                     icon_obj = make_assigned_triangle_icon(pin_color, pin_text)
                 else:
+                    pin_text = str(row.get("pin_label", ""))
                     icon_obj = make_stop_div_icon(pin_color, pin_text)
 
                 folium.Marker(
@@ -824,9 +815,6 @@ if uploaded_file:
 
     st_folium(m, width=None, height=900)
 
-    # =========================
-    # HTML 저장 + 공유링크
-    # =========================
     map_html = m.get_root().render()
 
     map_path = os.path.join(MAP_DIR, html_filename)
@@ -847,9 +835,6 @@ if uploaded_file:
     st.markdown(f"### [🔗 지도 바로 열기]({share_url})")
     st.text_input("공유 URL", value=share_url, key="share_url_box")
 
-    # =========================
-    # 기사 할당표
-    # =========================
     st.subheader("기사 할당표")
 
     assigned_only = assignment_df.copy()
