@@ -751,7 +751,10 @@ if uploaded_file:
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=10)
 
-    route_list = list(valid_result["route"].dropna().unique())
+    route_list = sorted(
+    valid_result["route"].dropna().unique().tolist(),
+    key=lambda x: route_prefix_map.get(x, "")
+)
     route_color_map = {
         route: ROUTE_COLORS[i % len(ROUTE_COLORS)]
         for i, route in enumerate(route_list)
@@ -959,4 +962,5 @@ if uploaded_file:
         file_name="route_assignment.csv",
         mime="text/csv"
     )
+
 
