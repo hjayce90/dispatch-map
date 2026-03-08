@@ -770,7 +770,7 @@ if uploaded_file:
         truck_request_id = truck_request_map.get(route, "")
 
         route_group = folium.FeatureGroup(
-            name=f"{route} | {truck_request_id}",
+            name=f"{route_prefix_map.get(route, '')}",
             show=True
         )
 
@@ -959,3 +959,4 @@ if uploaded_file:
         file_name="route_assignment.csv",
         mime="text/csv"
     )
+
