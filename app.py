@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -19,9 +20,12 @@ TIME_COL_INDEX = 21   # V열
 CACHE_FILE = "geocode_cache.csv"
 DRIVER_FILE = "drivers.csv"
 MAP_DIR = "saved_maps"
+SHARE_DIR = "shared_payloads"
+ASSIGNMENT_FILE = "route_assignments.json"
 APP_URL = "https://dispatch-map.streamlit.app"  # 본인 배포 주소로 수정
 
 os.makedirs(MAP_DIR, exist_ok=True)
+os.makedirs(SHARE_DIR, exist_ok=True)
 
 uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx"])
 
@@ -43,24 +47,6 @@ ROUTE_COLORS = [
     "#00acc1",
     "#c0ca33",
 ]
-
-# =========================
-# 공유 링크로 직접 지도 열기
-# =========================
-query_params = st.query_params
-shared_map = query_params.get("map")
-
-if shared_map:
-    shared_map_path = os.path.join(MAP_DIR, shared_map)
-
-    if os.path.exists(shared_map_path):
-        with open(shared_map_path, "r", encoding="utf-8") as f:
-            shared_html = f.read()
-        components.html(shared_html, height=1000, scrolling=True)
-    else:
-        st.error("저장된 공유 지도를 찾을 수 없습니다. 서버 재시작 등으로 파일이 사라졌을 수 있습니다.")
-
-    st.stop()
 
 # =========================
 # 공통 함수
@@ -85,6 +71,11 @@ def extract_date_from_filename(filename: str) -> str:
     if m:
         return f"{m.group(1)}{m.group(2)}{m.group(3)}"
     return "dispatch_map"
+
+def extract_base_name(filename: str) -> str:
+    name = os.path.splitext(str(filename))[0]
+    name = re.sub(r"[^\w\-가-힣]+", "_", name)
+    return name.strip("_") or "dispatch_map"
 
 def load_drivers():
     if os.path.exists(DRIVER_FILE):
@@ -170,6 +161,17 @@ def short_driver_name(name: str) -> str:
         return ""
     return text[-2:]
 
+def minutes_to_korean_text(x):
+    try:
+        if pd.isna(x):
+            return "0시간 00분"
+        total = int(x)
+        hh = total // 60
+        mm = total % 60
+        return f"{hh}시간 {mm:02d}분"
+    except Exception:
+        return "0시간 00분"
+
 def make_camp_div_icon(number_text: str):
     html = f"""
     <div style="
@@ -207,58 +209,42 @@ def make_stop_div_icon(route_color: str, stop_text: str):
     """
     return DivIcon(html=html, icon_size=(28, 28), icon_anchor=(14, 14))
 
-def make_assigned_triangle_icon(route_color: str, stop_text: str):
-    font_size = "10px" if len(str(stop_text)) <= 2 else "8px"
+def make_assigned_square_icon(route_color: str, stop_text: str):
+    font_size = "11px" if len(str(stop_text)) <= 2 else "9px"
     html = f"""
     <div style="
-        position: relative;
-        width: 0;
-        height: 0;
-        border-left: 16px solid transparent;
-        border-right: 16px solid transparent;
-        border-bottom: 30px solid {route_color};
-        filter: drop-shadow(0 0 3px rgba(0,0,0,0.45));
-    ">
-        <div style="
-            position:absolute;
-            top:8px;
-            left:-12px;
-            width:24px;
-            text-align:center;
-            color:#ffffff;
-            font-size:{font_size};
-            font-weight:700;
-            line-height:1;
-        ">{stop_text}</div>
-    </div>
+        width:30px;
+        height:30px;
+        background:{route_color};
+        border:2px solid #ffffff;
+        border-radius:6px;
+        color:#ffffff;
+        text-align:center;
+        line-height:26px;
+        font-size:{font_size};
+        font-weight:700;
+        box-shadow:0 0 3px rgba(0,0,0,0.45);
+    ">{stop_text}</div>
     """
-    return DivIcon(html=html, icon_size=(32, 30), icon_anchor=(16, 24))
+    return DivIcon(html=html, icon_size=(30, 30), icon_anchor=(15, 15))
 
-def make_assigned_triangle_camp_icon(route_color: str, text_value: str):
+def make_assigned_square_camp_icon(route_color: str, text_value: str):
     html = f"""
     <div style="
-        position: relative;
-        width: 0;
-        height: 0;
-        border-left: 14px solid transparent;
-        border-right: 14px solid transparent;
-        border-bottom: 26px solid {route_color};
-        filter: drop-shadow(0 0 3px rgba(0,0,0,0.45));
-    ">
-        <div style="
-            position:absolute;
-            top:7px;
-            left:-9px;
-            width:18px;
-            text-align:center;
-            color:#ffffff;
-            font-size:10px;
-            font-weight:700;
-            line-height:1;
-        ">{text_value}</div>
-    </div>
+        width:28px;
+        height:28px;
+        background:{route_color};
+        border:2px solid #ffffff;
+        border-radius:6px;
+        color:#ffffff;
+        text-align:center;
+        line-height:24px;
+        font-size:10px;
+        font-weight:700;
+        box-shadow:0 0 3px rgba(0,0,0,0.45);
+    ">{text_value}</div>
     """
-    return DivIcon(html=html, icon_size=(28, 26), icon_anchor=(14, 22))
+    return DivIcon(html=html, icon_size=(28, 28), icon_anchor=(14, 14))
 
 def make_diamond_div_icon(bg_color: str, text_value: str):
     html = f"""
@@ -324,7 +310,7 @@ def get_assigned_camp_icon_by_name(camp_name: str, color: str):
         return make_diamond_div_icon(color, "7")
     else:
         camp_no = extract_camp_number(camp_text)
-        return make_assigned_triangle_camp_icon(color, camp_no)
+        return make_assigned_square_camp_icon(color, camp_no)
 
 def format_time_value(value):
     if pd.isna(value):
@@ -360,6 +346,72 @@ def time_to_minutes(t: str):
         return None
     return int(m.group(1)) * 60 + int(m.group(2))
 
+def load_assignment_store():
+    if os.path.exists(ASSIGNMENT_FILE):
+        try:
+            with open(ASSIGNMENT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_assignment_store(store):
+    try:
+        with open(ASSIGNMENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def make_assignment_key(route: str, truck_request_id: str) -> str:
+    return f"{str(route).strip()}__{str(truck_request_id).strip()}"
+
+def save_share_payload(share_name: str, map_html: str, assignment_df: pd.DataFrame, assigned_summary: pd.DataFrame):
+    payload_path = os.path.join(SHARE_DIR, f"{share_name}.json")
+    payload = {
+        "map_html": map_html,
+        "assignment_rows": assignment_df.fillna("").to_dict(orient="records"),
+        "assigned_summary_rows": assigned_summary.fillna("").to_dict(orient="records"),
+    }
+    with open(payload_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+def load_share_payload(share_name: str):
+    payload_path = os.path.join(SHARE_DIR, f"{share_name}.json")
+    if not os.path.exists(payload_path):
+        return None
+    try:
+        with open(payload_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+# =========================
+# 공유 링크로 직접 열기
+# =========================
+query_params = st.query_params
+shared_map = query_params.get("map")
+
+if shared_map:
+    payload = load_share_payload(shared_map)
+
+    if payload and payload.get("map_html"):
+        st.subheader("공유 지도")
+        components.html(payload["map_html"], height=950, scrolling=True)
+
+        assignment_rows = payload.get("assignment_rows", [])
+        if assignment_rows:
+            st.subheader("기사 할당표")
+            st.dataframe(pd.DataFrame(assignment_rows), use_container_width=True)
+
+        assigned_summary_rows = payload.get("assigned_summary_rows", [])
+        if assigned_summary_rows:
+            st.subheader("기사별 요약")
+            st.dataframe(pd.DataFrame(assigned_summary_rows), use_container_width=True)
+    else:
+        st.error("저장된 공유 데이터를 찾을 수 없습니다. 서버 재시작 등으로 파일이 사라졌을 수 있습니다.")
+
+    st.stop()
+
 # =========================
 # 시작
 # =========================
@@ -370,10 +422,12 @@ if not uploaded_file:
 
 if uploaded_file:
     uploaded_filename = uploaded_file.name
-    file_date = extract_date_from_filename(uploaded_filename)
-    html_filename = f"{file_date}.html"
+    base_name = extract_base_name(uploaded_filename)
+    share_name = base_name
+    html_filename = f"{share_name}.html"
 
     cache = load_geocode_cache()
+    assignment_store = load_assignment_store()
 
     df = pd.read_excel(uploaded_file, sheet_name="일반차량")
 
@@ -431,9 +485,7 @@ if uploaded_file:
     result["af"] = pd.to_numeric(result["af"], errors="coerce").fillna(0)
     result["ag"] = pd.to_numeric(result["ag"], errors="coerce").fillna(0)
 
-    # =========================
     # 같은 route 안에서 같은 주소는 같은 집으로 처리
-    # =========================
     house_order_df = (
         result.groupby(["route", "address_norm"], as_index=False)
         .agg(first_stop=("stop_order", "min"))
@@ -472,10 +524,14 @@ if uploaded_file:
         )
     )
 
-    route_line_label = {
-        route: f"{truck_request_map.get(route, '')} {safe_int(row['ae_sum'])}/{safe_int(row['af_sum'])}/{safe_int(row['ag_sum'])}"
-        for route, row in route_qty_map.iterrows()
-    }
+    route_line_label = {}
+    for route, row in route_qty_map.iterrows():
+        small = safe_int(row["ae_sum"])
+        mid = safe_int(row["af_sum"])
+        large = safe_int(row["ag_sum"])
+        total = small + mid + large
+        prefix = route_prefix_map.get(route, "")
+        route_line_label[route] = f"{prefix} | {total}박스 | {small}/{mid}/{large}"
 
     normal_result = result[result["is_camp"] == False].copy()
     camp_result = result[result["is_camp"] == True].copy()
@@ -596,6 +652,10 @@ if uploaded_file:
 
     route_summary["시작시간"] = route_summary["start_min"].apply(min_to_hhmm)
     route_summary["종료시간"] = route_summary["end_max"].apply(min_to_hhmm)
+    route_summary["총걸린분"] = (
+        route_summary["end_max"].fillna(0) - route_summary["start_min"].fillna(0)
+    ).clip(lower=0)
+    route_summary["총걸린시간"] = route_summary["총걸린분"].apply(minutes_to_korean_text)
 
     st.subheader("지도")
 
@@ -620,12 +680,23 @@ if uploaded_file:
         c9.write(safe_int(row["대형합"]))
         c10.write(safe_int(row["총합"]))
 
+        driver_options = [""] + drivers
+        assignment_key = make_assignment_key(route, truck_request_id)
+        saved_driver = assignment_store.get(assignment_key, "")
+
+        default_index = 0
+        if saved_driver in driver_options:
+            default_index = driver_options.index(saved_driver)
+
         selected_driver = c11.selectbox(
-            f"기사선택_{route}",
-            options=[""] + drivers,
-            index=0,
-            label_visibility="collapsed"
+            f"기사선택_{route}_{truck_request_id}",
+            options=driver_options,
+            index=default_index,
+            label_visibility="collapsed",
+            key=f"driver_select_{route}_{truck_request_id}"
         )
+
+        assignment_store[assignment_key] = selected_driver
 
         assignment_rows.append({
             "route": route,
@@ -634,12 +705,16 @@ if uploaded_file:
             "스톱수": safe_int(row["스톱수"]),
             "시작시간": str(row["시작시간"]),
             "종료시간": str(row["종료시간"]),
+            "총걸린분": safe_int(row["총걸린분"]),
+            "총걸린시간": str(row["총걸린시간"]),
             "소형합": safe_int(row["소형합"]),
             "중형합": safe_int(row["중형합"]),
             "대형합": safe_int(row["대형합"]),
             "총합": safe_int(row["총합"]),
             "assigned_driver": selected_driver
         })
+
+    save_assignment_store(assignment_store)
 
     assignment_df = pd.DataFrame(assignment_rows)
     route_driver_map = dict(zip(assignment_df["route"], assignment_df["assigned_driver"]))
@@ -666,7 +741,7 @@ if uploaded_file:
 
     st.write(f"캐시 주소 수: {len(cache)}")
     st.write(f"현재 필터: {selected_filter}")
-    st.caption("미할당: 루트별 색 + 원형핀 + 실선 / 할당됨: 기사별 같은 색 + 삼각핀 + 점선 / 핀번호: 미할당은 A1, 할당은 기사명 뒤 2글자")
+    st.caption("미할당: 루트별 색 + 원형핀 + 굵은 실선 / 할당됨: 기사별 같은 색 + 네모핀 + 얇은 점선 / 핀번호: 미할당은 A1, 할당은 기사명 뒤 2글자")
 
     if len(valid_result) > 0:
         center_lat = valid_result.iloc[0]["coords"][0]
@@ -717,14 +792,18 @@ if uploaded_file:
 
         if is_assigned_route:
             line_color = driver_color_map.get(route_driver, "#1e88e5")
+            under_weight = 6
+            main_weight = 4
         else:
             line_color = route_color_map.get(route, "#1e88e5")
+            under_weight = 10
+            main_weight = 7
 
         if len(line_points) >= 2:
             folium.PolyLine(
                 line_points,
                 color="#111111",
-                weight=8,
+                weight=under_weight,
                 opacity=0.55,
                 tooltip=route_line_label.get(route, truck_request_id),
                 dash_array="10, 8" if is_assigned_route else None
@@ -733,7 +812,7 @@ if uploaded_file:
             folium.PolyLine(
                 line_points,
                 color=line_color,
-                weight=5,
+                weight=main_weight,
                 opacity=0.95,
                 tooltip=route_line_label.get(route, truck_request_id),
                 dash_array="10, 8" if is_assigned_route else None
@@ -794,7 +873,7 @@ if uploaded_file:
 
                 if is_assigned_pin:
                     pin_text = short_driver_name(driver_name)
-                    icon_obj = make_assigned_triangle_icon(pin_color, pin_text)
+                    icon_obj = make_assigned_square_icon(pin_color, pin_text)
                 else:
                     pin_text = str(row.get("pin_label", ""))
                     icon_obj = make_stop_div_icon(pin_color, pin_text)
@@ -828,14 +907,11 @@ if uploaded_file:
         mime="text/html"
     )
 
-    share_url = f"{APP_URL}?map={html_filename}"
-
-    st.subheader("지도 공유 링크")
-    st.success("아래 링크를 복사해서 바로 공유하시면 됩니다.")
-    st.markdown(f"### [🔗 지도 바로 열기]({share_url})")
-    st.text_input("공유 URL", value=share_url, key="share_url_box")
-
     st.subheader("기사 할당표")
+    view_assignment_df = assignment_df.copy()
+    if "총걸린분" in view_assignment_df.columns:
+        view_assignment_df = view_assignment_df.drop(columns=["총걸린분"])
+    st.dataframe(view_assignment_df, use_container_width=True)
 
     assigned_only = assignment_df.copy()
     assigned_only["assigned_driver"] = assigned_only["assigned_driver"].fillna("").astype(str)
@@ -846,6 +922,7 @@ if uploaded_file:
         .agg(
             담당루트수=("route", "count"),
             총스톱수=("스톱수", "sum"),
+            총걸린분=("총걸린분", "sum"),
             소형합=("소형합", "sum"),
             중형합=("중형합", "sum"),
             대형합=("대형합", "sum"),
@@ -855,10 +932,25 @@ if uploaded_file:
         .reset_index(drop=True)
     )
 
+    assigned_summary["총걸린시간"] = assigned_summary["총걸린분"].apply(minutes_to_korean_text)
+
     if len(assigned_summary) == 0:
         st.info("아직 기사 배정이 없습니다.")
     else:
-        st.dataframe(assigned_summary, use_container_width=True)
+        st.subheader("기사별 요약")
+        view_assigned_summary = assigned_summary.copy()
+        if "총걸린분" in view_assigned_summary.columns:
+            view_assigned_summary = view_assigned_summary.drop(columns=["총걸린분"])
+        st.dataframe(view_assigned_summary, use_container_width=True)
+
+    save_share_payload(share_name, map_html, view_assignment_df, view_assigned_summary if len(assigned_summary) > 0 else pd.DataFrame())
+
+    share_url = f"{APP_URL}?map={share_name}"
+
+    st.subheader("지도 공유 링크")
+    st.success("아래 링크를 복사해서 바로 공유하시면 됩니다.")
+    st.markdown(f"### [🔗 지도 + 기사할당표 바로 열기]({share_url})")
+    st.text_input("공유 URL", value=share_url, key="share_url_box")
 
     csv_data = assignment_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
