@@ -1,6 +1,5 @@
 import os
 import re
-import math
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -20,7 +19,7 @@ TIME_COL_INDEX = 21   # V열
 CACHE_FILE = "geocode_cache.csv"
 DRIVER_FILE = "drivers.csv"
 MAP_DIR = "saved_maps"
-APP_URL = "https://dispatch-map.streamlit.app"  # 본인 배포 주소
+APP_URL = "https://dispatch-map.streamlit.app"  # 본인 배포 주소로 수정
 
 os.makedirs(MAP_DIR, exist_ok=True)
 
@@ -66,6 +65,21 @@ if shared_map:
 # =========================
 # 공통 함수
 # =========================
+def safe_int(v):
+    try:
+        if pd.isna(v):
+            return 0
+        return int(float(v))
+    except Exception:
+        return 0
+
+def normalize_address(addr: str) -> str:
+    if pd.isna(addr):
+        return ""
+    text = str(addr).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
 def extract_date_from_filename(filename: str) -> str:
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(filename))
     if m:
@@ -143,6 +157,14 @@ def extract_camp_number(name: str) -> str:
         return m.group(1)
     return "C"
 
+def route_index_to_label(n: int) -> str:
+    # 1 -> A, 26 -> Z, 27 -> AA
+    label = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        label = chr(65 + rem) + label
+    return label
+
 def make_camp_div_icon(number_text: str):
     html = f"""
     <div style="
@@ -162,50 +184,52 @@ def make_camp_div_icon(number_text: str):
     return DivIcon(html=html, icon_size=(24, 24), icon_anchor=(12, 12))
 
 def make_stop_div_icon(route_color: str, stop_text: str):
+    font_size = "11px" if len(str(stop_text)) <= 2 else "9px"
     html = f"""
     <div style="
-        width:24px;
-        height:24px;
+        width:28px;
+        height:28px;
         border-radius:50%;
         background:{route_color};
         border:2px solid #ffffff;
         color:#ffffff;
         text-align:center;
-        line-height:20px;
-        font-size:11px;
+        line-height:24px;
+        font-size:{font_size};
         font-weight:700;
         box-shadow:0 0 3px rgba(0,0,0,0.45);
     ">{stop_text}</div>
     """
-    return DivIcon(html=html, icon_size=(24, 24), icon_anchor=(12, 12))
+    return DivIcon(html=html, icon_size=(28, 28), icon_anchor=(14, 14))
 
 def make_assigned_triangle_icon(route_color: str, stop_text: str):
+    font_size = "10px" if len(str(stop_text)) <= 2 else "8px"
     html = f"""
     <div style="
         position: relative;
         width: 0;
         height: 0;
-        border-left: 14px solid transparent;
-        border-right: 14px solid transparent;
-        border-bottom: 26px solid {route_color};
+        border-left: 16px solid transparent;
+        border-right: 16px solid transparent;
+        border-bottom: 30px solid {route_color};
         filter: drop-shadow(0 0 3px rgba(0,0,0,0.45));
     ">
         <div style="
             position:absolute;
-            top:7px;
-            left:-8px;
-            width:16px;
+            top:8px;
+            left:-12px;
+            width:24px;
             text-align:center;
             color:#ffffff;
-            font-size:10px;
+            font-size:{font_size};
             font-weight:700;
             line-height:1;
         ">{stop_text}</div>
     </div>
     """
-    return DivIcon(html=html, icon_size=(28, 26), icon_anchor=(14, 22))
+    return DivIcon(html=html, icon_size=(32, 30), icon_anchor=(16, 24))
 
-def make_assigned_triangle_camp_icon(route_color: str, number_text: str):
+def make_assigned_triangle_camp_icon(route_color: str, text_value: str):
     html = f"""
     <div style="
         position: relative;
@@ -219,17 +243,83 @@ def make_assigned_triangle_camp_icon(route_color: str, number_text: str):
         <div style="
             position:absolute;
             top:7px;
-            left:-8px;
-            width:16px;
+            left:-9px;
+            width:18px;
             text-align:center;
             color:#ffffff;
             font-size:10px;
             font-weight:700;
             line-height:1;
-        ">{number_text}</div>
+        ">{text_value}</div>
     </div>
     """
     return DivIcon(html=html, icon_size=(28, 26), icon_anchor=(14, 22))
+
+def make_diamond_div_icon(bg_color: str, text_value: str):
+    html = f"""
+    <div style="
+        width:24px;
+        height:24px;
+        background:{bg_color};
+        border:2px solid #ffffff;
+        transform:rotate(45deg);
+        box-shadow:0 0 3px rgba(0,0,0,0.45);
+        position:relative;
+    ">
+        <div style="
+            position:absolute;
+            inset:0;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            color:#ffffff;
+            font-size:10px;
+            font-weight:700;
+            transform:rotate(-45deg);
+        ">{text_value}</div>
+    </div>
+    """
+    return DivIcon(html=html, icon_size=(24, 24), icon_anchor=(12, 12))
+
+def make_square_div_icon(bg_color: str, text_value: str):
+    html = f"""
+    <div style="
+        width:24px;
+        height:24px;
+        background:{bg_color};
+        border:2px solid #ffffff;
+        border-radius:4px;
+        color:#ffffff;
+        text-align:center;
+        line-height:20px;
+        font-size:10px;
+        font-weight:700;
+        box-shadow:0 0 3px rgba(0,0,0,0.45);
+    ">{text_value}</div>
+    """
+    return DivIcon(html=html, icon_size=(24, 24), icon_anchor=(12, 12))
+
+def get_camp_icon_by_name(camp_name: str, color: str):
+    camp_text = str(camp_name).strip()
+
+    if "일산1캠" in camp_text:
+        return make_square_div_icon(color, "1")
+    elif "일산7캠" in camp_text:
+        return make_diamond_div_icon(color, "7")
+    else:
+        camp_no = extract_camp_number(camp_text)
+        return make_camp_div_icon(camp_no)
+
+def get_assigned_camp_icon_by_name(camp_name: str, color: str):
+    camp_text = str(camp_name).strip()
+
+    if "일산1캠" in camp_text:
+        return make_square_div_icon(color, "1")
+    elif "일산7캠" in camp_text:
+        return make_diamond_div_icon(color, "7")
+    else:
+        camp_no = extract_camp_number(camp_text)
+        return make_assigned_triangle_camp_icon(color, camp_no)
 
 def format_time_value(value):
     if pd.isna(value):
@@ -258,13 +348,12 @@ def format_time_value(value):
 
     return text
 
-def safe_int(v):
-    try:
-        if pd.isna(v):
-            return 0
-        return int(float(v))
-    except Exception:
-        return 0
+def time_to_minutes(t: str):
+    t = str(t).strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", t)
+    if not m:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2))
 
 # =========================
 # 시작
@@ -316,9 +405,11 @@ if uploaded_file:
                 "truck_request_id": current_truck_request_id,
                 "stop_order": stop_order,
                 "time_str": time_str,
+                "time_minutes": time_to_minutes(time_str),
                 "company_id": company_id_str,
                 "company_name": company_name_str,
                 "address": str(address).strip(),
+                "address_norm": normalize_address(address),
                 "ae": pd.to_numeric(ae, errors="coerce") if pd.notna(ae) else 0,
                 "af": pd.to_numeric(af, errors="coerce") if pd.notna(af) else 0,
                 "ag": pd.to_numeric(ag, errors="coerce") if pd.notna(ag) else 0,
@@ -335,7 +426,38 @@ if uploaded_file:
     result["af"] = pd.to_numeric(result["af"], errors="coerce").fillna(0)
     result["ag"] = pd.to_numeric(result["ag"], errors="coerce").fillna(0)
 
-    route_total_map = result.groupby("route")["stop_order"].max().to_dict()
+    # =========================
+    # 같은 route 안에서 같은 주소는 같은 집으로 처리
+    # =========================
+    house_order_df = (
+        result.groupby(["route", "address_norm"], as_index=False)
+        .agg(first_stop=("stop_order", "min"))
+        .sort_values(["route", "first_stop", "address_norm"])
+        .reset_index(drop=True)
+    )
+    house_order_df["house_order"] = house_order_df.groupby("route").cumcount() + 1
+
+    result = result.merge(
+        house_order_df[["route", "address_norm", "house_order"]],
+        on=["route", "address_norm"],
+        how="left"
+    )
+
+    # 라우트 prefix (A, B, C ... / AA ...)
+    all_routes_sorted = sorted(result["route"].dropna().astype(str).unique().tolist())
+    route_prefix_map = {
+        route: route_index_to_label(i + 1)
+        for i, route in enumerate(all_routes_sorted)
+    }
+
+    result["route_prefix"] = result["route"].map(route_prefix_map)
+    result["pin_label"] = result.apply(
+        lambda r: f"{r['route_prefix']}{safe_int(r['house_order'])}",
+        axis=1
+    )
+
+    # route 전체 집 수
+    route_total_map = result.groupby("route")["house_order"].max().to_dict()
     truck_request_map = result.groupby("route")["truck_request_id"].first().to_dict()
 
     route_qty_map = (
@@ -356,31 +478,35 @@ if uploaded_file:
     camp_result = result[result["is_camp"] == True].copy()
 
     grouped_normal = (
-        normal_result.groupby(["route", "company_id"], as_index=False)
+        normal_result.groupby(["route", "address_norm"], as_index=False)
         .agg(
             truck_request_id=("truck_request_id", "first"),
+            company_id=("company_id", "first"),
             company_name=("company_name", "first"),
             address=("address", "first"),
             stop_count=("stop_order", "count"),
             first_stop=("stop_order", "min"),
+            house_order=("house_order", "first"),
+            route_prefix=("route_prefix", "first"),
+            pin_label=("pin_label", "first"),
             first_time=("time_str", "first"),
             ae_sum=("ae", "sum"),
             af_sum=("af", "sum"),
             ag_sum=("ag", "sum"),
             is_camp=("is_camp", "first"),
         )
-        .sort_values(["route", "first_stop"])
+        .sort_values(["route", "house_order"])
         .reset_index(drop=True)
     )
 
     if len(grouped_normal) > 0:
         grouped_normal["route_total"] = grouped_normal["route"].map(route_total_map)
         grouped_normal["label"] = grouped_normal.apply(
-            lambda r: f"{safe_int(r['first_stop'])}/{safe_int(r['route_total'])} - {safe_int(r['ae_sum'])}.{safe_int(r['af_sum'])}.{safe_int(r['ag_sum'])}",
+            lambda r: f"{r['pin_label']} - {safe_int(r['ae_sum'])}.{safe_int(r['af_sum'])}.{safe_int(r['ag_sum'])}",
             axis=1
         )
         grouped_normal["hover_text"] = grouped_normal.apply(
-            lambda r: f"{r['first_time']} {safe_int(r['ae_sum'])}/{safe_int(r['af_sum'])}/{safe_int(r['ag_sum'])}".strip(),
+            lambda r: f"{r['pin_label']} / {r['first_time']} / {safe_int(r['ae_sum'])}/{safe_int(r['af_sum'])}/{safe_int(r['ag_sum'])}".strip(),
             axis=1
         )
     else:
@@ -397,30 +523,67 @@ if uploaded_file:
         camp_markers["af_sum"] = camp_markers["af"]
         camp_markers["ag_sum"] = camp_markers["ag"]
         camp_markers["route_total"] = camp_markers["route"].map(route_total_map)
+        camp_markers["route_prefix"] = camp_markers["route"].map(route_prefix_map)
+        camp_markers["pin_label"] = camp_markers.apply(
+            lambda r: f"{r['route_prefix']}{safe_int(r['house_order'])}",
+            axis=1
+        )
         camp_markers["label"] = camp_markers.apply(
-            lambda r: f"{safe_int(r['first_stop'])}/{safe_int(r['route_total'])} - CAMP",
+            lambda r: f"{r['pin_label']} - CAMP",
             axis=1
         )
         camp_markers["hover_text"] = camp_markers.apply(
-            lambda r: f"{r['first_time']} CAMP".strip(),
+            lambda r: f"{r['pin_label']} / {r['first_time']} / CAMP".strip(),
             axis=1
         )
     else:
         camp_markers["route_total"] = 0
+        camp_markers["route_prefix"] = ""
+        camp_markers["pin_label"] = ""
         camp_markers["label"] = ""
         camp_markers["hover_text"] = ""
 
     grouped = pd.concat([grouped_normal, camp_markers], ignore_index=True, sort=False)
-    grouped = grouped.sort_values(["route", "first_stop"]).reset_index(drop=True)
+    grouped = grouped.sort_values(["route", "house_order"]).reset_index(drop=True)
 
     # 좌표 변환
     result["coords"] = result["address"].apply(lambda x: geocode_kakao(x, KAKAO_API_KEY, cache))
     grouped["coords"] = grouped["address"].apply(lambda x: geocode_kakao(x, KAKAO_API_KEY, cache))
 
+    # =========================
+    # 기사 배정표용 요약
+    # 같은 주소는 한 스톱
+    # 시작시간 = 가장 이른 시간
+    # 종료시간 = 가장 늦은 시간
+    # =========================
+    route_time_summary = (
+        result.groupby(["route"], as_index=False)
+        .agg(
+            start_min=("time_minutes", "min"),
+            end_max=("time_minutes", "max")
+        )
+    )
+
+    def min_to_hhmm(x):
+        if pd.isna(x):
+            return ""
+        try:
+            x = int(x)
+            hh = x // 60
+            mm = x % 60
+            return f"{hh:02d}:{mm:02d}"
+        except Exception:
+            return ""
+
+    route_stop_count = (
+        result.groupby("route", as_index=False)["address_norm"]
+        .nunique()
+        .rename(columns={"address_norm": "스톱수"})
+    )
+
     route_summary = (
         result.groupby(["route", "truck_request_id"], as_index=False)
         .agg(
-            총정차수=("address", "count"),
             소형합=("ae", "sum"),
             중형합=("af", "sum"),
             대형합=("ag", "sum"),
@@ -428,13 +591,24 @@ if uploaded_file:
         .sort_values("route")
         .reset_index(drop=True)
     )
+
     route_summary["총합"] = route_summary["소형합"] + route_summary["중형합"] + route_summary["대형합"]
 
+    route_summary = route_summary.merge(route_stop_count, on="route", how="left")
+    route_summary = route_summary.merge(route_time_summary, on="route", how="left")
+    route_summary["route_prefix"] = route_summary["route"].map(route_prefix_map)
+
+    route_summary["시작시간"] = route_summary["start_min"].apply(min_to_hhmm)
+    route_summary["종료시간"] = route_summary["end_max"].apply(min_to_hhmm)
+
     # =========================
-    # 기사 배정
+    # 지도 (최상단 핵심)
     # =========================
+    st.subheader("지도")
+
+    # 기사 배정 먼저 생성
     st.subheader("기사 배정")
-    st.caption("route / truck_request_id / 총정차수 / 소형 / 중형 / 대형 / 총합 / 기사")
+    st.caption("route / 구분 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
 
     assignment_rows = []
 
@@ -442,16 +616,19 @@ if uploaded_file:
         route = row["route"]
         truck_request_id = row["truck_request_id"]
 
-        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.0, 1.3, 0.9, 0.8, 0.8, 0.8, 0.9, 1.4])
+        c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11 = st.columns([0.8, 0.7, 1.2, 0.7, 0.9, 0.9, 0.7, 0.7, 0.7, 0.8, 1.4])
         c1.write(str(route))
-        c2.write(str(truck_request_id))
-        c3.write(safe_int(row["총정차수"]))
-        c4.write(safe_int(row["소형합"]))
-        c5.write(safe_int(row["중형합"]))
-        c6.write(safe_int(row["대형합"]))
-        c7.write(safe_int(row["총합"]))
+        c2.write(str(row["route_prefix"]))
+        c3.write(str(truck_request_id))
+        c4.write(safe_int(row["스톱수"]))
+        c5.write(str(row["시작시간"]))
+        c6.write(str(row["종료시간"]))
+        c7.write(safe_int(row["소형합"]))
+        c8.write(safe_int(row["중형합"]))
+        c9.write(safe_int(row["대형합"]))
+        c10.write(safe_int(row["총합"]))
 
-        selected_driver = c8.selectbox(
+        selected_driver = c11.selectbox(
             f"기사선택_{route}",
             options=[""] + drivers,
             index=0,
@@ -460,8 +637,11 @@ if uploaded_file:
 
         assignment_rows.append({
             "route": route,
+            "route_prefix": row["route_prefix"],
             "truck_request_id": truck_request_id,
-            "총정차수": safe_int(row["총정차수"]),
+            "스톱수": safe_int(row["스톱수"]),
+            "시작시간": str(row["시작시간"]),
+            "종료시간": str(row["종료시간"]),
             "소형합": safe_int(row["소형합"]),
             "중형합": safe_int(row["중형합"]),
             "대형합": safe_int(row["대형합"]),
@@ -474,11 +654,8 @@ if uploaded_file:
 
     result["assigned_driver"] = result["route"].map(route_driver_map)
     grouped["assigned_driver"] = grouped["route"].map(route_driver_map)
-    route_summary["assigned_driver"] = route_summary["route"].map(route_driver_map)
 
-    # =========================
     # 기사별 필터
-    # =========================
     st.subheader("기사별 필터")
     driver_filter_options = ["전체", "미배정"] + drivers
     selected_filter = st.selectbox("지도 표시 대상", driver_filter_options)
@@ -487,8 +664,8 @@ if uploaded_file:
         map_result = result.copy()
         map_grouped = grouped.copy()
     elif selected_filter == "미배정":
-        map_result = result[result["assigned_driver"].fillna("") == ""].copy()
-        map_grouped = grouped[grouped["assigned_driver"].fillna("") == ""].copy()
+        map_result = result[result["assigned_driver"].fillna("").astype(str).str.strip() == ""].copy()
+        map_grouped = grouped[grouped["assigned_driver"].fillna("").astype(str).str.strip() == ""].copy()
     else:
         map_result = result[result["assigned_driver"] == selected_filter].copy()
         map_grouped = grouped[grouped["assigned_driver"] == selected_filter].copy()
@@ -496,13 +673,9 @@ if uploaded_file:
     valid_result = map_result[map_result["coords"].notna()].copy()
     valid_grouped = map_grouped[map_grouped["coords"].notna()].copy()
 
-    # =========================
-    # 지도 (최우선)
-    # =========================
-    st.subheader("지도")
     st.write(f"캐시 주소 수: {len(cache)}")
     st.write(f"현재 필터: {selected_filter}")
-    st.caption("기사 미배정은 루트별 색상+원형+실선, 기사 배정 후에는 같은 기사면 같은 색상+삼각형+점선으로 표시됩니다.")
+    st.caption("미할당: 루트별 색 + 원형핀 + 실선 / 할당됨: 기사별 같은 색 + 삼각핀 + 점선 / 핀번호: A1, A2 ...")
 
     if len(valid_result) > 0:
         center_lat = valid_result.iloc[0]["coords"][0]
@@ -539,10 +712,12 @@ if uploaded_file:
             (map_result["route"] == route) &
             (map_result["is_camp"] == False) &
             (map_result["coords"].notna())
-        ].sort_values("stop_order")
+        ].sort_values("house_order")
 
         line_points = []
-        for _, row in route_df_line.iterrows():
+        route_df_line_house = route_df_line.drop_duplicates(subset=["address_norm"], keep="first")
+
+        for _, row in route_df_line_house.iterrows():
             lat, lon = row["coords"]
             line_points.append([lat, lon])
 
@@ -588,20 +763,21 @@ if uploaded_file:
             is_camp = bool(row["is_camp"])
 
             if is_camp:
-                camp_no = extract_camp_number(row["company_name"])
                 popup_html = f"""
                 <b>루트:</b> {row['route']}<br>
+                <b>구분:</b> {row.get('route_prefix', '')}<br>
+                <b>핀번호:</b> {row.get('pin_label', '')}<br>
                 <b>트럭요청ID:</b> {row.get('truck_request_id', '')}<br>
                 <b>기사:</b> {row.get('assigned_driver', '')}<br>
                 <b>캠프명:</b> {row['company_name']}<br>
                 <b>주소:</b> {row['address']}<br>
-                <b>순서:</b> {safe_int(row['first_stop'])}/{safe_int(row['route_total'])}
+                <b>집순서:</b> {safe_int(row['house_order'])}/{safe_int(row['route_total'])}
                 """
 
                 if is_assigned_pin:
-                    icon_obj = make_assigned_triangle_camp_icon(pin_color, camp_no)
+                    icon_obj = get_assigned_camp_icon_by_name(row["company_name"], pin_color)
                 else:
-                    icon_obj = make_camp_div_icon(camp_no)
+                    icon_obj = get_camp_icon_by_name(row["company_name"], pin_color)
 
                 folium.Marker(
                     [lat, lon],
@@ -613,20 +789,24 @@ if uploaded_file:
             else:
                 popup_html = f"""
                 <b>루트:</b> {row['route']}<br>
+                <b>구분:</b> {row.get('route_prefix', '')}<br>
+                <b>핀번호:</b> {row.get('pin_label', '')}<br>
                 <b>트럭요청ID:</b> {row.get('truck_request_id', '')}<br>
                 <b>기사:</b> {row.get('assigned_driver', '')}<br>
                 <b>업체ID:</b> {row['company_id']}<br>
                 <b>업체명:</b> {row['company_name']}<br>
                 <b>주소:</b> {row['address']}<br>
-                <b>순서:</b> {safe_int(row['first_stop'])}/{safe_int(row['route_total'])}<br>
+                <b>집순서:</b> {safe_int(row['house_order'])}/{safe_int(row['route_total'])}<br>
                 <b>건수:</b> {safe_int(row['stop_count'])}<br>
                 <b>물량:</b> {safe_int(row['ae_sum'])}.{safe_int(row['af_sum'])}.{safe_int(row['ag_sum'])}
                 """
 
+                pin_text = str(row.get("pin_label", ""))
+
                 if is_assigned_pin:
-                    icon_obj = make_assigned_triangle_icon(pin_color, str(safe_int(row["first_stop"])))
+                    icon_obj = make_assigned_triangle_icon(pin_color, pin_text)
                 else:
-                    icon_obj = make_stop_div_icon(pin_color, str(safe_int(row["first_stop"])))
+                    icon_obj = make_stop_div_icon(pin_color, pin_text)
 
                 folium.Marker(
                     [lat, lon],
@@ -644,7 +824,9 @@ if uploaded_file:
 
     st_folium(m, width=None, height=900)
 
-    # HTML 저장 + 다운로드
+    # =========================
+    # HTML 저장 + 공유링크
+    # =========================
     map_html = m.get_root().render()
 
     map_path = os.path.join(MAP_DIR, html_filename)
@@ -666,7 +848,7 @@ if uploaded_file:
     st.text_input("공유 URL", value=share_url, key="share_url_box")
 
     # =========================
-    # 기사별 할당표
+    # 기사 할당표
     # =========================
     st.subheader("기사 할당표")
 
@@ -678,6 +860,7 @@ if uploaded_file:
         .groupby("assigned_driver", as_index=False)
         .agg(
             담당루트수=("route", "count"),
+            총스톱수=("스톱수", "sum"),
             소형합=("소형합", "sum"),
             중형합=("중형합", "sum"),
             대형합=("대형합", "sum"),
