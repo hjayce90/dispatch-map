@@ -901,16 +901,16 @@ def render_map(
             main_weight = 7
             dash_value = None
 
-        # 캠프 -> 첫 배송지 연결선
+        # 캠프 -> 마지막 배송지 연결선
         camp_coord = camp_coords.get(camp_code)
         if camp_coord and len(line_points) >= 1:
             folium.PolyLine(
-                [[camp_coord[0], camp_coord[1]], line_points[0]],
+                [[camp_coord[0], camp_coord[1]], line_points[-1]],
                 color="#444444",
                 weight=2,
                 opacity=0.7,
                 dash_array="4, 6",
-                tooltip=f"{route_prefix_map.get(route, '')} 출발캠프: {camp_name}"
+                tooltip=f"{route_prefix_map.get(route, '')} 도착센터: {camp_name}"
             ).add_to(route_group)
 
         # 배송 동선
