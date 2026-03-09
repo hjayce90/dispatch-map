@@ -69,6 +69,12 @@ def safe_int(v):
         return 0
 
 
+def clean_text(v):
+    if pd.isna(v):
+        return ""
+    return str(v).strip()
+
+
 def normalize_address(addr: str) -> str:
     if pd.isna(addr):
         return ""
@@ -226,6 +232,39 @@ def min_to_hhmm(x):
         return f"{hh:02d}:{mm:02d}"
     except Exception:
         return ""
+
+
+def is_fake_header_row(route_val, truck_request_id, company_name, address, center_type, spu_center):
+    values = [
+        clean_text(route_val),
+        clean_text(truck_request_id),
+        clean_text(company_name),
+        clean_text(address),
+        clean_text(center_type),
+        clean_text(spu_center),
+    ]
+
+    joined = " ".join(values).strip().lower()
+
+    header_keywords = [
+        "루트번호",
+        "루트 번호",
+        "트럭요청id",
+        "트럭 요청 id",
+        "트럭요청 id",
+        "request id",
+        "기사",
+        "시작시간",
+        "종료시간",
+        "캠프",
+        "센터",
+        "lane id",
+        "group id",
+        "order date",
+        "request date",
+    ]
+
+    return any(kw.lower() in joined for kw in header_keywords)
 
 
 def load_assignment_store():
@@ -398,18 +437,22 @@ def build_base_data(file_bytes: bytes):
         af = row.iloc[31]                 # AF열
         ag = row.iloc[32]                 # AG열
 
-        if pd.notna(route_val):
-            current_route = str(route_val).strip()
-            current_truck_request_id = str(truck_request_id).strip() if pd.notna(truck_request_id) else ""
+        # 반복 헤더 행 제거
+        if is_fake_header_row(route_val, truck_request_id, company_name, address, center_type, spu_center):
+            continue
+
+        if pd.notna(route_val) and clean_text(route_val) != "":
+            current_route = clean_text(route_val)
+            current_truck_request_id = clean_text(truck_request_id)
             stop_order = 1
         else:
             stop_order += 1
 
-        if pd.notna(address) and str(address).strip():
-            company_id_str = str(company_id).strip() if pd.notna(company_id) else ""
-            company_name_str = str(company_name).strip() if pd.notna(company_name) else ""
-            center_type_str = str(center_type).strip() if pd.notna(center_type) else ""
-            spu_center_str = str(spu_center).strip() if pd.notna(spu_center) else ""
+        if pd.notna(address) and clean_text(address) != "":
+            company_id_str = clean_text(company_id)
+            company_name_str = clean_text(company_name)
+            center_type_str = clean_text(center_type)
+            spu_center_str = clean_text(spu_center)
             time_str = format_time_value(time_val)
 
             is_center_row = (
@@ -425,7 +468,7 @@ def build_base_data(file_bytes: bytes):
                 "time_minutes": time_to_minutes(time_str),
                 "company_id": company_id_str,
                 "company_name": company_name_str,
-                "address": str(address).strip(),
+                "address": clean_text(address),
                 "address_norm": normalize_address(address),
                 "ae": pd.to_numeric(ae, errors="coerce") if pd.notna(ae) else 0,
                 "af": pd.to_numeric(af, errors="coerce") if pd.notna(af) else 0,
@@ -436,6 +479,34 @@ def build_base_data(file_bytes: bytes):
             })
 
     result = pd.DataFrame(parsed)
+
+    if len(result) == 0:
+        return {
+            "result_all": pd.DataFrame(),
+            "result_delivery": pd.DataFrame(),
+            "grouped_delivery": pd.DataFrame(),
+            "route_summary": pd.DataFrame(),
+            "route_prefix_map": {},
+            "route_total_map": {},
+            "truck_request_map": {},
+            "route_line_label": {},
+            "route_camp_map": {},
+        }
+
+    # 2차 방어: 혹시 남은 헤더 행 제거
+    bad_route_words = ["루트번호", "루트 번호"]
+    bad_request_words = ["트럭요청ID", "트럭 요청 ID", "트럭요청 ID", "request id"]
+
+    result = result[
+        ~result["route"].astype(str).str.strip().str.lower().isin([x.lower() for x in bad_route_words])
+    ].copy()
+
+    result = result[
+        ~result["truck_request_id"].astype(str).str.strip().str.lower().isin([x.lower() for x in bad_request_words])
+    ].copy()
+
+    result = result[result["route"].astype(str).str.strip() != ""].copy()
+    result = result[result["address"].astype(str).str.strip() != ""].copy()
 
     if len(result) == 0:
         return {
@@ -462,7 +533,7 @@ def build_base_data(file_bytes: bytes):
         .to_dict()
     )
 
-    # 배송지 데이터만 별도 사용 (센터 행 제외)
+    # 배송지 데이터만 사용
     result_delivery = result[result["is_center"] == False].copy()
 
     if len(result_delivery) == 0:
@@ -801,7 +872,6 @@ def render_map(
     route_camp_map: dict,
     camp_coords: dict,
 ):
-    # 지도 중심
     center_lat, center_lon = 37.55, 126.98
 
     for camp_code in CAMP_INFO.keys():
@@ -820,7 +890,7 @@ def render_map(
         prefer_canvas=True
     )
 
-    # 캠프 레이어 (항상 고정)
+    # 캠프 레이어
     camp_group = folium.FeatureGroup(name="캠프", show=True)
 
     for camp_code, info in CAMP_INFO.items():
@@ -846,7 +916,6 @@ def render_map(
 
     camp_group.add_to(m)
 
-    # 라우트별 색상
     route_list = sorted(
         valid_result["route"].dropna().unique().tolist(),
         key=lambda x: route_prefix_map.get(x, "")
@@ -901,7 +970,6 @@ def render_map(
             main_weight = 7
             dash_value = None
 
-        # 캠프 -> 첫 배송지 연결선
         camp_coord = camp_coords.get(camp_code)
         if camp_coord and len(line_points) >= 1:
             folium.PolyLine(
@@ -913,7 +981,6 @@ def render_map(
                 tooltip=f"{route_prefix_map.get(route, '')} 출발캠프: {camp_name}"
             ).add_to(route_group)
 
-        # 배송 동선
         if len(line_points) >= 2:
             folium.PolyLine(
                 line_points,
@@ -1034,7 +1101,6 @@ result_delivery = built["result_delivery"].copy()
 grouped_delivery = built["grouped_delivery"].copy()
 route_summary = built["route_summary"].copy()
 route_prefix_map = built["route_prefix_map"]
-route_total_map = built["route_total_map"]
 truck_request_map = built["truck_request_map"]
 route_line_label = built["route_line_label"]
 route_camp_map = built["route_camp_map"]
