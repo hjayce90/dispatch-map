@@ -978,9 +978,10 @@ def render_map(
 
             house_order = safe_int(row.get("house_order", 0))
             route_total = safe_int(row.get("route_total", 0))
-            is_start_or_end = route_total > 0 and house_order in {1, route_total}
-            size_scale = PIN_EDGE_SCALE if is_start_or_end else PIN_NORMAL_SCALE
-            border_color = PIN_EDGE_BORDER_COLOR if is_start_or_end else PIN_NORMAL_BORDER_COLOR
+            is_start = route_total > 0 and house_order == 1
+            is_end = route_total > 0 and house_order == route_total
+            size_scale = PIN_EDGE_SCALE if is_start else PIN_NORMAL_SCALE
+            border_color = PIN_EDGE_BORDER_COLOR if (is_start or is_end) else PIN_NORMAL_BORDER_COLOR
 
             if is_assigned_pin:
                 pin_text = short_driver_name(driver_name)
