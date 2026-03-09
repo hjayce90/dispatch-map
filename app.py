@@ -910,7 +910,7 @@ def render_map(
                 weight=2,
                 opacity=0.7,
                 dash_array="4, 6",
-                tooltip=f"{route_prefix_map.get(route, '')} 출발캠프: {camp_name}"
+                tooltip=f"{route_prefix_map.get(route, '')} 도착센터: {camp_name}"
             ).add_to(route_group)
 
         # 배송 동선
