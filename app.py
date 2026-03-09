@@ -52,6 +52,11 @@ ROUTE_COLORS = [
     "#7cb342", "#f4511e", "#00acc1", "#c0ca33",
 ]
 
+PIN_NORMAL_SCALE = 0.8
+PIN_EDGE_SCALE = 1.2
+PIN_NORMAL_BORDER_COLOR = "#ffffff"
+PIN_EDGE_BORDER_COLOR = "#111111"
+
 os.makedirs(MAP_DIR, exist_ok=True)
 os.makedirs(SHARE_DIR, exist_ok=True)
 
@@ -272,44 +277,55 @@ def load_share_payload(share_name: str):
         return None
 
 
-def make_stop_div_icon(route_color: str, stop_text: str):
+def make_stop_div_icon(route_color: str, stop_text: str, size_scale: float = 1.0, border_color: str = "#ffffff"):
+    base_size = 28
+    icon_size = max(16, int(round(base_size * size_scale)))
+    border_size = max(1, int(round(2 * size_scale)))
+    line_height = max(14, icon_size - border_size * 2)
+    anchor = icon_size // 2
     font_size = "11px" if len(str(stop_text)) <= 2 else "9px"
     html = f"""
     <div style="
-        width:28px;
-        height:28px;
+        width:{icon_size}px;
+        height:{icon_size}px;
         border-radius:50%;
         background:{route_color};
-        border:2px solid #ffffff;
+        border:{border_size}px solid {border_color};
         color:#ffffff;
         text-align:center;
-        line-height:24px;
+        line-height:{line_height}px;
         font-size:{font_size};
         font-weight:700;
         box-shadow:0 0 3px rgba(0,0,0,0.45);
     ">{stop_text}</div>
     """
-    return DivIcon(html=html, icon_size=(28, 28), icon_anchor=(14, 14))
+    return DivIcon(html=html, icon_size=(icon_size, icon_size), icon_anchor=(anchor, anchor))
 
 
-def make_assigned_square_icon(route_color: str, stop_text: str):
+def make_assigned_square_icon(route_color: str, stop_text: str, size_scale: float = 1.0, border_color: str = "#ffffff"):
+    base_size = 30
+    icon_size = max(16, int(round(base_size * size_scale)))
+    border_size = max(1, int(round(2 * size_scale)))
+    border_radius = max(3, int(round(6 * size_scale)))
+    line_height = max(14, icon_size - border_size * 2)
+    anchor = icon_size // 2
     font_size = "11px" if len(str(stop_text)) <= 2 else "9px"
     html = f"""
     <div style="
-        width:30px;
-        height:30px;
+        width:{icon_size}px;
+        height:{icon_size}px;
         background:{route_color};
-        border:2px solid #ffffff;
-        border-radius:6px;
+        border:{border_size}px solid {border_color};
+        border-radius:{border_radius}px;
         color:#ffffff;
         text-align:center;
-        line-height:26px;
+        line-height:{line_height}px;
         font-size:{font_size};
         font-weight:700;
         box-shadow:0 0 3px rgba(0,0,0,0.45);
     ">{stop_text}</div>
     """
-    return DivIcon(html=html, icon_size=(30, 30), icon_anchor=(15, 15))
+    return DivIcon(html=html, icon_size=(icon_size, icon_size), icon_anchor=(anchor, anchor))
 
 
 def make_diamond_div_icon(bg_color: str, text_value: str):
@@ -901,16 +917,16 @@ def render_map(
             main_weight = 7
             dash_value = None
 
-        # 캠프 -> 첫 배송지 연결선
+        # 캠프 -> 마지막 배송지 연결선
         camp_coord = camp_coords.get(camp_code)
         if camp_coord and len(line_points) >= 1:
             folium.PolyLine(
-                [[camp_coord[0], camp_coord[1]], line_points[0]],
+                [[camp_coord[0], camp_coord[1]], line_points[-1]],
                 color="#444444",
                 weight=2,
                 opacity=0.7,
                 dash_array="4, 6",
-                tooltip=f"{route_prefix_map.get(route, '')} 출발캠프: {camp_name}"
+                tooltip=f"{route_prefix_map.get(route, '')} 도착센터: {camp_name}"
             ).add_to(route_group)
 
         # 배송 동선
@@ -960,12 +976,18 @@ def render_map(
             <b>물량:</b> {safe_int(row['ae_sum'])}.{safe_int(row['af_sum'])}.{safe_int(row['ag_sum'])}
             """
 
+            house_order = safe_int(row.get("house_order", 0))
+            route_total = safe_int(row.get("route_total", 0))
+            is_start_or_end = route_total > 0 and house_order in {1, route_total}
+            size_scale = PIN_EDGE_SCALE if is_start_or_end else PIN_NORMAL_SCALE
+            border_color = PIN_EDGE_BORDER_COLOR if is_start_or_end else PIN_NORMAL_BORDER_COLOR
+
             if is_assigned_pin:
                 pin_text = short_driver_name(driver_name)
-                icon_obj = make_assigned_square_icon(pin_color, pin_text)
+                icon_obj = make_assigned_square_icon(pin_color, pin_text, size_scale=size_scale, border_color=border_color)
             else:
                 pin_text = str(row.get("pin_label", ""))
-                icon_obj = make_stop_div_icon(pin_color, pin_text)
+                icon_obj = make_stop_div_icon(pin_color, pin_text, size_scale=size_scale, border_color=border_color)
 
             folium.Marker(
                 [lat, lon],
