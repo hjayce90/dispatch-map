@@ -901,11 +901,11 @@ def render_map(
             main_weight = 7
             dash_value = None
 
-        # 캠프 -> 첫 배송지 연결선
+        # 캠프 -> 마지막 배송지 연결선
         camp_coord = camp_coords.get(camp_code)
         if camp_coord and len(line_points) >= 1:
             folium.PolyLine(
-                [[camp_coord[0], camp_coord[1]], line_points[0]],
+                [[camp_coord[0], camp_coord[1]], line_points[-1]],
                 color="#444444",
                 weight=2,
                 opacity=0.7,
