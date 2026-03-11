@@ -792,6 +792,17 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
     return assignment_store
 
 
+def resolve_group_count(route_feature_df: pd.DataFrame, manual_group_count=None) -> int:
+    if len(route_feature_df) == 0:
+        return 1
+
+    k = safe_int(manual_group_count)
+    if k <= 0:
+        k = choose_auto_group_count(route_feature_df)
+
+    return max(1, min(k, len(route_feature_df)))
+
+
 def build_map_data(result_delivery: pd.DataFrame, grouped_delivery: pd.DataFrame, assignment_df: pd.DataFrame, selected_filter: str):
     route_driver_map = {}
     if len(assignment_df) > 0:
