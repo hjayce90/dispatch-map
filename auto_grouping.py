@@ -4,6 +4,23 @@ from typing import Dict, List, Tuple
 import pandas as pd
 
 
+SYMBOL_GOOD = "■"
+SYMBOL_MID = "▣"
+SYMBOL_BAD = "□"
+
+
+def to_three_level_symbol(score: float) -> str:
+    if score >= 0.66:
+        return SYMBOL_GOOD
+    if score >= 0.33:
+        return SYMBOL_MID
+    return SYMBOL_BAD
+
+
+def to_symbol_summary(parts: List[Tuple[str, str]]) -> str:
+    return " / ".join(f"{label} {mark}" for label, mark in parts)
+
+
 def safe_int(v) -> int:
     try:
         if pd.isna(v):
@@ -451,28 +468,33 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
             box_deviation_rate = abs(total_boxes - avg_boxes) / avg_boxes
 
         if spread_km <= 10:
-            route_mark = "●"
+            route_mark = SYMBOL_GOOD
         elif spread_km <= 18:
-            route_mark = "◐"
+            route_mark = SYMBOL_MID
         else:
-            route_mark = "○"
+            route_mark = SYMBOL_BAD
 
         if avg_stops:
             gap = abs(total_stops - avg_stops)
-            stop_mark = "●" if gap <= 5 else "◐"
+            stop_mark = SYMBOL_GOOD if gap <= 5 else SYMBOL_MID
         else:
-            stop_mark = "◐"
+            stop_mark = SYMBOL_MID
 
-        qty_mark = "●" if box_deviation_rate <= 0.2 else "◐"
+        qty_mark = SYMBOL_GOOD if box_deviation_rate <= 0.2 else SYMBOL_MID
 
         if total_minutes <= 240:
-            time_mark = "●"
+            time_mark = SYMBOL_GOOD
         elif total_minutes <= 270:
-            time_mark = "◐"
+            time_mark = SYMBOL_MID
         else:
-            time_mark = "○"
+            time_mark = SYMBOL_BAD
 
-        reason_summary = f"라우트 {route_mark} / 스톱수 {stop_mark} / 수량차이 {qty_mark} / 예상시간 {time_mark}"
+        reason_summary = to_symbol_summary([
+            ("라우트", route_mark),
+            ("스톱수", stop_mark),
+            ("수량", qty_mark),
+            ("시간", time_mark),
+        ])
 
         rows.append({
             "추천그룹": gname,
@@ -535,46 +557,57 @@ def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[s
         return pd.DataFrame()
 
     out = route_feature_df.copy()
-    out["추천그룹"] = out["route"].map(group_map).fillna("")
+    out["추천그룹"] = out["route"].map(group_map).fillna("추천그룹 1")
 
-    box_score = _inverse_minmax(out["총합"])
-    stop_score = _inverse_minmax(out["스톱수"])
-    minute_score = _inverse_minmax(out["보정걸린분"])
-    spread_score = _inverse_minmax(out["route_spread_km"])
+    group_rows = []
+    group_names = sorted(
+        out["추천그룹"].dropna().unique().tolist(),
+        key=lambda x: int(str(x).replace("추천그룹 ", ""))
+    )
 
-    out["선호예상점수"] = (
+    for gname in group_names:
+        part = out[out["추천그룹"] == gname].copy()
+        group_rows.append({
+            "추천그룹": gname,
+            "라우트수": int(part["route"].nunique()),
+            "총합": safe_int(part["총합"].sum()),
+            "스톱수": safe_int(part["스톱수"].sum()),
+            "보정걸린분": safe_int(part["보정걸린분"].sum()),
+            "route_spread_km": max_pairwise_distance([xy for coords in part["coords_list"].tolist() for xy in coords]),
+        })
+
+    pref_df = pd.DataFrame(group_rows)
+    if len(pref_df) == 0:
+        return pref_df
+
+    box_score = _inverse_minmax(pref_df["총합"])
+    stop_score = _inverse_minmax(pref_df["스톱수"])
+    minute_score = _inverse_minmax(pref_df["보정걸린분"])
+    spread_score = _inverse_minmax(pref_df["route_spread_km"])
+
+    pref_df["선호예상점수"] = (
         box_score * 0.35
         + stop_score * 0.20
         + minute_score * 0.30
         + spread_score * 0.15
     ) * 100
 
-    out["선호예상순위"] = out["선호예상점수"].rank(method="dense", ascending=False).astype(int)
-
-    reason_labels = {
-        "box": "박스 수가 상대적으로 적음",
-        "stop": "스톱 수가 상대적으로 적음",
-        "minute": "예상 소요시간이 짧은 편",
-        "spread": "라우트 퍼짐이 작은 편",
-    }
+    pref_df["선호예상순위"] = pref_df["선호예상점수"].rank(method="dense", ascending=False).astype(int)
 
     reason_rows = []
-    for i in out.index:
-        strengths = [
-            ("box", float(box_score.loc[i])),
-            ("stop", float(stop_score.loc[i])),
-            ("minute", float(minute_score.loc[i])),
-            ("spread", float(spread_score.loc[i])),
-        ]
-        strengths.sort(key=lambda x: x[1], reverse=True)
-        top2 = [reason_labels[k] for k, _ in strengths[:2]]
-        reason_rows.append(" / ".join(top2))
+    for i in pref_df.index:
+        reason_rows.append(to_symbol_summary([
+            ("총합", to_three_level_symbol(float(box_score.loc[i]))),
+            ("스톱", to_three_level_symbol(float(stop_score.loc[i]))),
+            ("시간", to_three_level_symbol(float(minute_score.loc[i]))),
+            ("퍼짐", to_three_level_symbol(float(spread_score.loc[i]))),
+        ]))
 
-    out["선호이유"] = reason_rows
+    pref_df["선호이유"] = reason_rows
 
-    return out[[
-        "route",
+    return pref_df[[
         "추천그룹",
+        "라우트수",
         "총합",
         "스톱수",
         "보정걸린분",
@@ -582,7 +615,7 @@ def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[s
         "선호예상점수",
         "선호예상순위",
         "선호이유",
-    ]].sort_values(["선호예상순위", "route"]).reset_index(drop=True)
+    ]].sort_values(["선호예상순위", "추천그룹"]).reset_index(drop=True)
 
 
 def default_group_edit_map(group_assignment_df: pd.DataFrame) -> Dict[str, str]:
