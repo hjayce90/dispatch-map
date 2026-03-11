@@ -10,6 +10,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import folium
 from folium.features import DivIcon
+from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 
 from auto_grouping import (
@@ -925,9 +926,23 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
     st.subheader("기사 배정")
     st.caption("구분 / 캠프 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
 
-    def styled_qty_html(value: int, color: str, bold: bool = False) -> str:
-        weight = "700" if bold else "500"
-        return f"<span style='color:{color}; font-weight:{weight};'>{safe_int(value)}</span>"
+    def styled_qty_badge_html(value: int, kind: str) -> str:
+        palette = {
+            "small": {"bg": "rgba(248, 113, 113, 0.10)", "text": "#fca5a5", "weight": "600"},
+            "medium": {"bg": "rgba(251, 113, 133, 0.12)", "text": "#fda4af", "weight": "600"},
+            "large": {"bg": "rgba(253, 186, 116, 0.14)", "text": "#fdba74", "weight": "600"},
+            "total": {"bg": "rgba(59, 130, 246, 0.14)", "text": "#bfdbfe", "weight": "700"},
+        }
+        style = palette.get(kind, palette["small"])
+        return (
+            "<span style='display:inline-block; min-width:40px; text-align:right;"
+            " padding:1px 8px; border-radius:6px;"
+            f" background:{style['bg']}; color:{style['text']};"
+            " border:1px solid rgba(255,255,255,0.08);"
+            f" font-weight:{style['weight']}; letter-spacing:0.01em; line-height:1.35;'>"
+            f"{safe_int(value)}"
+            "</span>"
+        )
 
     driver_options = [""] + drivers
 
@@ -953,10 +968,10 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
             c4.write(safe_int(row["스톱수"]))
             c5.write(str(row["시작시간"]))
             c6.write(str(row["종료시간"]))
-            c7.markdown(styled_qty_html(row["소형합"], "#6b7280"), unsafe_allow_html=True)
-            c8.markdown(styled_qty_html(row["중형합"], "#4b5563"), unsafe_allow_html=True)
-            c9.markdown(styled_qty_html(row["대형합"], "#374151"), unsafe_allow_html=True)
-            c10.markdown(styled_qty_html(row["총합"], "#1f2937", bold=True), unsafe_allow_html=True)
+            c7.markdown(styled_qty_badge_html(row["소형합"], "small"), unsafe_allow_html=True)
+            c8.markdown(styled_qty_badge_html(row["중형합"], "medium"), unsafe_allow_html=True)
+            c9.markdown(styled_qty_badge_html(row["대형합"], "large"), unsafe_allow_html=True)
+            c10.markdown(styled_qty_badge_html(row["총합"], "total"), unsafe_allow_html=True)
 
             selected_driver = c11.selectbox(
                 f"기사선택_{route}_{truck_request_id}",
@@ -1325,6 +1340,14 @@ def render_group_map(
         route_tooltip = f"{group_label} / {small_sum + medium_sum + large_sum}개({small_sum}/{medium_sum}/{large_sum})"
 
         route_group = folium.FeatureGroup(name=f"{route_prefix_map.get(route, '')}", show=True)
+        marker_cluster = MarkerCluster(
+            options={
+                "spiderfyOnMaxZoom": True,
+                "showCoverageOnHover": False,
+                "zoomToBoundsOnClick": True,
+                "maxClusterRadius": 35,
+            }
+        ).add_to(route_group)
 
         line_points = []
         route_df_line_house = route_df_line.drop_duplicates(subset=["address_norm"], keep="first")
@@ -1375,7 +1398,7 @@ def render_group_map(
                 popup=popup_html,
                 tooltip=marker_tooltip,
                 icon=make_stop_div_icon(route_color, str(row.get("pin_label", "")), size_scale=size_scale, border_color=border_color)
-            ).add_to(route_group)
+            ).add_to(marker_cluster)
 
         route_group.add_to(m)
 
