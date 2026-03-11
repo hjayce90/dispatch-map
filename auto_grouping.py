@@ -228,6 +228,56 @@ def recompute_centers(route_feature_df: pd.DataFrame, group_map: Dict[str, str],
     return centers
 
 
+def count_routes_per_group(group_map: Dict[str, str], k: int) -> Dict[str, int]:
+    counts = {f"추천그룹 {i}": 0 for i in range(1, k + 1)}
+    for gname in group_map.values():
+        if gname in counts:
+            counts[gname] += 1
+    return counts
+
+
+def fill_empty_groups(route_feature_df: pd.DataFrame, group_map: Dict[str, str], k: int) -> Dict[str, str]:
+    """빈 그룹이 없도록 다른 그룹에서 라우트를 하나씩 이동해 채운다."""
+    if len(route_feature_df) == 0:
+        return group_map
+
+    adjusted_map = group_map.copy()
+    score_cache = evaluate_group_score(route_feature_df, adjusted_map)
+
+    while True:
+        counts = count_routes_per_group(adjusted_map, k)
+        empty_groups = [g for g, c in counts.items() if c == 0]
+        if not empty_groups:
+            break
+
+        target_group = empty_groups[0]
+        donor_groups = [g for g, c in counts.items() if c > 1]
+        if not donor_groups:
+            break
+
+        best_route = None
+        best_score_delta = float("inf")
+
+        for donor_group in donor_groups:
+            donor_routes = [r for r, g in adjusted_map.items() if g == donor_group]
+            for route in donor_routes:
+                test_map = adjusted_map.copy()
+                test_map[route] = target_group
+                test_score = evaluate_group_score(route_feature_df, test_map)
+                score_delta = test_score - score_cache
+                if score_delta < best_score_delta:
+                    best_score_delta = score_delta
+                    best_route = route
+
+        if best_route is None:
+            break
+
+        adjusted_map[best_route] = target_group
+        score_cache = evaluate_group_score(route_feature_df, adjusted_map)
+
+    return adjusted_map
+
+
 def evaluate_group_score(route_feature_df: pd.DataFrame, group_map: Dict[str, str]) -> float:
     if len(route_feature_df) == 0:
         return 0.0
@@ -302,6 +352,7 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
 
     centers = [(s[1], s[2]) for s in seeds]
     group_map = assign_routes_to_centers(route_feature_df, centers)
+    group_map = fill_empty_groups(route_feature_df, group_map, k)
 
     for _ in range(5):
         centers = recompute_centers(route_feature_df, group_map, k)
@@ -317,6 +368,7 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
 
         usable_centers = [(a, b) for a, b in valid_centers if a is not None and b is not None]
         group_map = assign_routes_to_centers(route_feature_df, usable_centers)
+        group_map = fill_empty_groups(route_feature_df, group_map, k)
 
     current_score = evaluate_group_score(route_feature_df, group_map)
     routes = route_feature_df["route"].tolist()
@@ -332,6 +384,10 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
             original_group = group_map.get(route)
             best_group = original_group
             best_score = current_score
+
+            group_counts = count_routes_per_group(group_map, k)
+            if group_counts.get(original_group, 0) <= 1:
+                continue
 
             for candidate_group in all_groups:
                 if candidate_group == original_group:
@@ -349,6 +405,8 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
                 group_map[route] = best_group
                 current_score = best_score
                 improved = True
+
+    group_map = fill_empty_groups(route_feature_df, group_map, k)
 
     return group_map
 
@@ -433,6 +491,101 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
         })
 
     return pd.DataFrame(rows)
+
+
+
+
+def build_group_detail_stats_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
+    if len(group_assignment_df) == 0:
+        return pd.DataFrame(columns=["추천그룹", "라우트개수", "박스총개수", "소형합", "중형합", "대형합"])
+
+    grouped = (
+        group_assignment_df.groupby("추천그룹", as_index=False)
+        .agg({
+            "route": "nunique",
+            "총합": "sum",
+            "소형합": "sum",
+            "중형합": "sum",
+            "대형합": "sum",
+        })
+        .rename(columns={
+            "route": "라우트개수",
+            "총합": "박스총개수",
+            "소형합": "소형합",
+            "중형합": "중형합",
+            "대형합": "대형합",
+        })
+    )
+
+    grouped = grouped.sort_values(
+        by="추천그룹",
+        key=lambda col: col.map(lambda x: int(str(x).replace("추천그룹 ", "")))
+    ).reset_index(drop=True)
+    return grouped
+
+
+def _inverse_minmax(series: pd.Series) -> pd.Series:
+    s = series.fillna(0).astype(float)
+    s_min = s.min()
+    s_max = s.max()
+    if s_max == s_min:
+        return pd.Series([1.0] * len(s), index=s.index)
+    return 1.0 - ((s - s_min) / (s_max - s_min))
+
+
+def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[str, str]) -> pd.DataFrame:
+    if len(route_feature_df) == 0:
+        return pd.DataFrame()
+
+    out = route_feature_df.copy()
+    out["추천그룹"] = out["route"].map(group_map).fillna("")
+
+    box_score = _inverse_minmax(out["총합"])
+    stop_score = _inverse_minmax(out["스톱수"])
+    minute_score = _inverse_minmax(out["보정걸린분"])
+    spread_score = _inverse_minmax(out["route_spread_km"])
+
+    out["선호예상점수"] = (
+        box_score * 0.35
+        + stop_score * 0.20
+        + minute_score * 0.30
+        + spread_score * 0.15
+    ) * 100
+
+    out["선호예상순위"] = out["선호예상점수"].rank(method="dense", ascending=False).astype(int)
+
+    reason_labels = {
+        "box": "박스 수가 상대적으로 적음",
+        "stop": "스톱 수가 상대적으로 적음",
+        "minute": "예상 소요시간이 짧은 편",
+        "spread": "라우트 퍼짐이 작은 편",
+    }
+
+    reason_rows = []
+    for i in out.index:
+        strengths = [
+            ("box", float(box_score.loc[i])),
+            ("stop", float(stop_score.loc[i])),
+            ("minute", float(minute_score.loc[i])),
+            ("spread", float(spread_score.loc[i])),
+        ]
+        strengths.sort(key=lambda x: x[1], reverse=True)
+        top2 = [reason_labels[k] for k, _ in strengths[:2]]
+        reason_rows.append(" / ".join(top2))
+
+    out["선호이유"] = reason_rows
+
+    return out[[
+        "route",
+        "추천그룹",
+        "총합",
+        "스톱수",
+        "보정걸린분",
+        "route_spread_km",
+        "선호예상점수",
+        "선호예상순위",
+        "선호이유",
+    ]].sort_values(["선호예상순위", "route"]).reset_index(drop=True)
 
 
 def default_group_edit_map(group_assignment_df: pd.DataFrame) -> Dict[str, str]:
