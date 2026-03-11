@@ -11,6 +11,17 @@ import folium
 from folium.features import DivIcon
 from streamlit_folium import st_folium
 
+from auto_grouping import (
+    apply_group_edit_map,
+    build_group_assignment_df,
+    build_group_map_data,
+    build_group_summary_df,
+    build_route_feature_df,
+    choose_auto_group_count,
+    default_group_edit_map,
+    recommend_route_groups,
+)
+
 st.set_page_config(page_title="배차 지도", layout="wide")
 st.title("배차 지도")
 
@@ -1003,6 +1014,116 @@ def render_map(
     return m
 
 
+def render_group_map(
+    valid_result: pd.DataFrame,
+    valid_grouped: pd.DataFrame,
+    route_prefix_map: dict,
+    route_camp_map: dict,
+    camp_coords: dict,
+):
+    # 추천그룹 확인용 지도
+    center_lat, center_lon = 37.55, 126.98
+
+    for camp_code in CAMP_INFO.keys():
+        coords = camp_coords.get(camp_code)
+        if coords:
+            center_lat, center_lon = coords
+            break
+
+    if len(valid_result) > 0 and valid_result.iloc[0]["coords"] is not None:
+        center_lat = valid_result.iloc[0]["coords"][0]
+        center_lon = valid_result.iloc[0]["coords"][1]
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=10, prefer_canvas=True)
+
+    camp_group = folium.FeatureGroup(name="캠프", show=True)
+    for camp_code, info in CAMP_INFO.items():
+        coords = camp_coords.get(camp_code)
+        if not coords:
+            continue
+
+        folium.Marker(
+            [coords[0], coords[1]],
+            popup=f"<b>캠프:</b> {info['camp_name']}<br><b>코드:</b> {camp_code}<br><b>주소:</b> {info['address']}",
+            tooltip=info["camp_name"],
+            icon=make_camp_icon(camp_code)
+        ).add_to(camp_group)
+    camp_group.add_to(m)
+
+    route_list = sorted(
+        valid_result["route"].dropna().unique().tolist(),
+        key=lambda x: route_prefix_map.get(x, "")
+    )
+
+    group_list = sorted([g for g in valid_result["추천그룹"].dropna().unique().tolist() if str(g).strip() != ""])
+    group_color_map = {group_name: ROUTE_COLORS[i % len(ROUTE_COLORS)] for i, group_name in enumerate(group_list)}
+
+    for route in route_list:
+        route_df_line = valid_result[valid_result["route"] == route].sort_values("house_order")
+        if len(route_df_line) == 0:
+            continue
+
+        group_name = str(route_df_line.iloc[0].get("추천그룹", "")).strip()
+        route_color = group_color_map.get(group_name, "#1e88e5")
+        camp_code = route_camp_map.get(route, "")
+        camp_name = CAMP_INFO.get(camp_code, {}).get("camp_name", "")
+
+        route_group = folium.FeatureGroup(name=f"{route_prefix_map.get(route, '')}", show=True)
+
+        line_points = []
+        route_df_line_house = route_df_line.drop_duplicates(subset=["address_norm"], keep="first")
+        for _, row in route_df_line_house.iterrows():
+            lat, lon = row["coords"]
+            line_points.append([lat, lon])
+
+        camp_coord = camp_coords.get(camp_code)
+        if camp_coord and len(line_points) >= 1:
+            folium.PolyLine(
+                [[camp_coord[0], camp_coord[1]], line_points[-1]],
+                color="#444444",
+                weight=2,
+                opacity=0.7,
+                dash_array="4, 6",
+                tooltip=f"{route_prefix_map.get(route, '')} 도착센터: {camp_name}"
+            ).add_to(route_group)
+
+        if len(line_points) >= 2:
+            folium.PolyLine(line_points, color="#111111", weight=8, opacity=0.55).add_to(route_group)
+            folium.PolyLine(line_points, color=route_color, weight=5, opacity=0.95).add_to(route_group)
+
+        route_grouped = valid_grouped[valid_grouped["route"] == route].copy()
+        for _, row in route_grouped.iterrows():
+            lat, lon = row["coords"]
+            popup_html = f"""
+            <b>추천그룹:</b> {row.get('추천그룹', '')}<br>
+            <b>루트:</b> {row.get('route', '')}<br>
+            <b>트럭요청ID:</b> {row.get('truck_request_id', '')}<br>
+            <b>주소:</b> {row.get('address', '')}<br>
+            <b>업체명:</b> {row.get('company_name', '')}<br>
+            <b>건수:</b> {safe_int(row.get('stop_count', 0))}<br>
+            <b>물량:</b> {safe_int(row.get('ae_sum', 0))}.{safe_int(row.get('af_sum', 0))}.{safe_int(row.get('ag_sum', 0))}
+            """
+
+            house_order = safe_int(row.get("house_order", 0))
+            route_total = safe_int(row.get("route_total", 0))
+            is_start = route_total > 0 and house_order == 1
+            is_end = route_total > 0 and house_order == route_total
+            size_scale = PIN_EDGE_SCALE if is_start else PIN_NORMAL_SCALE
+            border_color = PIN_EDGE_BORDER_COLOR if (is_start or is_end) else PIN_NORMAL_BORDER_COLOR
+
+            folium.Marker(
+                [lat, lon],
+                popup=popup_html,
+                tooltip=f"{row.get('추천그룹', '')} / {row.get('route', '')}",
+                icon=make_stop_div_icon(route_color, str(row.get("pin_label", "")), size_scale=size_scale, border_color=border_color)
+            ).add_to(route_group)
+
+        route_group.add_to(m)
+
+    folium.LayerControl(collapsed=False, position="topright").add_to(m)
+    return m
+
+
 # =========================
 # 공유 링크로 직접 열기
 # =========================
@@ -1072,6 +1193,76 @@ with st.spinner("주소 좌표 확인 중..."):
     grouped_delivery, cache = attach_coords_by_unique_address(grouped_delivery, cache)
     camp_coords, cache = resolve_camp_coords(cache)
     save_geocode_cache(cache)
+
+# 추천배정 엔진 (기존 기사배정과 분리)
+st.subheader("추천배정 엔진")
+group_count_mode = st.radio("추천그룹 수 설정", ["자동", "직접입력"], horizontal=True)
+manual_group_count = None
+
+if group_count_mode == "직접입력":
+    manual_group_count = st.number_input("추천그룹 수", min_value=1, max_value=max(1, len(route_summary)), value=2, step=1)
+else:
+    route_feature_df_for_count = build_route_feature_df(route_summary, grouped_delivery)
+    auto_group_count = choose_auto_group_count(route_feature_df_for_count)
+    st.caption(f"자동 추천그룹 수: {auto_group_count}")
+
+if st.button("추천그룹 자동 추천 실행"):
+    route_feature_df = build_route_feature_df(route_summary, grouped_delivery)
+    recommended_group_map = recommend_route_groups(route_feature_df, manual_group_count=manual_group_count)
+    st.session_state["recommended_group_map"] = recommended_group_map
+    st.success("추천그룹 생성을 완료했습니다.")
+
+if "recommended_group_map" in st.session_state:
+    route_feature_df = build_route_feature_df(route_summary, grouped_delivery)
+    recommended_group_map = st.session_state["recommended_group_map"]
+    group_assignment_df = build_group_assignment_df(route_feature_df, recommended_group_map)
+    group_summary_df = build_group_summary_df(group_assignment_df)
+
+    st.subheader("추천그룹 요약")
+    st.dataframe(group_summary_df, use_container_width=True)
+
+    st.subheader("추천그룹 수정")
+    edit_map = default_group_edit_map(group_assignment_df)
+    group_options = sorted(group_assignment_df["추천그룹"].dropna().unique().tolist())
+    with st.form("group_edit_form", clear_on_submit=False):
+        new_group_map = edit_map.copy()
+        for _, row in group_assignment_df.sort_values(["route_prefix", "route"]).iterrows():
+            route = row["route"]
+            current_group = recommended_group_map.get(route, row["추천그룹"])
+            default_idx = group_options.index(current_group) if current_group in group_options else 0
+
+            c1, c2, c3, c4 = st.columns([1.0, 0.8, 1.2, 1.2])
+            c1.write(str(route))
+            c2.write(str(row.get("route_prefix", "")))
+            c3.write(str(row.get("truck_request_id", "")))
+            selected_group = c4.selectbox(
+                f"추천그룹선택_{route}",
+                options=group_options,
+                index=default_idx,
+                label_visibility="collapsed",
+                key=f"group_select_{route}"
+            )
+            new_group_map[route] = selected_group
+
+        group_submitted = st.form_submit_button("추천그룹 수정 적용")
+
+    if group_submitted:
+        updated_assignment_df = apply_group_edit_map(route_feature_df, new_group_map)
+        st.session_state["recommended_group_map"] = default_group_edit_map(updated_assignment_df)
+        st.success("추천그룹 수동 수정을 반영했습니다.")
+
+    final_group_map = st.session_state["recommended_group_map"]
+    group_map_result, group_map_grouped = build_group_map_data(result_delivery, grouped_delivery, final_group_map)
+
+    st.subheader("추천그룹 지도")
+    group_map_view = render_group_map(
+        valid_result=group_map_result,
+        valid_grouped=group_map_grouped,
+        route_prefix_map=route_prefix_map,
+        route_camp_map=route_camp_map,
+        camp_coords=camp_coords,
+    )
+    st_folium(group_map_view, width=None, height=700)
 
 st.subheader("지도")
 
