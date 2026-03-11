@@ -925,9 +925,22 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
     st.subheader("기사 배정")
     st.caption("구분 / 캠프 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
 
-    def styled_qty_html(value: int, color: str, bold: bool = False) -> str:
-        weight = "700" if bold else "500"
-        return f"<span style='color:{color}; font-weight:{weight};'>{safe_int(value)}</span>"
+    def styled_qty_badge_html(value: int, kind: str) -> str:
+        palette = {
+            "small": {"bg": "#7f1d1d", "border": "#b91c1c", "text": "#fee2e2"},
+            "medium": {"bg": "#991b1b", "border": "#dc2626", "text": "#fee2e2"},
+            "large": {"bg": "#b91c1c", "border": "#ef4444", "text": "#fff1f2"},
+            "total": {"bg": "#1e3a8a", "border": "#3b82f6", "text": "#dbeafe"},
+        }
+        style = palette.get(kind, palette["small"])
+        return (
+            "<span style='display:inline-flex; align-items:center; justify-content:center;"
+            " min-width:44px; padding:2px 10px; border-radius:999px;"
+            f" background:{style['bg']}; color:{style['text']}; border:1px solid {style['border']};"
+            " font-weight:700; letter-spacing:0.01em; line-height:1.3;'>"
+            f"{safe_int(value)}"
+            "</span>"
+        )
 
     driver_options = [""] + drivers
 
@@ -953,10 +966,10 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
             c4.write(safe_int(row["스톱수"]))
             c5.write(str(row["시작시간"]))
             c6.write(str(row["종료시간"]))
-            c7.markdown(styled_qty_html(row["소형합"], "#6b7280"), unsafe_allow_html=True)
-            c8.markdown(styled_qty_html(row["중형합"], "#4b5563"), unsafe_allow_html=True)
-            c9.markdown(styled_qty_html(row["대형합"], "#374151"), unsafe_allow_html=True)
-            c10.markdown(styled_qty_html(row["총합"], "#1f2937", bold=True), unsafe_allow_html=True)
+            c7.markdown(styled_qty_badge_html(row["소형합"], "small"), unsafe_allow_html=True)
+            c8.markdown(styled_qty_badge_html(row["중형합"], "medium"), unsafe_allow_html=True)
+            c9.markdown(styled_qty_badge_html(row["대형합"], "large"), unsafe_allow_html=True)
+            c10.markdown(styled_qty_badge_html(row["총합"], "total"), unsafe_allow_html=True)
 
             selected_driver = c11.selectbox(
                 f"기사선택_{route}_{truck_request_id}",
