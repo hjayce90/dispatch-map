@@ -1461,25 +1461,18 @@ if shared_map:
             left_col, right_col = st.columns([1.3, 8.7], gap="medium")
 
             with left_col:
-                st.markdown("### 필터")
-                view_mode = st.radio("보기 모드", ["전체 보기", "기사별 보기", "추천그룹별 보기"], label_visibility="collapsed")
-
-                selected_driver = ""
-                selected_group = ""
-
-                if view_mode == "기사별 보기":
-                    driver_options = sorted([d for d in shared_result_df["assigned_driver"].fillna("").astype(str).unique().tolist() if d.strip() != ""])
-                    selected_driver = st.selectbox("기사 선택", driver_options) if driver_options else ""
-                elif view_mode == "추천그룹별 보기":
-                    group_options = sorted([g for g in shared_result_df["추천그룹"].fillna("").astype(str).unique().tolist() if g.strip() != ""])
-                    selected_group = st.selectbox("추천그룹 선택", group_options) if group_options else ""
+                st.markdown("### 추천그룹 선택")
+                group_options = sorted([g for g in shared_result_df["추천그룹"].fillna("").astype(str).unique().tolist() if g.strip() != ""])
+                selectable_groups = ["전체"] + group_options if group_options else ["전체"]
+                selected_group = st.selectbox("추천그룹", selectable_groups, label_visibility="collapsed")
+                shared_view_mode = "추천그룹별 보기" if selected_group != "전체" else "전체 보기"
 
                 filtered_result, filtered_grouped = _filter_shared_view(
                     shared_result_df,
                     shared_grouped_df,
-                    mode=view_mode,
-                    selected_driver=selected_driver,
-                    selected_group=selected_group,
+                    mode=shared_view_mode,
+                    selected_driver="",
+                    selected_group=selected_group if selected_group != "전체" else "",
                 )
 
                 route_count, driver_count, group_count, small_box_total, medium_box_total, large_box_total, box_total, overlap_count = _build_shared_summary(filtered_result, filtered_grouped)
@@ -1490,27 +1483,6 @@ if shared_map:
                 st.metric("박스 총합", f"{box_total}개")
                 st.caption(f"소 {small_box_total} / 중 {medium_box_total} / 대 {large_box_total}")
                 st.caption(f"동일위치 겹침 {overlap_count}건")
-
-                route_summary_df = pd.DataFrame()
-                if len(filtered_result) > 0 and "route" in filtered_result.columns:
-                    route_summary_df = (
-                        filtered_result.groupby("route", as_index=False)
-                        .agg(
-                            truck_request_id=("truck_request_id", "first"),
-                            assigned_driver=("assigned_driver", "first"),
-                            추천그룹=("추천그룹", "first"),
-                        )
-                    )
-                    route_summary_df["truck_request_id"] = route_summary_df["route"].map(truck_request_map_payload).fillna(route_summary_df["truck_request_id"])
-
-                if len(route_summary_df) > 0:
-                    st.markdown("### 라우트/요청 정보")
-                    st.dataframe(
-                        route_summary_df[["추천그룹", "route", "truck_request_id", "assigned_driver"]],
-                        hide_index=True,
-                        use_container_width=True,
-                        height=min(220, 36 * (len(route_summary_df) + 1)),
-                    )
 
             route_driver_map = {}
             if len(filtered_result) > 0 and "route" in filtered_result.columns and "assigned_driver" in filtered_result.columns:
@@ -1534,9 +1506,7 @@ if shared_map:
             assignment_rows = payload.get("assignment_rows", [])
             if assignment_rows:
                 assignment_df_payload = pd.DataFrame(assignment_rows)
-                if view_mode == "기사별 보기" and selected_driver:
-                    assignment_df_payload = assignment_df_payload[assignment_df_payload["assigned_driver"].fillna("").astype(str) == selected_driver].copy()
-                elif view_mode == "추천그룹별 보기" and selected_group and "추천그룹" in assignment_df_payload.columns:
+                if shared_view_mode == "추천그룹별 보기" and selected_group and selected_group != "전체" and "추천그룹" in assignment_df_payload.columns:
                     assignment_df_payload = assignment_df_payload[assignment_df_payload["추천그룹"].fillna("").astype(str) == selected_group].copy()
                 st.dataframe(assignment_df_payload, use_container_width=True)
 
