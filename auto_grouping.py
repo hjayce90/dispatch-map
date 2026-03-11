@@ -228,6 +228,56 @@ def recompute_centers(route_feature_df: pd.DataFrame, group_map: Dict[str, str],
     return centers
 
 
+def count_routes_per_group(group_map: Dict[str, str], k: int) -> Dict[str, int]:
+    counts = {f"추천그룹 {i}": 0 for i in range(1, k + 1)}
+    for gname in group_map.values():
+        if gname in counts:
+            counts[gname] += 1
+    return counts
+
+
+def fill_empty_groups(route_feature_df: pd.DataFrame, group_map: Dict[str, str], k: int) -> Dict[str, str]:
+    """빈 그룹이 없도록 다른 그룹에서 라우트를 하나씩 이동해 채운다."""
+    if len(route_feature_df) == 0:
+        return group_map
+
+    adjusted_map = group_map.copy()
+    score_cache = evaluate_group_score(route_feature_df, adjusted_map)
+
+    while True:
+        counts = count_routes_per_group(adjusted_map, k)
+        empty_groups = [g for g, c in counts.items() if c == 0]
+        if not empty_groups:
+            break
+
+        target_group = empty_groups[0]
+        donor_groups = [g for g, c in counts.items() if c > 1]
+        if not donor_groups:
+            break
+
+        best_route = None
+        best_score_delta = float("inf")
+
+        for donor_group in donor_groups:
+            donor_routes = [r for r, g in adjusted_map.items() if g == donor_group]
+            for route in donor_routes:
+                test_map = adjusted_map.copy()
+                test_map[route] = target_group
+                test_score = evaluate_group_score(route_feature_df, test_map)
+                score_delta = test_score - score_cache
+                if score_delta < best_score_delta:
+                    best_score_delta = score_delta
+                    best_route = route
+
+        if best_route is None:
+            break
+
+        adjusted_map[best_route] = target_group
+        score_cache = evaluate_group_score(route_feature_df, adjusted_map)
+
+    return adjusted_map
+
+
 def evaluate_group_score(route_feature_df: pd.DataFrame, group_map: Dict[str, str]) -> float:
     if len(route_feature_df) == 0:
         return 0.0
@@ -302,6 +352,7 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
 
     centers = [(s[1], s[2]) for s in seeds]
     group_map = assign_routes_to_centers(route_feature_df, centers)
+    group_map = fill_empty_groups(route_feature_df, group_map, k)
 
     for _ in range(5):
         centers = recompute_centers(route_feature_df, group_map, k)
@@ -317,6 +368,7 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
 
         usable_centers = [(a, b) for a, b in valid_centers if a is not None and b is not None]
         group_map = assign_routes_to_centers(route_feature_df, usable_centers)
+        group_map = fill_empty_groups(route_feature_df, group_map, k)
 
     current_score = evaluate_group_score(route_feature_df, group_map)
     routes = route_feature_df["route"].tolist()
@@ -332,6 +384,10 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
             original_group = group_map.get(route)
             best_group = original_group
             best_score = current_score
+
+            group_counts = count_routes_per_group(group_map, k)
+            if group_counts.get(original_group, 0) <= 1:
+                continue
 
             for candidate_group in all_groups:
                 if candidate_group == original_group:
@@ -349,6 +405,8 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
                 group_map[route] = best_group
                 current_score = best_score
                 improved = True
+
+    group_map = fill_empty_groups(route_feature_df, group_map, k)
 
     return group_map
 
