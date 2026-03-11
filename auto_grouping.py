@@ -140,6 +140,17 @@ def choose_auto_group_count(route_feature_df: pd.DataFrame) -> int:
     return max(1, min(k, n_routes))
 
 
+def resolve_group_count(route_feature_df: pd.DataFrame, manual_group_count=None) -> int:
+    if len(route_feature_df) == 0:
+        return 1
+
+    k = safe_int(manual_group_count)
+    if k <= 0:
+        k = choose_auto_group_count(route_feature_df)
+
+    return max(1, min(k, len(route_feature_df)))
+
+
 def init_farthest_seeds(route_feature_df: pd.DataFrame, k: int):
     valid = route_feature_df.dropna(subset=["centroid_lat", "centroid_lon"]).copy()
     if len(valid) == 0:
@@ -283,11 +294,7 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
     if len(route_feature_df) == 0:
         return {}
 
-    k = safe_int(manual_group_count)
-    if k <= 0:
-        k = choose_auto_group_count(route_feature_df)
-
-    k = max(1, min(k, len(route_feature_df)))
+    k = resolve_group_count(route_feature_df, manual_group_count=manual_group_count)
 
     seeds = init_farthest_seeds(route_feature_df, k)
     if not seeds:
@@ -313,7 +320,7 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
 
     current_score = evaluate_group_score(route_feature_df, group_map)
     routes = route_feature_df["route"].tolist()
-    all_groups = sorted(set(group_map.values()), key=lambda x: int(str(x).replace("추천그룹 ", "")))
+    all_groups = [f"추천그룹 {i}" for i in range(1, k + 1)]
 
     improved = True
     loop_guard = 0
