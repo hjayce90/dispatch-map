@@ -1075,13 +1075,15 @@ def render_group_map(
         if len(route_df_line) == 0:
             continue
 
+        route_grouped = valid_grouped[valid_grouped["route"] == route].copy()
         group_name = str(route_df_line.iloc[0].get("추천그룹", "")).strip()
         route_color = group_color_map.get(group_name, "#1e88e5")
         camp_code = route_camp_map.get(route, "")
         camp_name = CAMP_INFO.get(camp_code, {}).get("camp_name", "")
-        small_sum = safe_int(route_df_line.get("ae_sum", 0).sum())
-        medium_sum = safe_int(route_df_line.get("af_sum", 0).sum())
-        large_sum = safe_int(route_df_line.get("ag_sum", 0).sum())
+
+        small_sum = safe_int(route_grouped["ae_sum"].sum()) if "ae_sum" in route_grouped.columns else 0
+        medium_sum = safe_int(route_grouped["af_sum"].sum()) if "af_sum" in route_grouped.columns else 0
+        large_sum = safe_int(route_grouped["ag_sum"].sum()) if "ag_sum" in route_grouped.columns else 0
         route_tooltip = f"{group_name} | {route} | 총수량(소{small_sum}/중{medium_sum}/대{large_sum})"
 
         route_group = folium.FeatureGroup(name=f"{route_prefix_map.get(route, '')}", show=True)
@@ -1107,7 +1109,6 @@ def render_group_map(
             folium.PolyLine(line_points, color="#111111", weight=8, opacity=0.55, tooltip=route_tooltip).add_to(route_group)
             folium.PolyLine(line_points, color=route_color, weight=5, opacity=0.95, tooltip=route_tooltip).add_to(route_group)
 
-        route_grouped = valid_grouped[valid_grouped["route"] == route].copy()
         for _, row in route_grouped.iterrows():
             lat, lon = row["coords"]
             popup_html = f"""
