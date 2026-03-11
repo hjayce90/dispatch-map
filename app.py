@@ -16,6 +16,8 @@ from auto_grouping import (
     build_group_assignment_df,
     build_group_map_data,
     build_group_summary_df,
+    build_group_detail_stats_df,
+    build_driver_preference_df,
     build_route_feature_df,
     choose_auto_group_count,
     default_group_edit_map,
@@ -737,6 +739,85 @@ def build_assigned_summary(assignment_df: pd.DataFrame):
     return assigned_summary
 
 
+def apply_group_driver_assignments(
+    route_summary: pd.DataFrame,
+    assignment_store: dict,
+    recommended_group_map: dict,
+    group_driver_map: dict,
+):
+    updated_store = assignment_store.copy()
+    applied_count = 0
+
+    for _, row in route_summary.iterrows():
+        route = row["route"]
+        truck_request_id = row["truck_request_id"]
+        assignment_key = make_assignment_key(route, truck_request_id)
+
+        group_name = recommended_group_map.get(route, "")
+        selected_driver = str(group_driver_map.get(group_name, "")).strip()
+        if not selected_driver:
+            continue
+
+        updated_store[assignment_key] = selected_driver
+        applied_count += 1
+
+    return updated_store, applied_count
+
+
+def render_group_driver_assignment_form(
+    route_summary: pd.DataFrame,
+    drivers,
+    assignment_store: dict,
+    recommended_group_map: dict,
+):
+    if not recommended_group_map:
+        return assignment_store
+
+    st.subheader("추천그룹별 기사 배정")
+    st.caption("추천그룹에 기사를 먼저 지정하고 적용한 뒤, 아래 기사 배정에서 개별 수정하세요.")
+
+    group_names = sorted(
+        [g for g in set(recommended_group_map.values()) if str(g).strip() != ""],
+        key=lambda x: int(str(x).replace("추천그룹 ", ""))
+    )
+    if not group_names:
+        return assignment_store
+
+    driver_options = [""] + drivers
+
+    with st.form("group_driver_assignment_form", clear_on_submit=False):
+        group_driver_map = {}
+
+        for gname in group_names:
+            routes_in_group = [r for r, g in recommended_group_map.items() if g == gname]
+            c1, c2 = st.columns([1.2, 1.8])
+            c1.write(f"{gname} ({len(routes_in_group)}개 라우트)")
+            selected_driver = c2.selectbox(
+                f"{gname}_기사선택",
+                options=driver_options,
+                index=0,
+                key=f"group_driver_select_{gname}",
+                label_visibility="collapsed",
+            )
+            group_driver_map[gname] = selected_driver
+
+        submitted = st.form_submit_button("추천그룹 배정 적용")
+
+    if submitted:
+        updated_store, applied_count = apply_group_driver_assignments(
+            route_summary=route_summary,
+            assignment_store=assignment_store,
+            recommended_group_map=recommended_group_map,
+            group_driver_map=group_driver_map,
+        )
+        save_assignment_store(updated_store)
+        st.session_state["assignment_store"] = updated_store
+        st.success(f"추천그룹 배정을 적용했습니다. ({applied_count}개 라우트 반영)")
+        return updated_store
+
+    return assignment_store
+
+
 def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_store: dict):
     st.subheader("기사 배정")
     st.caption("route / 구분 / 캠프 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
@@ -1032,6 +1113,7 @@ def render_group_map(
     route_prefix_map: dict,
     route_camp_map: dict,
     camp_coords: dict,
+    selected_group: str = "전체",
 ):
     # 추천그룹 확인용 지도
     center_lat, center_lon = 37.55, 126.98
@@ -1067,6 +1149,10 @@ def render_group_map(
         key=lambda x: route_prefix_map.get(x, "")
     )
 
+    if selected_group != "전체":
+        selected_routes = valid_result[valid_result["추천그룹"] == selected_group]["route"].dropna().unique().tolist()
+        route_list = [r for r in route_list if r in selected_routes]
+
     group_list = sorted([g for g in valid_result["추천그룹"].dropna().unique().tolist() if str(g).strip() != ""])
     group_color_map = {group_name: ROUTE_COLORS[i % len(ROUTE_COLORS)] for i, group_name in enumerate(group_list)}
 
@@ -1084,7 +1170,8 @@ def render_group_map(
         small_sum = safe_int(route_grouped["ae_sum"].sum()) if "ae_sum" in route_grouped.columns else 0
         medium_sum = safe_int(route_grouped["af_sum"].sum()) if "af_sum" in route_grouped.columns else 0
         large_sum = safe_int(route_grouped["ag_sum"].sum()) if "ag_sum" in route_grouped.columns else 0
-        route_tooltip = f"{group_name} | {route} | 총수량(소{small_sum}/중{medium_sum}/대{large_sum})"
+        group_label = str(group_name).replace("추천그룹 ", "추천그룹")
+        route_tooltip = f"{group_label} / {small_sum + medium_sum + large_sum}개({small_sum}/{medium_sum}/{large_sum})"
 
         route_group = folium.FeatureGroup(name=f"{route_prefix_map.get(route, '')}", show=True)
 
@@ -1112,13 +1199,10 @@ def render_group_map(
         for _, row in route_grouped.iterrows():
             lat, lon = row["coords"]
             popup_html = f"""
-            <b>추천그룹:</b> {row.get('추천그룹', '')}<br>
-            <b>루트:</b> {row.get('route', '')}<br>
-            <b>트럭요청ID:</b> {row.get('truck_request_id', '')}<br>
+            <b>추천그룹:</b> {str(row.get('추천그룹', '')).replace('추천그룹 ', '추천그룹')}<br>
             <b>주소:</b> {row.get('address', '')}<br>
             <b>업체명:</b> {row.get('company_name', '')}<br>
-            <b>건수:</b> {safe_int(row.get('stop_count', 0))}<br>
-            <b>물량:</b> {safe_int(row.get('ae_sum', 0))}.{safe_int(row.get('af_sum', 0))}.{safe_int(row.get('ag_sum', 0))}
+            <b>물량(소/중/대):</b> {safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}
             """
 
             house_order = safe_int(row.get("house_order", 0))
@@ -1276,19 +1360,72 @@ if "recommended_group_map" in st.session_state:
     final_group_map = st.session_state["recommended_group_map"]
     group_map_result, group_map_grouped = build_group_map_data(result_delivery, grouped_delivery, final_group_map)
 
+    latest_assignment_df = build_group_assignment_df(route_feature_df, final_group_map)
+    group_detail_df = build_group_detail_stats_df(latest_assignment_df)
+
     st.subheader("추천그룹 지도")
+    selectable_groups = ["전체"] + group_detail_df["추천그룹"].astype(str).tolist()
+    selected_group_filter = st.selectbox("추천그룹 선택", selectable_groups, key="selected_group_filter")
+
+    if selected_group_filter == "전체":
+        selected_info_df = group_detail_df.copy()
+        route_count = safe_int(selected_info_df["라우트개수"].sum())
+        box_total = safe_int(selected_info_df["박스총개수"].sum())
+        small_total = safe_int(selected_info_df["소형합"].sum())
+        medium_total = safe_int(selected_info_df["중형합"].sum())
+        large_total = safe_int(selected_info_df["대형합"].sum())
+    else:
+        selected_info_df = group_detail_df[group_detail_df["추천그룹"] == selected_group_filter]
+        if len(selected_info_df) == 0:
+            route_count = box_total = small_total = medium_total = large_total = 0
+        else:
+            row = selected_info_df.iloc[0]
+            route_count = safe_int(row["라우트개수"])
+            box_total = safe_int(row["박스총개수"])
+            small_total = safe_int(row["소형합"])
+            medium_total = safe_int(row["중형합"])
+            large_total = safe_int(row["대형합"])
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("라우트개수", route_count)
+    m2.metric("박스총개수", box_total)
+    m3.metric("소형", small_total)
+    m4.metric("중형", medium_total)
+    m5.metric("대형", large_total)
+
+    st.caption("추천그룹 지도와 지표는 선택한 그룹 기준으로 표시됩니다.")
+
     group_map_view = render_group_map(
         valid_result=group_map_result,
         valid_grouped=group_map_grouped,
         route_prefix_map=route_prefix_map,
         route_camp_map=route_camp_map,
         camp_coords=camp_coords,
+        selected_group=selected_group_filter,
     )
     st_folium(group_map_view, width=None, height=700)
+
+    st.subheader("기사 선호 예상 순위 (참고용)")
+    st.caption("총합, 스톱수, 보정걸린분, route_spread_km가 낮을수록 높은 점수를 받는 휴리스틱 지표입니다.")
+    preference_df = build_driver_preference_df(route_feature_df, final_group_map)
+    st.dataframe(
+        preference_df.assign(
+            선호예상점수=lambda df: df["선호예상점수"].round(1),
+            route_spread_km=lambda df: df["route_spread_km"].round(1),
+        ),
+        use_container_width=True,
+    )
 
 st.subheader("지도")
 
 assignment_store = st.session_state["assignment_store"]
+if "recommended_group_map" in st.session_state:
+    assignment_store = render_group_driver_assignment_form(
+        route_summary=route_summary,
+        drivers=drivers,
+        assignment_store=assignment_store,
+        recommended_group_map=st.session_state["recommended_group_map"],
+    )
 assignment_store = render_assignment_form(route_summary, drivers, assignment_store)
 st.session_state["assignment_store"] = assignment_store
 
