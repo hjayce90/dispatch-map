@@ -739,6 +739,83 @@ def build_assigned_summary(assignment_df: pd.DataFrame):
     return assigned_summary
 
 
+def apply_group_driver_assignments(
+    route_summary: pd.DataFrame,
+    assignment_store: dict,
+    group_assignment_df: pd.DataFrame,
+    group_driver_selection: dict,
+):
+    if len(route_summary) == 0 or len(group_assignment_df) == 0:
+        return assignment_store.copy(), 0
+
+    route_to_group = dict(zip(group_assignment_df["route"], group_assignment_df["추천그룹"]))
+    updated_store = assignment_store.copy()
+    updated_count = 0
+
+    for _, row in route_summary.iterrows():
+        route = row["route"]
+        truck_request_id = row["truck_request_id"]
+        group_name = route_to_group.get(route, "")
+        selected_driver = str(group_driver_selection.get(group_name, "")).strip()
+        if not selected_driver:
+            continue
+
+        assignment_key = make_assignment_key(route, truck_request_id)
+        updated_store[assignment_key] = selected_driver
+        updated_count += 1
+
+    return updated_store, updated_count
+
+
+def render_group_driver_assignment_form(
+    route_summary: pd.DataFrame,
+    drivers,
+    assignment_store: dict,
+    group_assignment_df: pd.DataFrame,
+):
+    if len(group_assignment_df) == 0:
+        return assignment_store
+
+    st.subheader("추천그룹별 기사 배정")
+    st.caption("추천그룹 단위로 기사명을 먼저 선택하고, 적용 후 아래 기사 배정 표에서 미세 조정할 수 있습니다.")
+
+    driver_options = [""] + drivers
+    group_options = sorted(
+        group_assignment_df["추천그룹"].dropna().astype(str).unique().tolist(),
+        key=lambda x: int(str(x).replace("추천그룹 ", "")) if str(x).replace("추천그룹 ", "").isdigit() else 999,
+    )
+
+    with st.form("group_driver_assignment_form", clear_on_submit=False):
+        group_driver_selection = {}
+        for group_name in group_options:
+            c1, c2 = st.columns([1.1, 1.7])
+            c1.write(group_name)
+            selected_driver = c2.selectbox(
+                f"추천그룹기사선택_{group_name}",
+                options=driver_options,
+                index=0,
+                key=f"group_driver_select_{group_name}",
+                label_visibility="collapsed",
+            )
+            group_driver_selection[group_name] = selected_driver
+
+        group_apply_submitted = st.form_submit_button("추천그룹 배정 적용")
+
+    if group_apply_submitted:
+        updated_store, updated_count = apply_group_driver_assignments(
+            route_summary=route_summary,
+            assignment_store=assignment_store,
+            group_assignment_df=group_assignment_df,
+            group_driver_selection=group_driver_selection,
+        )
+        save_assignment_store(updated_store)
+        st.session_state["assignment_store"] = updated_store
+        st.success(f"추천그룹 배정을 적용했습니다. ({updated_count}개 route 반영)")
+        return updated_store
+
+    return assignment_store
+
+
 def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_store: dict):
     st.subheader("기사 배정")
     st.caption("route / 구분 / 캠프 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
@@ -748,7 +825,7 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
     with st.form("assignment_form", clear_on_submit=False):
         new_assignment_store = assignment_store.copy()
 
-        for _, row in route_summary.iterrows():
+        for _, row in route_summary.sort_values(["route_prefix", "route", "truck_request_id"]).iterrows():
             route = row["route"]
             truck_request_id = row["truck_request_id"]
             assignment_key = make_assignment_key(route, truck_request_id)
@@ -1253,15 +1330,23 @@ if "recommended_group_map" in st.session_state:
     group_options = [f"추천그룹 {i}" for i in range(1, recommended_group_count + 1)]
     with st.form("group_edit_form", clear_on_submit=False):
         new_group_map = edit_map.copy()
-        for _, row in group_assignment_df.sort_values(["route_prefix", "route"]).iterrows():
-            route = row["route"]
-            current_group = recommended_group_map.get(route, row["추천그룹"])
+        edit_rows = group_assignment_df.sort_values(["route_prefix", "route"]).reset_index(drop=True)
+
+        h1, h2, h3, h4 = st.columns([1.0, 0.8, 1.2, 1.2])
+        h1.caption("route")
+        h2.caption("route_prefix")
+        h3.caption("truck_request_id")
+        h4.caption("selected_group")
+
+        for row in edit_rows.itertuples(index=False):
+            route = row.route
+            current_group = recommended_group_map.get(route, row.추천그룹)
             default_idx = group_options.index(current_group) if current_group in group_options else 0
 
             c1, c2, c3, c4 = st.columns([1.0, 0.8, 1.2, 1.2])
             c1.write(str(route))
-            c2.write(str(row.get("route_prefix", "")))
-            c3.write(str(row.get("truck_request_id", "")))
+            c2.write(str(getattr(row, "route_prefix", "")))
+            c3.write(str(getattr(row, "truck_request_id", "")))
             selected_group = c4.selectbox(
                 f"추천그룹선택_{route}",
                 options=group_options,
@@ -1282,6 +1367,7 @@ if "recommended_group_map" in st.session_state:
     group_map_result, group_map_grouped = build_group_map_data(result_delivery, grouped_delivery, final_group_map)
 
     latest_assignment_df = build_group_assignment_df(route_feature_df, final_group_map)
+    st.session_state["latest_group_assignment_df"] = latest_assignment_df.copy()
     group_detail_df = build_group_detail_stats_df(latest_assignment_df)
 
     st.subheader("추천그룹 지도")
@@ -1340,6 +1426,15 @@ if "recommended_group_map" in st.session_state:
 st.subheader("지도")
 
 assignment_store = st.session_state["assignment_store"]
+latest_group_assignment_df = st.session_state.get("latest_group_assignment_df", pd.DataFrame())
+if len(latest_group_assignment_df) > 0:
+    assignment_store = render_group_driver_assignment_form(
+        route_summary=route_summary,
+        drivers=drivers,
+        assignment_store=assignment_store,
+        group_assignment_df=latest_group_assignment_df,
+    )
+
 assignment_store = render_assignment_form(route_summary, drivers, assignment_store)
 st.session_state["assignment_store"] = assignment_store
 
