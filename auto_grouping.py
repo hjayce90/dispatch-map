@@ -223,6 +223,7 @@ def evaluate_group_score(route_feature_df: pd.DataFrame, group_map: Dict[str, st
 
     score = 0.0
     stops_by_group = []
+    boxes_by_group = []
 
     group_names = sorted(set(group_map.values()), key=lambda x: int(str(x).replace("추천그룹 ", "")))
 
@@ -237,6 +238,7 @@ def evaluate_group_score(route_feature_df: pd.DataFrame, group_map: Dict[str, st
 
         spread_km = max_pairwise_distance(all_coords)
         total_stops = part["스톱수"].sum()
+        total_boxes = part["총합"].sum()
         total_minutes = part["보정걸린분"].sum()
 
         # 1순위: 퍼짐이 작을수록 좋음
@@ -251,11 +253,28 @@ def evaluate_group_score(route_feature_df: pd.DataFrame, group_map: Dict[str, st
             score += (total_minutes - 270) * 2.0
 
         stops_by_group.append(total_stops)
+        boxes_by_group.append(total_boxes)
 
     if stops_by_group:
         avg_stops = sum(stops_by_group) / len(stops_by_group)
         imbalance = sum(abs(x - avg_stops) for x in stops_by_group)
         score += imbalance * 1.5
+
+    if boxes_by_group:
+        avg_boxes = sum(boxes_by_group) / len(boxes_by_group)
+        if avg_boxes > 0:
+            box_imbalance = 0.0
+            over_20_penalty = 0.0
+            for boxes in boxes_by_group:
+                deviation_rate = abs(boxes - avg_boxes) / avg_boxes
+                box_imbalance += deviation_rate
+                if deviation_rate > 0.2:
+                    over_20_penalty += (deviation_rate - 0.2) ** 2
+
+            # 3순위 소프트 제약: 기본적으로는 균형을 유도하되,
+            # 20%를 넘는 경우에만 강한 페널티를 추가해 "최대한 맞추되 불가 시 덜 나쁜 해"를 선택하도록 함.
+            score += box_imbalance * 6.0
+            score += over_20_penalty * 220.0
 
     return score
 
@@ -298,7 +317,7 @@ def recommend_route_groups(route_feature_df: pd.DataFrame, manual_group_count=No
 
     improved = True
     loop_guard = 0
-    while improved and loop_guard < 4:
+    while improved and loop_guard < 7:
         improved = False
         loop_guard += 1
 
@@ -348,6 +367,7 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     avg_stops = group_assignment_df.groupby("추천그룹")["스톱수"].sum().mean()
+    avg_boxes = group_assignment_df.groupby("추천그룹")["총합"].sum().mean()
 
     for gname in group_names:
         part = group_assignment_df[group_assignment_df["추천그룹"] == gname].copy()
@@ -361,6 +381,9 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
         total_boxes = safe_int(part["총합"].sum())
         total_minutes = safe_int(part["보정걸린분"].sum())
         route_list = part["route"].astype(str).tolist()
+        box_deviation_rate = 0.0
+        if avg_boxes:
+            box_deviation_rate = abs(total_boxes - avg_boxes) / avg_boxes
 
         reasons = []
         if spread_km <= 10:
@@ -377,6 +400,11 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
             else:
                 reasons.append("스톱 수 편차가 다소 있음")
 
+        if box_deviation_rate <= 0.2:
+            reasons.append("수량 차이가 20% 이내")
+        else:
+            reasons.append("수량 차이가 20% 초과")
+
         if total_minutes <= 240:
             reasons.append("예상시간이 비교적 안정적임")
         elif total_minutes <= 270:
@@ -390,6 +418,7 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
             "라우트목록": ", ".join(route_list),
             "총스톱수": total_stops,
             "총박스수": total_boxes,
+            "수량편차율": round(box_deviation_rate * 100, 1),
             "보정예상분": total_minutes,
             "보정예상시간": minutes_to_korean_text(total_minutes),
             "최대퍼짐km": round(spread_km, 1),
