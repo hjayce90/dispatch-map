@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import math
 from io import BytesIO
 
 import requests
@@ -9,6 +10,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import folium
 from folium.features import DivIcon
+from folium.plugins import OverlappingMarkerSpiderfier
 from streamlit_folium import st_folium
 
 from auto_grouping import (
@@ -277,12 +279,58 @@ def is_header_like_route_values(route_value, truck_request_id_value) -> bool:
     return route_text in header_routes or truck_text in header_trucks
 
 
-def save_share_payload(share_name: str, map_html: str, assignment_df: pd.DataFrame, assigned_summary: pd.DataFrame):
+def _df_to_records_for_json(df: pd.DataFrame):
+    out = []
+    for row in df.fillna("").to_dict(orient="records"):
+        r = row.copy()
+        coords = r.get("coords")
+        if isinstance(coords, tuple):
+            r["coords"] = [coords[0], coords[1]]
+        out.append(r)
+    return out
+
+
+def _records_to_df_with_coords(records):
+    df = pd.DataFrame(records or [])
+    if len(df) == 0:
+        return df
+
+    if "coords" in df.columns:
+        def to_tuple(v):
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                return (float(v[0]), float(v[1]))
+            return None
+        df["coords"] = df["coords"].apply(to_tuple)
+    return df
+
+
+def save_share_payload(
+    share_name: str,
+    map_html: str,
+    assignment_df: pd.DataFrame,
+    assigned_summary: pd.DataFrame,
+    result_delivery_df: pd.DataFrame = None,
+    grouped_delivery_df: pd.DataFrame = None,
+    route_prefix_map: dict = None,
+    truck_request_map: dict = None,
+    route_line_label: dict = None,
+    route_camp_map: dict = None,
+    camp_coords: dict = None,
+    group_assignment_df: pd.DataFrame = None,
+):
     payload_path = os.path.join(SHARE_DIR, f"{share_name}.json")
     payload = {
         "map_html": map_html,
         "assignment_rows": assignment_df.fillna("").to_dict(orient="records"),
         "assigned_summary_rows": assigned_summary.fillna("").to_dict(orient="records"),
+        "result_delivery_rows": _df_to_records_for_json(result_delivery_df) if result_delivery_df is not None else [],
+        "grouped_delivery_rows": _df_to_records_for_json(grouped_delivery_df) if grouped_delivery_df is not None else [],
+        "route_prefix_map": route_prefix_map or {},
+        "truck_request_map": truck_request_map or {},
+        "route_line_label": route_line_label or {},
+        "route_camp_map": route_camp_map or {},
+        "camp_coords": camp_coords or {},
+        "group_assignment_rows": group_assignment_df.fillna("").to_dict(orient="records") if group_assignment_df is not None else [],
     }
     with open(payload_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
@@ -297,6 +345,38 @@ def load_share_payload(share_name: str):
             return json.load(f)
     except Exception:
         return None
+
+
+def _filter_shared_view(result_df: pd.DataFrame, grouped_df: pd.DataFrame, mode: str, selected_driver: str, selected_group: str):
+    result2 = result_df.copy()
+    grouped2 = grouped_df.copy()
+
+    if mode == "기사별 보기" and str(selected_driver).strip() != "":
+        result2 = result2[result2["assigned_driver"].fillna("").astype(str) == str(selected_driver)].copy()
+        grouped2 = grouped2[grouped2["assigned_driver"].fillna("").astype(str) == str(selected_driver)].copy()
+    elif mode == "추천그룹별 보기" and str(selected_group).strip() != "":
+        result2 = result2[result2["추천그룹"].fillna("").astype(str) == str(selected_group)].copy()
+        grouped2 = grouped2[grouped2["추천그룹"].fillna("").astype(str) == str(selected_group)].copy()
+
+    result2 = result2[result2["coords"].notna()].copy() if "coords" in result2.columns else pd.DataFrame()
+    grouped2 = grouped2[grouped2["coords"].notna()].copy() if "coords" in grouped2.columns else pd.DataFrame()
+    return result2, grouped2
+
+
+def _build_shared_summary(result_df: pd.DataFrame, grouped_df: pd.DataFrame):
+    route_count = safe_int(result_df["route"].nunique()) if len(result_df) > 0 and "route" in result_df.columns else 0
+    driver_count = safe_int(result_df["assigned_driver"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()) if len(result_df) > 0 and "assigned_driver" in result_df.columns else 0
+    group_count = safe_int(result_df["추천그룹"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()) if len(result_df) > 0 and "추천그룹" in result_df.columns else 0
+    box_total = 0
+    if len(grouped_df) > 0:
+        box_total = safe_int(grouped_df.get("ae_sum", pd.Series(dtype=float)).sum()) + safe_int(grouped_df.get("af_sum", pd.Series(dtype=float)).sum()) + safe_int(grouped_df.get("ag_sum", pd.Series(dtype=float)).sum())
+
+    overlap_count = 0
+    if len(grouped_df) > 0 and "coords" in grouped_df.columns:
+        key_series = grouped_df["coords"].apply(lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else "")
+        overlap_count = safe_int((key_series.value_counts() > 1).sum())
+
+    return route_count, driver_count, group_count, box_total, overlap_count
 
 
 def make_stop_div_icon(route_color: str, stop_text: str, size_scale: float = 1.0, border_color: str = "#ffffff"):
@@ -842,9 +922,64 @@ def render_group_driver_assignment_form(
     return assignment_store
 
 
+def styled_qty_value_html(value: int, kind: str) -> str:
+    palette = {
+        "small": {"bg": "rgba(148, 163, 184, 0.10)", "text": "#e2e8f0"},
+        "medium": {"bg": "rgba(148, 163, 184, 0.14)", "text": "#e2e8f0"},
+        "large": {"bg": "rgba(148, 163, 184, 0.18)", "text": "#f1f5f9"},
+        "total": {"bg": "rgba(226, 232, 240, 0.18)", "text": "#f8fafc"},
+    }
+    style = palette.get(kind, palette["small"])
+    weight = "700" if kind == "total" else "600"
+    return (
+        "<span style='display:inline-flex; align-items:center; justify-content:flex-end;"
+        " min-width:44px; padding:2px 8px; border-radius:6px;"
+        f" background:{style['bg']}; color:{style['text']};"
+        f" font-weight:{weight}; letter-spacing:0.01em; line-height:1.35;'>"
+        f"{safe_int(value)}"
+        "</span>"
+    )
+
+
+def build_overlap_info_map(valid_grouped: pd.DataFrame) -> dict:
+    overlap_info_map = {}
+    if len(valid_grouped) == 0:
+        return overlap_info_map
+
+    overlap_df = valid_grouped.copy()
+    overlap_df["coord_key"] = overlap_df["coords"].apply(
+        lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else ""
+    )
+    overlap_df["coord_rank"] = overlap_df.groupby("coord_key").cumcount()
+
+    for key, part in overlap_df.groupby("coord_key"):
+        if key == "":
+            continue
+        overlap_info_map[key] = {
+            "count": safe_int(len(part)),
+            "rank_map": {(str(r.get("route", "")), str(r.get("address_norm", ""))): safe_int(r.get("coord_rank", 0)) for _, r in part.iterrows()},
+        }
+
+    return overlap_info_map
+
+
+def spread_overlapping_marker(lat: float, lon: float, overlap_info: dict, row: pd.Series):
+    base_lat, base_lon = lat, lon
+    overlap_count = safe_int(overlap_info.get("count", 1))
+    overlap_rank = safe_int(overlap_info.get("rank_map", {}).get((str(row.get("route", "")), str(row.get("address_norm", ""))), 0))
+
+    if overlap_count > 1:
+        angle = (2 * math.pi * overlap_rank) / overlap_count
+        radius = 0.00018
+        lat = base_lat + (radius * math.sin(angle))
+        lon = base_lon + (radius * math.cos(angle))
+
+    return lat, lon, overlap_count
+
+
 def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_store: dict):
     st.subheader("기사 배정")
-    st.caption("route / 구분 / 캠프 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
+    st.caption("구분 / 캠프 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
 
     driver_options = [""] + drivers
 
@@ -861,22 +996,21 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
             if saved_driver in driver_options:
                 default_index = driver_options.index(saved_driver)
 
-            c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12 = st.columns(
-                [0.8, 0.6, 0.9, 1.2, 0.7, 0.9, 0.9, 0.7, 0.7, 0.7, 0.8, 1.4]
+            c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11 = st.columns(
+                [0.6, 0.9, 1.2, 0.7, 0.9, 0.9, 0.7, 0.7, 0.7, 0.8, 1.4]
             )
-            c1.write(str(route))
-            c2.write(str(row["route_prefix"]))
-            c3.write(str(row.get("camp_name", "")))
-            c4.write(str(truck_request_id))
-            c5.write(safe_int(row["스톱수"]))
-            c6.write(str(row["시작시간"]))
-            c7.write(str(row["종료시간"]))
-            c8.write(safe_int(row["소형합"]))
-            c9.write(safe_int(row["중형합"]))
-            c10.write(safe_int(row["대형합"]))
-            c11.write(safe_int(row["총합"]))
+            c1.write(str(row["route_prefix"]))
+            c2.write(str(row.get("camp_name", "")))
+            c3.write(str(truck_request_id))
+            c4.write(safe_int(row["스톱수"]))
+            c5.write(str(row["시작시간"]))
+            c6.write(str(row["종료시간"]))
+            c7.markdown(styled_qty_value_html(row["소형합"], "small"), unsafe_allow_html=True)
+            c8.markdown(styled_qty_value_html(row["중형합"], "medium"), unsafe_allow_html=True)
+            c9.markdown(styled_qty_value_html(row["대형합"], "large"), unsafe_allow_html=True)
+            c10.markdown(styled_qty_value_html(row["총합"], "total"), unsafe_allow_html=True)
 
-            selected_driver = c12.selectbox(
+            selected_driver = c11.selectbox(
                 f"기사선택_{route}_{truck_request_id}",
                 options=driver_options,
                 index=default_index,
@@ -1010,6 +1144,20 @@ def render_map(
         for i, driver in enumerate(driver_list)
     }
 
+    overlap_info_map = build_overlap_info_map(valid_grouped)
+
+    for key, part in valid_grouped.assign(
+        coord_key=valid_grouped["coords"].apply(
+            lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else ""
+        )
+    ).groupby("coord_key"):
+        if key == "":
+            continue
+        route_names = sorted(part["route"].dropna().astype(str).unique().tolist())
+        driver_names = sorted([d for d in part["assigned_driver"].fillna("").astype(str).unique().tolist() if d.strip() != ""])
+        overlap_info_map[key]["routes"] = route_names
+        overlap_info_map[key]["drivers"] = driver_names
+
     for route in route_list:
         truck_request_id = truck_request_map.get(route, "")
         camp_code = route_camp_map.get(route, "")
@@ -1081,6 +1229,10 @@ def render_map(
 
         for _, row in route_grouped.iterrows():
             lat, lon = row["coords"]
+            coord_key = f"{round(float(lat), 6)}_{round(float(lon), 6)}"
+            overlap_info = overlap_info_map.get(coord_key, {})
+            lat, lon, overlap_count = spread_overlapping_marker(lat, lon, overlap_info, row)
+
             driver_name = row.get("assigned_driver", "")
             is_assigned_pin = str(driver_name).strip() != ""
 
@@ -1088,6 +1240,14 @@ def render_map(
                 pin_color = driver_color_map.get(driver_name, "#1e88e5")
             else:
                 pin_color = route_color_map.get(route, "#1e88e5")
+
+            overlap_label = ""
+            overlap_detail = ""
+            if overlap_count > 1:
+                overlap_label = f"동일 위치 {overlap_count}건"
+                overlap_routes = ", ".join(overlap_info.get("routes", []))
+                overlap_drivers = ", ".join(overlap_info.get("drivers", []))
+                overlap_detail = f"<b>중복배정:</b> 동일 위치 {overlap_count}건<br><b>겹치는 route:</b> {overlap_routes}<br><b>겹치는 기사:</b> {overlap_drivers}<br>"
 
             popup_html = f"""
             <b>루트:</b> {row['route']}<br>
@@ -1101,7 +1261,8 @@ def render_map(
             <b>주소:</b> {row['address']}<br>
             <b>집순서:</b> {safe_int(row['house_order'])}/{safe_int(row['route_total'])}<br>
             <b>건수:</b> {safe_int(row['stop_count'])}<br>
-            <b>물량:</b> {safe_int(row['ae_sum'])}.{safe_int(row['af_sum'])}.{safe_int(row['ag_sum'])}
+            <b>물량:</b> {safe_int(row['ae_sum'])}.{safe_int(row['af_sum'])}.{safe_int(row['ag_sum'])}<br>
+            {overlap_detail}
             """
 
             house_order = safe_int(row.get("house_order", 0))
@@ -1118,10 +1279,14 @@ def render_map(
                 pin_text = str(row.get("pin_label", ""))
                 icon_obj = make_stop_div_icon(pin_color, pin_text, size_scale=size_scale, border_color=border_color)
 
+            tooltip_text = row["hover_text"]
+            if overlap_label:
+                tooltip_text = f"{tooltip_text} / {overlap_label}"
+
             folium.Marker(
                 [lat, lon],
                 popup=popup_html,
-                tooltip=row["hover_text"],
+                tooltip=tooltip_text,
                 icon=icon_obj
             ).add_to(route_group)
 
@@ -1153,6 +1318,7 @@ def render_group_map(
         center_lon = valid_result.iloc[0]["coords"][1]
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=10, prefer_canvas=True)
+    OverlappingMarkerSpiderfier(nearby_distance=24, keep_spiderfied=True).add_to(m)
 
     camp_group = folium.FeatureGroup(name="캠프", show=True)
     for camp_code, info in CAMP_INFO.items():
@@ -1179,6 +1345,7 @@ def render_group_map(
 
     group_list = sorted([g for g in valid_result["추천그룹"].dropna().unique().tolist() if str(g).strip() != ""])
     group_color_map = {group_name: ROUTE_COLORS[i % len(ROUTE_COLORS)] for i, group_name in enumerate(group_list)}
+    overlap_info_map = build_overlap_info_map(valid_grouped)
 
     for route in route_list:
         route_df_line = valid_result[valid_result["route"] == route].sort_values("house_order")
@@ -1222,6 +1389,10 @@ def render_group_map(
 
         for _, row in route_grouped.iterrows():
             lat, lon = row["coords"]
+            coord_key = f"{round(float(lat), 6)}_{round(float(lon), 6)}"
+            overlap_info = overlap_info_map.get(coord_key, {})
+            lat, lon, overlap_count = spread_overlapping_marker(lat, lon, overlap_info, row)
+            overlap_label = f" / 동일 위치 {overlap_count}건" if overlap_count > 1 else ""
             popup_html = f"""
             <b>추천그룹:</b> {str(row.get('추천그룹', '')).replace('추천그룹 ', '추천그룹')}<br>
             <b>주소:</b> {row.get('address', '')}<br>
@@ -1236,10 +1407,17 @@ def render_group_map(
             size_scale = PIN_EDGE_SCALE if is_start else PIN_NORMAL_SCALE
             border_color = PIN_EDGE_BORDER_COLOR if (is_start or is_end) else PIN_NORMAL_BORDER_COLOR
 
+            company_name = str(row.get("company_name", "")).strip() or "업체명없음"
+            item_small = safe_int(row.get("ae_sum", 0))
+            item_medium = safe_int(row.get("af_sum", 0))
+            item_large = safe_int(row.get("ag_sum", 0))
+            total_items = item_small + item_medium + item_large
+            marker_tooltip = f"{company_name} / 총수량 {total_items}개({item_small}/{item_medium}/{item_large}){overlap_label}"
+
             folium.Marker(
                 [lat, lon],
                 popup=popup_html,
-                tooltip=route_tooltip,
+                tooltip=marker_tooltip,
                 icon=make_stop_div_icon(route_color, str(row.get("pin_label", "")), size_scale=size_scale, border_color=border_color)
             ).add_to(route_group)
 
@@ -1259,13 +1437,83 @@ if shared_map:
     payload = load_share_payload(shared_map)
 
     if payload and payload.get("map_html"):
-        st.subheader("공유 지도")
-        components.html(payload["map_html"], height=950, scrolling=True)
+        result_rows = payload.get("result_delivery_rows", [])
+        grouped_rows = payload.get("grouped_delivery_rows", [])
 
-        assigned_summary_rows = payload.get("assigned_summary_rows", [])
-        if assigned_summary_rows:
-            st.subheader("기사별 요약")
-            st.dataframe(pd.DataFrame(assigned_summary_rows), use_container_width=True)
+        if result_rows and grouped_rows:
+            shared_result_df = _records_to_df_with_coords(result_rows)
+            shared_grouped_df = _records_to_df_with_coords(grouped_rows)
+
+            route_prefix_map_payload = payload.get("route_prefix_map", {})
+            truck_request_map_payload = payload.get("truck_request_map", {})
+            route_line_label_payload = payload.get("route_line_label", {})
+            route_camp_map_payload = payload.get("route_camp_map", {})
+            camp_coords_payload = payload.get("camp_coords", {})
+
+            st.subheader("대표님 보고용 공유 지도")
+            view_mode = st.radio("보기 모드", ["전체 보기", "기사별 보기", "추천그룹별 보기"], horizontal=True)
+
+            selected_driver = ""
+            selected_group = ""
+
+            if view_mode == "기사별 보기":
+                driver_options = sorted([d for d in shared_result_df["assigned_driver"].fillna("").astype(str).unique().tolist() if d.strip() != ""])
+                selected_driver = st.selectbox("기사 선택", driver_options) if driver_options else ""
+            elif view_mode == "추천그룹별 보기":
+                group_options = sorted([g for g in shared_result_df["추천그룹"].fillna("").astype(str).unique().tolist() if g.strip() != ""])
+                selected_group = st.selectbox("추천그룹 선택", group_options) if group_options else ""
+
+            filtered_result, filtered_grouped = _filter_shared_view(
+                shared_result_df,
+                shared_grouped_df,
+                mode=view_mode,
+                selected_driver=selected_driver,
+                selected_group=selected_group,
+            )
+
+            route_driver_map = {}
+            if len(filtered_result) > 0 and "route" in filtered_result.columns and "assigned_driver" in filtered_result.columns:
+                route_driver_map = dict(zip(filtered_result["route"], filtered_result["assigned_driver"]))
+
+            route_count, driver_count, group_count, box_total, overlap_count = _build_shared_summary(filtered_result, filtered_grouped)
+            s1, s2, s3, s4, s5 = st.columns(5)
+            s1.metric("라우트 수", route_count)
+            s2.metric("기사 수", driver_count)
+            s3.metric("추천그룹 수", group_count)
+            s4.metric("박스 총합", box_total)
+            s5.metric("동일위치 겹침", overlap_count)
+
+            with st.spinner("공유 지도 생성 중..."):
+                shared_map_obj = render_map(
+                    valid_result=filtered_result,
+                    valid_grouped=filtered_grouped,
+                    route_prefix_map=route_prefix_map_payload,
+                    truck_request_map=truck_request_map_payload,
+                    route_line_label=route_line_label_payload,
+                    route_driver_map=route_driver_map,
+                    route_camp_map=route_camp_map_payload,
+                    camp_coords=camp_coords_payload,
+                )
+            st_folium(shared_map_obj, width=None, height=900)
+
+            st.subheader("기사 할당표")
+            assignment_rows = payload.get("assignment_rows", [])
+            if assignment_rows:
+                assignment_df_payload = pd.DataFrame(assignment_rows)
+                if view_mode == "기사별 보기" and selected_driver:
+                    assignment_df_payload = assignment_df_payload[assignment_df_payload["assigned_driver"].fillna("").astype(str) == selected_driver].copy()
+                elif view_mode == "추천그룹별 보기" and selected_group and "추천그룹" in assignment_df_payload.columns:
+                    assignment_df_payload = assignment_df_payload[assignment_df_payload["추천그룹"].fillna("").astype(str) == selected_group].copy()
+                st.dataframe(assignment_df_payload, use_container_width=True)
+
+        else:
+            st.subheader("공유 지도")
+            components.html(payload["map_html"], height=950, scrolling=True)
+
+            assigned_summary_rows = payload.get("assigned_summary_rows", [])
+            if assigned_summary_rows:
+                st.subheader("기사별 요약")
+                st.dataframe(pd.DataFrame(assigned_summary_rows), use_container_width=True)
     else:
         st.error("저장된 공유 데이터를 찾을 수 없습니다. 서버 재시작 등으로 파일이 사라졌을 수 있습니다.")
 
@@ -1348,46 +1596,40 @@ if "recommended_group_map" in st.session_state:
     st.subheader("추천그룹 요약")
     st.dataframe(group_summary_df, use_container_width=True)
 
-    st.subheader("추천그룹 수정")
-    edit_map = default_group_edit_map(group_assignment_df)
-    recommended_group_count = safe_int(st.session_state.get("recommended_group_count", 0))
-    if recommended_group_count <= 0:
-        recommended_group_count = max(1, safe_int(group_assignment_df["추천그룹"].nunique()))
-    group_options = [f"추천그룹 {i}" for i in range(1, recommended_group_count + 1)]
-    with st.form("group_edit_form", clear_on_submit=False):
-        new_group_map = edit_map.copy()
-        edit_rows = group_assignment_df.sort_values(["route_prefix", "route"]).reset_index(drop=True)
+    with st.expander("추천그룹 수정", expanded=False):
+        edit_map = default_group_edit_map(group_assignment_df)
+        recommended_group_count = safe_int(st.session_state.get("recommended_group_count", 0))
+        if recommended_group_count <= 0:
+            recommended_group_count = max(1, safe_int(group_assignment_df["추천그룹"].nunique()))
+        group_options = [f"추천그룹 {i}" for i in range(1, recommended_group_count + 1)]
+        with st.form("group_edit_form", clear_on_submit=False):
+            new_group_map = edit_map.copy()
+            edit_rows = group_assignment_df.sort_values(["route_prefix", "route"]).reset_index(drop=True)
 
-        h1, h2, h3, h4 = st.columns([1.0, 0.8, 1.2, 1.2])
-        h1.caption("route")
-        h2.caption("route_prefix")
-        h3.caption("truck_request_id")
-        h4.caption("selected_group")
+            for _, row in edit_rows.iterrows():
+                route = row["route"]
+                current_group = recommended_group_map.get(route, row["추천그룹"])
+                default_idx = group_options.index(current_group) if current_group in group_options else 0
 
-        for _, row in edit_rows.iterrows():
-            route = row["route"]
-            current_group = recommended_group_map.get(route, row["추천그룹"])
-            default_idx = group_options.index(current_group) if current_group in group_options else 0
+                c1, c2, c3, c4 = st.columns([1.0, 0.8, 1.2, 1.2])
+                c1.write(str(route))
+                c2.write(str(row.get("route_prefix", "")))
+                c3.write(str(row.get("truck_request_id", "")))
+                selected_group = c4.selectbox(
+                    f"추천그룹선택_{route}",
+                    options=group_options,
+                    index=default_idx,
+                    label_visibility="collapsed",
+                    key=f"group_select_{route}"
+                )
+                new_group_map[route] = selected_group
 
-            c1, c2, c3, c4 = st.columns([1.0, 0.8, 1.2, 1.2])
-            c1.write(str(route))
-            c2.write(str(row.get("route_prefix", "")))
-            c3.write(str(row.get("truck_request_id", "")))
-            selected_group = c4.selectbox(
-                f"추천그룹선택_{route}",
-                options=group_options,
-                index=default_idx,
-                label_visibility="collapsed",
-                key=f"group_select_{route}"
-            )
-            new_group_map[route] = selected_group
+            group_submitted = st.form_submit_button("추천그룹 수정 적용")
 
-        group_submitted = st.form_submit_button("추천그룹 수정 적용")
-
-    if group_submitted:
-        updated_assignment_df = apply_group_edit_map(route_feature_df, new_group_map)
-        st.session_state["recommended_group_map"] = default_group_edit_map(updated_assignment_df)
-        st.success("추천그룹 수동 수정을 반영했습니다.")
+        if group_submitted:
+            updated_assignment_df = apply_group_edit_map(route_feature_df, new_group_map)
+            st.session_state["recommended_group_map"] = default_group_edit_map(updated_assignment_df)
+            st.success("추천그룹 수동 수정을 반영했습니다.")
 
     final_group_map = st.session_state["recommended_group_map"]
     group_map_result, group_map_grouped = build_group_map_data(result_delivery, grouped_delivery, final_group_map)
@@ -1438,16 +1680,16 @@ if "recommended_group_map" in st.session_state:
     )
     st_folium(group_map_view, width=None, height=700)
 
-    st.subheader("기사 선호 예상 순위 (참고용)")
-    st.caption("총합, 스톱수, 보정걸린분, route_spread_km가 낮을수록 높은 점수를 받는 휴리스틱 지표입니다.")
-    preference_df = build_driver_preference_df(route_feature_df, final_group_map)
-    st.dataframe(
-        preference_df.assign(
-            선호예상점수=lambda df: df["선호예상점수"].round(1),
-            route_spread_km=lambda df: df["route_spread_km"].round(1),
-        ),
-        use_container_width=True,
-    )
+    with st.expander("기사 선호 예상 순위 (참고용)", expanded=False):
+        st.caption("추천그룹별 물량·스톱·예상시간·퍼짐 기준의 휴리스틱 참고 순위입니다.")
+        preference_df = build_driver_preference_df(route_feature_df, final_group_map)
+        st.dataframe(
+            preference_df.assign(
+                선호예상점수=lambda df: df["선호예상점수"].round(1),
+                route_spread_km=lambda df: df["route_spread_km"].round(1),
+            ).rename(columns={"route_spread_km": "그룹평균퍼짐km"}),
+            use_container_width=True,
+        )
 
 st.subheader("지도")
 
@@ -1465,6 +1707,10 @@ assignment_store = render_assignment_form(route_summary, drivers, assignment_sto
 st.session_state["assignment_store"] = assignment_store
 
 assignment_df = build_assignment_df(route_summary, assignment_store)
+
+group_route_map = {}
+if len(latest_group_assignment_df) > 0 and "route" in latest_group_assignment_df.columns and "추천그룹" in latest_group_assignment_df.columns:
+    group_route_map = dict(zip(latest_group_assignment_df["route"], latest_group_assignment_df["추천그룹"]))
 
 st.subheader("기사별 필터")
 driver_filter_options = ["전체", "미배정"] + drivers
@@ -1513,6 +1759,8 @@ st.download_button(
 
 st.subheader("기사 할당표")
 view_assignment_df = assignment_df.copy()
+if group_route_map:
+    view_assignment_df["추천그룹"] = view_assignment_df["route"].map(group_route_map).fillna("")
 if "총걸린분" in view_assignment_df.columns:
     view_assignment_df = view_assignment_df.drop(columns=["총걸린분"])
 st.dataframe(view_assignment_df, use_container_width=True)
@@ -1529,7 +1777,27 @@ else:
         view_assigned_summary = view_assigned_summary.drop(columns=["총걸린분"])
     st.dataframe(view_assigned_summary, use_container_width=True)
 
-save_share_payload(share_name, map_html, view_assignment_df, view_assigned_summary)
+shared_result_delivery = result_delivery.copy()
+shared_grouped_delivery = grouped_delivery.copy()
+shared_result_delivery["assigned_driver"] = shared_result_delivery["route"].map(route_driver_map).fillna("")
+shared_grouped_delivery["assigned_driver"] = shared_grouped_delivery["route"].map(route_driver_map).fillna("")
+shared_result_delivery["추천그룹"] = shared_result_delivery["route"].map(group_route_map).fillna("")
+shared_grouped_delivery["추천그룹"] = shared_grouped_delivery["route"].map(group_route_map).fillna("")
+
+save_share_payload(
+    share_name,
+    map_html,
+    view_assignment_df,
+    view_assigned_summary,
+    result_delivery_df=shared_result_delivery,
+    grouped_delivery_df=shared_grouped_delivery,
+    route_prefix_map=route_prefix_map,
+    truck_request_map=truck_request_map,
+    route_line_label=route_line_label,
+    route_camp_map=route_camp_map,
+    camp_coords=camp_coords,
+    group_assignment_df=latest_group_assignment_df,
+)
 
 share_url = f"{APP_URL}?map={share_name}"
 
