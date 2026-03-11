@@ -10,6 +10,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import folium
 from folium.features import DivIcon
+from folium.plugins import OverlappingMarkerSpiderfier
 from streamlit_folium import st_folium
 
 from auto_grouping import (
@@ -921,26 +922,64 @@ def render_group_driver_assignment_form(
     return assignment_store
 
 
+def styled_qty_value_html(value: int, kind: str) -> str:
+    palette = {
+        "small": {"bg": "rgba(148, 163, 184, 0.10)", "text": "#e2e8f0"},
+        "medium": {"bg": "rgba(148, 163, 184, 0.14)", "text": "#e2e8f0"},
+        "large": {"bg": "rgba(148, 163, 184, 0.18)", "text": "#f1f5f9"},
+        "total": {"bg": "rgba(226, 232, 240, 0.18)", "text": "#f8fafc"},
+    }
+    style = palette.get(kind, palette["small"])
+    weight = "700" if kind == "total" else "600"
+    return (
+        "<span style='display:inline-flex; align-items:center; justify-content:flex-end;"
+        " min-width:44px; padding:2px 8px; border-radius:6px;"
+        f" background:{style['bg']}; color:{style['text']};"
+        f" font-weight:{weight}; letter-spacing:0.01em; line-height:1.35;'>"
+        f"{safe_int(value)}"
+        "</span>"
+    )
+
+
+def build_overlap_info_map(valid_grouped: pd.DataFrame) -> dict:
+    overlap_info_map = {}
+    if len(valid_grouped) == 0:
+        return overlap_info_map
+
+    overlap_df = valid_grouped.copy()
+    overlap_df["coord_key"] = overlap_df["coords"].apply(
+        lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else ""
+    )
+    overlap_df["coord_rank"] = overlap_df.groupby("coord_key").cumcount()
+
+    for key, part in overlap_df.groupby("coord_key"):
+        if key == "":
+            continue
+        overlap_info_map[key] = {
+            "count": safe_int(len(part)),
+            "rank_map": {(str(r.get("route", "")), str(r.get("address_norm", ""))): safe_int(r.get("coord_rank", 0)) for _, r in part.iterrows()},
+        }
+
+    return overlap_info_map
+
+
+def spread_overlapping_marker(lat: float, lon: float, overlap_info: dict, row: pd.Series):
+    base_lat, base_lon = lat, lon
+    overlap_count = safe_int(overlap_info.get("count", 1))
+    overlap_rank = safe_int(overlap_info.get("rank_map", {}).get((str(row.get("route", "")), str(row.get("address_norm", ""))), 0))
+
+    if overlap_count > 1:
+        angle = (2 * math.pi * overlap_rank) / overlap_count
+        radius = 0.00018
+        lat = base_lat + (radius * math.sin(angle))
+        lon = base_lon + (radius * math.cos(angle))
+
+    return lat, lon, overlap_count
+
+
 def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_store: dict):
     st.subheader("기사 배정")
     st.caption("구분 / 캠프 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
-
-    def styled_qty_badge_html(value: int, kind: str) -> str:
-        palette = {
-            "small": {"bg": "#7f1d1d", "border": "#b91c1c", "text": "#fee2e2"},
-            "medium": {"bg": "#991b1b", "border": "#dc2626", "text": "#fee2e2"},
-            "large": {"bg": "#b91c1c", "border": "#ef4444", "text": "#fff1f2"},
-            "total": {"bg": "#1e3a8a", "border": "#3b82f6", "text": "#dbeafe"},
-        }
-        style = palette.get(kind, palette["small"])
-        return (
-            "<span style='display:inline-flex; align-items:center; justify-content:center;"
-            " min-width:44px; padding:2px 10px; border-radius:999px;"
-            f" background:{style['bg']}; color:{style['text']}; border:1px solid {style['border']};"
-            " font-weight:700; letter-spacing:0.01em; line-height:1.3;'>"
-            f"{safe_int(value)}"
-            "</span>"
-        )
 
     driver_options = [""] + drivers
 
@@ -966,10 +1005,10 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
             c4.write(safe_int(row["스톱수"]))
             c5.write(str(row["시작시간"]))
             c6.write(str(row["종료시간"]))
-            c7.markdown(styled_qty_badge_html(row["소형합"], "small"), unsafe_allow_html=True)
-            c8.markdown(styled_qty_badge_html(row["중형합"], "medium"), unsafe_allow_html=True)
-            c9.markdown(styled_qty_badge_html(row["대형합"], "large"), unsafe_allow_html=True)
-            c10.markdown(styled_qty_badge_html(row["총합"], "total"), unsafe_allow_html=True)
+            c7.markdown(styled_qty_value_html(row["소형합"], "small"), unsafe_allow_html=True)
+            c8.markdown(styled_qty_value_html(row["중형합"], "medium"), unsafe_allow_html=True)
+            c9.markdown(styled_qty_value_html(row["대형합"], "large"), unsafe_allow_html=True)
+            c10.markdown(styled_qty_value_html(row["총합"], "total"), unsafe_allow_html=True)
 
             selected_driver = c11.selectbox(
                 f"기사선택_{route}_{truck_request_id}",
@@ -1105,26 +1144,19 @@ def render_map(
         for i, driver in enumerate(driver_list)
     }
 
-    overlap_info_map = {}
-    if len(valid_grouped) > 0:
-        overlap_df = valid_grouped.copy()
-        overlap_df["coord_key"] = overlap_df["coords"].apply(
+    overlap_info_map = build_overlap_info_map(valid_grouped)
+
+    for key, part in valid_grouped.assign(
+        coord_key=valid_grouped["coords"].apply(
             lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else ""
         )
-        overlap_df["coord_rank"] = overlap_df.groupby("coord_key").cumcount()
-        overlap_df["coord_count"] = overlap_df.groupby("coord_key")["coord_key"].transform("count")
-
-        for key, part in overlap_df.groupby("coord_key"):
-            if key == "":
-                continue
-            route_names = sorted(part["route"].dropna().astype(str).unique().tolist())
-            driver_names = sorted([d for d in part["assigned_driver"].fillna("").astype(str).unique().tolist() if d.strip() != ""])
-            overlap_info_map[key] = {
-                "count": safe_int(len(part)),
-                "routes": route_names,
-                "drivers": driver_names,
-                "rank_map": {(str(r.get("route", "")), str(r.get("address_norm", ""))): safe_int(r.get("coord_rank", 0)) for _, r in part.iterrows()},
-            }
+    ).groupby("coord_key"):
+        if key == "":
+            continue
+        route_names = sorted(part["route"].dropna().astype(str).unique().tolist())
+        driver_names = sorted([d for d in part["assigned_driver"].fillna("").astype(str).unique().tolist() if d.strip() != ""])
+        overlap_info_map[key]["routes"] = route_names
+        overlap_info_map[key]["drivers"] = driver_names
 
     for route in route_list:
         truck_request_id = truck_request_map.get(route, "")
@@ -1197,16 +1229,9 @@ def render_map(
 
         for _, row in route_grouped.iterrows():
             lat, lon = row["coords"]
-            base_lat, base_lon = lat, lon
-            coord_key = f"{round(float(base_lat), 6)}_{round(float(base_lon), 6)}"
+            coord_key = f"{round(float(lat), 6)}_{round(float(lon), 6)}"
             overlap_info = overlap_info_map.get(coord_key, {})
-            overlap_count = safe_int(overlap_info.get("count", 1))
-            overlap_rank = safe_int(overlap_info.get("rank_map", {}).get((str(row.get("route", "")), str(row.get("address_norm", ""))), 0))
-            if overlap_count > 1:
-                angle = (2 * math.pi * overlap_rank) / overlap_count
-                radius = 0.00018
-                lat = base_lat + (radius * math.sin(angle))
-                lon = base_lon + (radius * math.cos(angle))
+            lat, lon, overlap_count = spread_overlapping_marker(lat, lon, overlap_info, row)
 
             driver_name = row.get("assigned_driver", "")
             is_assigned_pin = str(driver_name).strip() != ""
@@ -1293,6 +1318,7 @@ def render_group_map(
         center_lon = valid_result.iloc[0]["coords"][1]
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=10, prefer_canvas=True)
+    OverlappingMarkerSpiderfier(nearby_distance=24, keep_spiderfied=True).add_to(m)
 
     camp_group = folium.FeatureGroup(name="캠프", show=True)
     for camp_code, info in CAMP_INFO.items():
@@ -1319,6 +1345,7 @@ def render_group_map(
 
     group_list = sorted([g for g in valid_result["추천그룹"].dropna().unique().tolist() if str(g).strip() != ""])
     group_color_map = {group_name: ROUTE_COLORS[i % len(ROUTE_COLORS)] for i, group_name in enumerate(group_list)}
+    overlap_info_map = build_overlap_info_map(valid_grouped)
 
     for route in route_list:
         route_df_line = valid_result[valid_result["route"] == route].sort_values("house_order")
@@ -1362,6 +1389,10 @@ def render_group_map(
 
         for _, row in route_grouped.iterrows():
             lat, lon = row["coords"]
+            coord_key = f"{round(float(lat), 6)}_{round(float(lon), 6)}"
+            overlap_info = overlap_info_map.get(coord_key, {})
+            lat, lon, overlap_count = spread_overlapping_marker(lat, lon, overlap_info, row)
+            overlap_label = f" / 동일 위치 {overlap_count}건" if overlap_count > 1 else ""
             popup_html = f"""
             <b>추천그룹:</b> {str(row.get('추천그룹', '')).replace('추천그룹 ', '추천그룹')}<br>
             <b>주소:</b> {row.get('address', '')}<br>
@@ -1381,7 +1412,7 @@ def render_group_map(
             item_medium = safe_int(row.get("af_sum", 0))
             item_large = safe_int(row.get("ag_sum", 0))
             total_items = item_small + item_medium + item_large
-            marker_tooltip = f"{company_name} / 총수량 {total_items}개({item_small}/{item_medium}/{item_large})"
+            marker_tooltip = f"{company_name} / 총수량 {total_items}개({item_small}/{item_medium}/{item_large}){overlap_label}"
 
             folium.Marker(
                 [lat, lon],
