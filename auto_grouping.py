@@ -472,7 +472,7 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
         else:
             time_mark = "◯"
 
-        reason_summary = f"라우트 {route_mark} / 스톱수 {stop_mark} / 수량차이 {qty_mark} / 예상시간 {time_mark}"
+        reason_summary = f"집중도 {route_mark} · 스톱밸런스 {stop_mark} · 물량밸런스 {qty_mark} · 시간 {time_mark}"
 
         rows.append({
             "추천그룹": gname,
@@ -536,30 +536,45 @@ def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[s
 
     out = route_feature_df.copy()
     out["추천그룹"] = out["route"].map(group_map).fillna("")
+    out = out[out["추천그룹"].astype(str).str.strip() != ""].copy()
+    if len(out) == 0:
+        return pd.DataFrame()
 
-    box_score = _inverse_minmax(out["총합"])
-    stop_score = _inverse_minmax(out["스톱수"])
-    minute_score = _inverse_minmax(out["보정걸린분"])
-    spread_score = _inverse_minmax(out["route_spread_km"])
+    grouped = (
+        out.groupby("추천그룹", as_index=False)
+        .agg({
+            "route": "nunique",
+            "총합": "sum",
+            "스톱수": "sum",
+            "보정걸린분": "sum",
+            "route_spread_km": "mean",
+        })
+        .rename(columns={"route": "라우트수"})
+    )
 
-    out["선호예상점수"] = (
+    box_score = _inverse_minmax(grouped["총합"])
+    stop_score = _inverse_minmax(grouped["스톱수"])
+    minute_score = _inverse_minmax(grouped["보정걸린분"])
+    spread_score = _inverse_minmax(grouped["route_spread_km"])
+
+    grouped["선호예상점수"] = (
         box_score * 0.35
         + stop_score * 0.20
         + minute_score * 0.30
         + spread_score * 0.15
     ) * 100
 
-    out["선호예상순위"] = out["선호예상점수"].rank(method="dense", ascending=False).astype(int)
+    grouped["선호예상순위"] = grouped["선호예상점수"].rank(method="dense", ascending=False).astype(int)
 
     reason_labels = {
-        "box": "박스 수가 상대적으로 적음",
-        "stop": "스톱 수가 상대적으로 적음",
-        "minute": "예상 소요시간이 짧은 편",
-        "spread": "라우트 퍼짐이 작은 편",
+        "box": "물량부담↓",
+        "stop": "스톱부담↓",
+        "minute": "시간효율↑",
+        "spread": "동선집중↑",
     }
 
     reason_rows = []
-    for i in out.index:
+    for i in grouped.index:
         strengths = [
             ("box", float(box_score.loc[i])),
             ("stop", float(stop_score.loc[i])),
@@ -568,13 +583,13 @@ def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[s
         ]
         strengths.sort(key=lambda x: x[1], reverse=True)
         top2 = [reason_labels[k] for k, _ in strengths[:2]]
-        reason_rows.append(" / ".join(top2))
+        reason_rows.append(" · ".join(top2))
 
-    out["선호이유"] = reason_rows
+    grouped["선호이유"] = reason_rows
 
-    return out[[
-        "route",
+    return grouped[[
         "추천그룹",
+        "라우트수",
         "총합",
         "스톱수",
         "보정걸린분",
@@ -582,7 +597,7 @@ def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[s
         "선호예상점수",
         "선호예상순위",
         "선호이유",
-    ]].sort_values(["선호예상순위", "route"]).reset_index(drop=True)
+    ]].sort_values(["선호예상순위", "추천그룹"]).reset_index(drop=True)
 
 
 def default_group_edit_map(group_assignment_df: pd.DataFrame) -> Dict[str, str]:
