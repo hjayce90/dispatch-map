@@ -1236,10 +1236,17 @@ def render_group_map(
             size_scale = PIN_EDGE_SCALE if is_start else PIN_NORMAL_SCALE
             border_color = PIN_EDGE_BORDER_COLOR if (is_start or is_end) else PIN_NORMAL_BORDER_COLOR
 
+            company_name = str(row.get("company_name", "")).strip() or "업체명없음"
+            item_small = safe_int(row.get("ae_sum", 0))
+            item_medium = safe_int(row.get("af_sum", 0))
+            item_large = safe_int(row.get("ag_sum", 0))
+            total_items = item_small + item_medium + item_large
+            marker_tooltip = f"{company_name} / 총수량 {total_items}개({item_small}/{item_medium}/{item_large})"
+
             folium.Marker(
                 [lat, lon],
                 popup=popup_html,
-                tooltip=route_tooltip,
+                tooltip=marker_tooltip,
                 icon=make_stop_div_icon(route_color, str(row.get("pin_label", "")), size_scale=size_scale, border_color=border_color)
             ).add_to(route_group)
 
@@ -1348,46 +1355,40 @@ if "recommended_group_map" in st.session_state:
     st.subheader("추천그룹 요약")
     st.dataframe(group_summary_df, use_container_width=True)
 
-    st.subheader("추천그룹 수정")
-    edit_map = default_group_edit_map(group_assignment_df)
-    recommended_group_count = safe_int(st.session_state.get("recommended_group_count", 0))
-    if recommended_group_count <= 0:
-        recommended_group_count = max(1, safe_int(group_assignment_df["추천그룹"].nunique()))
-    group_options = [f"추천그룹 {i}" for i in range(1, recommended_group_count + 1)]
-    with st.form("group_edit_form", clear_on_submit=False):
-        new_group_map = edit_map.copy()
-        edit_rows = group_assignment_df.sort_values(["route_prefix", "route"]).reset_index(drop=True)
+    with st.expander("추천그룹 수정", expanded=False):
+        edit_map = default_group_edit_map(group_assignment_df)
+        recommended_group_count = safe_int(st.session_state.get("recommended_group_count", 0))
+        if recommended_group_count <= 0:
+            recommended_group_count = max(1, safe_int(group_assignment_df["추천그룹"].nunique()))
+        group_options = [f"추천그룹 {i}" for i in range(1, recommended_group_count + 1)]
+        with st.form("group_edit_form", clear_on_submit=False):
+            new_group_map = edit_map.copy()
+            edit_rows = group_assignment_df.sort_values(["route_prefix", "route"]).reset_index(drop=True)
 
-        h1, h2, h3, h4 = st.columns([1.0, 0.8, 1.2, 1.2])
-        h1.caption("route")
-        h2.caption("route_prefix")
-        h3.caption("truck_request_id")
-        h4.caption("selected_group")
+            for _, row in edit_rows.iterrows():
+                route = row["route"]
+                current_group = recommended_group_map.get(route, row["추천그룹"])
+                default_idx = group_options.index(current_group) if current_group in group_options else 0
 
-        for _, row in edit_rows.iterrows():
-            route = row["route"]
-            current_group = recommended_group_map.get(route, row["추천그룹"])
-            default_idx = group_options.index(current_group) if current_group in group_options else 0
+                c1, c2, c3, c4 = st.columns([1.0, 0.8, 1.2, 1.2])
+                c1.write(str(route))
+                c2.write(str(row.get("route_prefix", "")))
+                c3.write(str(row.get("truck_request_id", "")))
+                selected_group = c4.selectbox(
+                    f"추천그룹선택_{route}",
+                    options=group_options,
+                    index=default_idx,
+                    label_visibility="collapsed",
+                    key=f"group_select_{route}"
+                )
+                new_group_map[route] = selected_group
 
-            c1, c2, c3, c4 = st.columns([1.0, 0.8, 1.2, 1.2])
-            c1.write(str(route))
-            c2.write(str(row.get("route_prefix", "")))
-            c3.write(str(row.get("truck_request_id", "")))
-            selected_group = c4.selectbox(
-                f"추천그룹선택_{route}",
-                options=group_options,
-                index=default_idx,
-                label_visibility="collapsed",
-                key=f"group_select_{route}"
-            )
-            new_group_map[route] = selected_group
+            group_submitted = st.form_submit_button("추천그룹 수정 적용")
 
-        group_submitted = st.form_submit_button("추천그룹 수정 적용")
-
-    if group_submitted:
-        updated_assignment_df = apply_group_edit_map(route_feature_df, new_group_map)
-        st.session_state["recommended_group_map"] = default_group_edit_map(updated_assignment_df)
-        st.success("추천그룹 수동 수정을 반영했습니다.")
+        if group_submitted:
+            updated_assignment_df = apply_group_edit_map(route_feature_df, new_group_map)
+            st.session_state["recommended_group_map"] = default_group_edit_map(updated_assignment_df)
+            st.success("추천그룹 수동 수정을 반영했습니다.")
 
     final_group_map = st.session_state["recommended_group_map"]
     group_map_result, group_map_grouped = build_group_map_data(result_delivery, grouped_delivery, final_group_map)
@@ -1438,16 +1439,16 @@ if "recommended_group_map" in st.session_state:
     )
     st_folium(group_map_view, width=None, height=700)
 
-    st.subheader("기사 선호 예상 순위 (참고용)")
-    st.caption("총합, 스톱수, 보정걸린분, route_spread_km가 낮을수록 높은 점수를 받는 휴리스틱 지표입니다.")
-    preference_df = build_driver_preference_df(route_feature_df, final_group_map)
-    st.dataframe(
-        preference_df.assign(
-            선호예상점수=lambda df: df["선호예상점수"].round(1),
-            route_spread_km=lambda df: df["route_spread_km"].round(1),
-        ),
-        use_container_width=True,
-    )
+    with st.expander("기사 선호 예상 순위 (참고용)", expanded=False):
+        st.caption("추천그룹별 물량·스톱·예상시간·퍼짐 기준의 휴리스틱 참고 순위입니다.")
+        preference_df = build_driver_preference_df(route_feature_df, final_group_map)
+        st.dataframe(
+            preference_df.assign(
+                선호예상점수=lambda df: df["선호예상점수"].round(1),
+                route_spread_km=lambda df: df["route_spread_km"].round(1),
+            ).rename(columns={"route_spread_km": "그룹평균퍼짐km"}),
+            use_container_width=True,
+        )
 
 st.subheader("지도")
 
