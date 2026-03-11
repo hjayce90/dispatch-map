@@ -367,16 +367,22 @@ def _build_shared_summary(result_df: pd.DataFrame, grouped_df: pd.DataFrame):
     route_count = safe_int(result_df["route"].nunique()) if len(result_df) > 0 and "route" in result_df.columns else 0
     driver_count = safe_int(result_df["assigned_driver"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()) if len(result_df) > 0 and "assigned_driver" in result_df.columns else 0
     group_count = safe_int(result_df["추천그룹"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()) if len(result_df) > 0 and "추천그룹" in result_df.columns else 0
+    small_box_total = 0
+    medium_box_total = 0
+    large_box_total = 0
     box_total = 0
     if len(grouped_df) > 0:
-        box_total = safe_int(grouped_df.get("ae_sum", pd.Series(dtype=float)).sum()) + safe_int(grouped_df.get("af_sum", pd.Series(dtype=float)).sum()) + safe_int(grouped_df.get("ag_sum", pd.Series(dtype=float)).sum())
+        small_box_total = safe_int(grouped_df.get("ae_sum", pd.Series(dtype=float)).sum())
+        medium_box_total = safe_int(grouped_df.get("af_sum", pd.Series(dtype=float)).sum())
+        large_box_total = safe_int(grouped_df.get("ag_sum", pd.Series(dtype=float)).sum())
+        box_total = small_box_total + medium_box_total + large_box_total
 
     overlap_count = 0
     if len(grouped_df) > 0 and "coords" in grouped_df.columns:
         key_series = grouped_df["coords"].apply(lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else "")
         overlap_count = safe_int((key_series.value_counts() > 1).sum())
 
-    return route_count, driver_count, group_count, box_total, overlap_count
+    return route_count, driver_count, group_count, small_box_total, medium_box_total, large_box_total, box_total, overlap_count
 
 
 def make_stop_div_icon(route_color: str, stop_text: str, size_scale: float = 1.0, border_color: str = "#ffffff"):
@@ -1475,12 +1481,13 @@ if shared_map:
             if len(filtered_result) > 0 and "route" in filtered_result.columns and "assigned_driver" in filtered_result.columns:
                 route_driver_map = dict(zip(filtered_result["route"], filtered_result["assigned_driver"]))
 
-            route_count, driver_count, group_count, box_total, overlap_count = _build_shared_summary(filtered_result, filtered_grouped)
+            route_count, driver_count, group_count, small_box_total, medium_box_total, large_box_total, box_total, overlap_count = _build_shared_summary(filtered_result, filtered_grouped)
             s1, s2, s3, s4, s5 = st.columns(5)
             s1.metric("라우트 수", route_count)
             s2.metric("기사 수", driver_count)
             s3.metric("추천그룹 수", group_count)
-            s4.metric("박스 총합", box_total)
+            s4.metric("박스 총합", f"{box_total}개")
+            s4.caption(f"소 {small_box_total} / 중 {medium_box_total} / 대 {large_box_total}")
             s5.metric("동일위치 겹침", overlap_count)
 
             with st.spinner("공유 지도 생성 중..."):
