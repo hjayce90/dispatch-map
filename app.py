@@ -1457,51 +1457,78 @@ if shared_map:
             camp_coords_payload = payload.get("camp_coords", {})
 
             st.subheader("대표님 보고용 공유 지도")
-            view_mode = st.radio("보기 모드", ["전체 보기", "기사별 보기", "추천그룹별 보기"], horizontal=True)
 
-            selected_driver = ""
-            selected_group = ""
+            left_col, right_col = st.columns([1.3, 8.7], gap="medium")
 
-            if view_mode == "기사별 보기":
-                driver_options = sorted([d for d in shared_result_df["assigned_driver"].fillna("").astype(str).unique().tolist() if d.strip() != ""])
-                selected_driver = st.selectbox("기사 선택", driver_options) if driver_options else ""
-            elif view_mode == "추천그룹별 보기":
-                group_options = sorted([g for g in shared_result_df["추천그룹"].fillna("").astype(str).unique().tolist() if g.strip() != ""])
-                selected_group = st.selectbox("추천그룹 선택", group_options) if group_options else ""
+            with left_col:
+                st.markdown("### 필터")
+                view_mode = st.radio("보기 모드", ["전체 보기", "기사별 보기", "추천그룹별 보기"], label_visibility="collapsed")
 
-            filtered_result, filtered_grouped = _filter_shared_view(
-                shared_result_df,
-                shared_grouped_df,
-                mode=view_mode,
-                selected_driver=selected_driver,
-                selected_group=selected_group,
-            )
+                selected_driver = ""
+                selected_group = ""
+
+                if view_mode == "기사별 보기":
+                    driver_options = sorted([d for d in shared_result_df["assigned_driver"].fillna("").astype(str).unique().tolist() if d.strip() != ""])
+                    selected_driver = st.selectbox("기사 선택", driver_options) if driver_options else ""
+                elif view_mode == "추천그룹별 보기":
+                    group_options = sorted([g for g in shared_result_df["추천그룹"].fillna("").astype(str).unique().tolist() if g.strip() != ""])
+                    selected_group = st.selectbox("추천그룹 선택", group_options) if group_options else ""
+
+                filtered_result, filtered_grouped = _filter_shared_view(
+                    shared_result_df,
+                    shared_grouped_df,
+                    mode=view_mode,
+                    selected_driver=selected_driver,
+                    selected_group=selected_group,
+                )
+
+                route_count, driver_count, group_count, small_box_total, medium_box_total, large_box_total, box_total, overlap_count = _build_shared_summary(filtered_result, filtered_grouped)
+                st.markdown("### 핵심 요약")
+                st.metric("라우트", route_count)
+                st.metric("기사", driver_count)
+                st.metric("추천그룹", group_count)
+                st.metric("박스 총합", f"{box_total}개")
+                st.caption(f"소 {small_box_total} / 중 {medium_box_total} / 대 {large_box_total}")
+                st.caption(f"동일위치 겹침 {overlap_count}건")
+
+                route_summary_df = pd.DataFrame()
+                if len(filtered_result) > 0 and "route" in filtered_result.columns:
+                    route_summary_df = (
+                        filtered_result.groupby("route", as_index=False)
+                        .agg(
+                            truck_request_id=("truck_request_id", "first"),
+                            assigned_driver=("assigned_driver", "first"),
+                            추천그룹=("추천그룹", "first"),
+                        )
+                    )
+                    route_summary_df["truck_request_id"] = route_summary_df["route"].map(truck_request_map_payload).fillna(route_summary_df["truck_request_id"])
+
+                if len(route_summary_df) > 0:
+                    st.markdown("### 라우트/요청 정보")
+                    st.dataframe(
+                        route_summary_df[["추천그룹", "route", "truck_request_id", "assigned_driver"]],
+                        hide_index=True,
+                        use_container_width=True,
+                        height=min(220, 36 * (len(route_summary_df) + 1)),
+                    )
 
             route_driver_map = {}
             if len(filtered_result) > 0 and "route" in filtered_result.columns and "assigned_driver" in filtered_result.columns:
                 route_driver_map = dict(zip(filtered_result["route"], filtered_result["assigned_driver"]))
 
-            route_count, driver_count, group_count, small_box_total, medium_box_total, large_box_total, box_total, overlap_count = _build_shared_summary(filtered_result, filtered_grouped)
-            s1, s2, s3, s4, s5 = st.columns(5)
-            s1.metric("라우트 수", route_count)
-            s2.metric("기사 수", driver_count)
-            s3.metric("추천그룹 수", group_count)
-            s4.metric("박스 총합", f"{box_total}개")
-            s4.caption(f"소 {small_box_total} / 중 {medium_box_total} / 대 {large_box_total}")
-            s5.metric("동일위치 겹침", overlap_count)
-
-            with st.spinner("공유 지도 생성 중..."):
-                shared_map_obj = render_map(
-                    valid_result=filtered_result,
-                    valid_grouped=filtered_grouped,
-                    route_prefix_map=route_prefix_map_payload,
-                    truck_request_map=truck_request_map_payload,
-                    route_line_label=route_line_label_payload,
-                    route_driver_map=route_driver_map,
-                    route_camp_map=route_camp_map_payload,
-                    camp_coords=camp_coords_payload,
-                )
-            st_folium(shared_map_obj, width=None, height=900)
+            with right_col:
+                with st.spinner("공유 지도 생성 중..."):
+                    shared_map_obj = render_map(
+                        valid_result=filtered_result,
+                        valid_grouped=filtered_grouped,
+                        route_prefix_map=route_prefix_map_payload,
+                        truck_request_map=truck_request_map_payload,
+                        route_line_label=route_line_label_payload,
+                        route_driver_map=route_driver_map,
+                        route_camp_map=route_camp_map_payload,
+                        camp_coords=camp_coords_payload,
+                    )
+                st_folium(shared_map_obj, width=None, height=980)
 
             st.subheader("기사 할당표")
             assignment_rows = payload.get("assignment_rows", [])
