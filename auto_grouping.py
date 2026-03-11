@@ -455,7 +455,7 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
         elif spread_km <= 18:
             route_mark = "◐"
         else:
-            route_mark = "○"
+            route_mark = "◯"
 
         if avg_stops:
             gap = abs(total_stops - avg_stops)
@@ -470,7 +470,7 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
         elif total_minutes <= 270:
             time_mark = "◐"
         else:
-            time_mark = "○"
+            time_mark = "◯"
 
         reason_summary = f"라우트 {route_mark} / 스톱수 {stop_mark} / 수량차이 {qty_mark} / 예상시간 {time_mark}"
 
