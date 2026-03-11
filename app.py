@@ -269,6 +269,14 @@ def make_assignment_key(route: str, truck_request_id: str) -> str:
     return f"{str(route).strip()}__{str(truck_request_id).strip()}"
 
 
+def is_header_like_route_values(route_value, truck_request_id_value) -> bool:
+    route_text = str(route_value).strip().lower()
+    truck_text = str(truck_request_id_value).strip().lower()
+    header_routes = {"루트 번호", "루트번호", "route", "route no", "route_no"}
+    header_trucks = {"트럭 요청 id", "트럭요청id", "truck request id", "truck_request_id"}
+    return route_text in header_routes or truck_text in header_trucks
+
+
 def save_share_payload(share_name: str, map_html: str, assignment_df: pd.DataFrame, assigned_summary: pd.DataFrame):
     payload_path = os.path.join(SHARE_DIR, f"{share_name}.json")
     payload = {
@@ -630,6 +638,24 @@ def build_base_data(file_bytes: bytes):
         route_summary["end_max"].fillna(0) - route_summary["start_min"].fillna(0)
     ).clip(lower=0)
     route_summary["총걸린시간"] = route_summary["총걸린분"].apply(minutes_to_korean_text)
+
+    header_like_routes = route_summary[
+        route_summary.apply(
+            lambda r: is_header_like_route_values(r.get("route", ""), r.get("truck_request_id", "")),
+            axis=1,
+        )
+    ]["route"].astype(str).tolist()
+
+    if header_like_routes:
+        route_summary = route_summary[~route_summary["route"].astype(str).isin(header_like_routes)].copy()
+        result = result[~result["route"].astype(str).isin(header_like_routes)].copy()
+        result_delivery = result_delivery[~result_delivery["route"].astype(str).isin(header_like_routes)].copy()
+        grouped_delivery = grouped_delivery[~grouped_delivery["route"].astype(str).isin(header_like_routes)].copy()
+        route_prefix_map = {k: v for k, v in route_prefix_map.items() if str(k) not in set(map(str, header_like_routes))}
+        route_total_map = {k: v for k, v in route_total_map.items() if str(k) not in set(map(str, header_like_routes))}
+        truck_request_map = {k: v for k, v in truck_request_map.items() if str(k) not in set(map(str, header_like_routes))}
+        route_line_label = {k: v for k, v in route_line_label.items() if str(k) not in set(map(str, header_like_routes))}
+        route_camp_map = {k: v for k, v in route_camp_map.items() if str(k) not in set(map(str, header_like_routes))}
 
     return {
         "result_all": result,
@@ -1338,15 +1364,15 @@ if "recommended_group_map" in st.session_state:
         h3.caption("truck_request_id")
         h4.caption("selected_group")
 
-        for row in edit_rows.itertuples(index=False):
-            route = row.route
-            current_group = recommended_group_map.get(route, row.추천그룹)
+        for _, row in edit_rows.iterrows():
+            route = row["route"]
+            current_group = recommended_group_map.get(route, row["추천그룹"])
             default_idx = group_options.index(current_group) if current_group in group_options else 0
 
             c1, c2, c3, c4 = st.columns([1.0, 0.8, 1.2, 1.2])
             c1.write(str(route))
-            c2.write(str(getattr(row, "route_prefix", "")))
-            c3.write(str(getattr(row, "truck_request_id", "")))
+            c2.write(str(row.get("route_prefix", "")))
+            c3.write(str(row.get("truck_request_id", "")))
             selected_group = c4.selectbox(
                 f"추천그룹선택_{route}",
                 options=group_options,
