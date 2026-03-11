@@ -791,6 +791,17 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
     return assignment_store
 
 
+def resolve_group_count(route_feature_df: pd.DataFrame, manual_group_count=None) -> int:
+    if len(route_feature_df) == 0:
+        return 1
+
+    k = safe_int(manual_group_count)
+    if k <= 0:
+        k = choose_auto_group_count(route_feature_df)
+
+    return max(1, min(k, len(route_feature_df)))
+
+
 def build_map_data(result_delivery: pd.DataFrame, grouped_delivery: pd.DataFrame, assignment_df: pd.DataFrame, selected_filter: str):
     route_driver_map = {}
     if len(assignment_df) > 0:
@@ -1067,6 +1078,10 @@ def render_group_map(
         route_color = group_color_map.get(group_name, "#1e88e5")
         camp_code = route_camp_map.get(route, "")
         camp_name = CAMP_INFO.get(camp_code, {}).get("camp_name", "")
+        small_sum = safe_int(route_df_line.get("ae_sum", 0).sum())
+        medium_sum = safe_int(route_df_line.get("af_sum", 0).sum())
+        large_sum = safe_int(route_df_line.get("ag_sum", 0).sum())
+        route_tooltip = f"{group_name} | {route} | 총수량(소{small_sum}/중{medium_sum}/대{large_sum})"
 
         route_group = folium.FeatureGroup(name=f"{route_prefix_map.get(route, '')}", show=True)
 
@@ -1084,12 +1099,12 @@ def render_group_map(
                 weight=2,
                 opacity=0.7,
                 dash_array="4, 6",
-                tooltip=f"{route_prefix_map.get(route, '')} 도착센터: {camp_name}"
+                tooltip=route_tooltip
             ).add_to(route_group)
 
         if len(line_points) >= 2:
-            folium.PolyLine(line_points, color="#111111", weight=8, opacity=0.55).add_to(route_group)
-            folium.PolyLine(line_points, color=route_color, weight=5, opacity=0.95).add_to(route_group)
+            folium.PolyLine(line_points, color="#111111", weight=8, opacity=0.55, tooltip=route_tooltip).add_to(route_group)
+            folium.PolyLine(line_points, color=route_color, weight=5, opacity=0.95, tooltip=route_tooltip).add_to(route_group)
 
         route_grouped = valid_grouped[valid_grouped["route"] == route].copy()
         for _, row in route_grouped.iterrows():
@@ -1114,7 +1129,7 @@ def render_group_map(
             folium.Marker(
                 [lat, lon],
                 popup=popup_html,
-                tooltip=f"{row.get('추천그룹', '')} / {row.get('route', '')}",
+                tooltip=route_tooltip,
                 icon=make_stop_div_icon(route_color, str(row.get("pin_label", "")), size_scale=size_scale, border_color=border_color)
             ).add_to(route_group)
 
@@ -1208,8 +1223,10 @@ else:
 
 if st.button("추천그룹 자동 추천 실행"):
     route_feature_df = build_route_feature_df(route_summary, grouped_delivery)
+    recommended_group_count = resolve_group_count(route_feature_df, manual_group_count=manual_group_count)
     recommended_group_map = recommend_route_groups(route_feature_df, manual_group_count=manual_group_count)
     st.session_state["recommended_group_map"] = recommended_group_map
+    st.session_state["recommended_group_count"] = recommended_group_count
     st.success("추천그룹 생성을 완료했습니다.")
 
 if "recommended_group_map" in st.session_state:
@@ -1223,7 +1240,10 @@ if "recommended_group_map" in st.session_state:
 
     st.subheader("추천그룹 수정")
     edit_map = default_group_edit_map(group_assignment_df)
-    group_options = sorted(group_assignment_df["추천그룹"].dropna().unique().tolist())
+    recommended_group_count = safe_int(st.session_state.get("recommended_group_count", 0))
+    if recommended_group_count <= 0:
+        recommended_group_count = max(1, safe_int(group_assignment_df["추천그룹"].nunique()))
+    group_options = [f"추천그룹 {i}" for i in range(1, recommended_group_count + 1)]
     with st.form("group_edit_form", clear_on_submit=False):
         new_group_map = edit_map.copy()
         for _, row in group_assignment_df.sort_values(["route_prefix", "route"]).iterrows():
