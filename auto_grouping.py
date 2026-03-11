@@ -450,32 +450,29 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
         if avg_boxes:
             box_deviation_rate = abs(total_boxes - avg_boxes) / avg_boxes
 
-        reasons = []
         if spread_km <= 10:
-            reasons.append("라우트가 비교적 좁게 모여 있음")
+            route_mark = "●"
         elif spread_km <= 18:
-            reasons.append("라우트가 무난한 범위로 묶임")
+            route_mark = "◐"
         else:
-            reasons.append("라우트 범위가 다소 길게 퍼짐")
+            route_mark = "○"
 
         if avg_stops:
             gap = abs(total_stops - avg_stops)
-            if gap <= 5:
-                reasons.append("스톱 수 균형이 양호함")
-            else:
-                reasons.append("스톱 수 편차가 다소 있음")
-
-        if box_deviation_rate <= 0.2:
-            reasons.append("수량 차이가 20% 이내")
+            stop_mark = "●" if gap <= 5 else "◐"
         else:
-            reasons.append("수량 차이가 20% 초과")
+            stop_mark = "◐"
+
+        qty_mark = "●" if box_deviation_rate <= 0.2 else "◐"
 
         if total_minutes <= 240:
-            reasons.append("예상시간이 비교적 안정적임")
+            time_mark = "●"
         elif total_minutes <= 270:
-            reasons.append("예상시간이 상한에 가까움")
+            time_mark = "◐"
         else:
-            reasons.append("예상시간 주의 필요")
+            time_mark = "○"
+
+        reason_summary = f"라우트 {route_mark} / 스톱수 {stop_mark} / 수량차이 {qty_mark} / 예상시간 {time_mark}"
 
         rows.append({
             "추천그룹": gname,
@@ -487,7 +484,7 @@ def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
             "보정예상분": total_minutes,
             "보정예상시간": minutes_to_korean_text(total_minutes),
             "최대퍼짐km": round(spread_km, 1),
-            "추천이유": " / ".join(reasons),
+            "추천이유": reason_summary,
         })
 
     return pd.DataFrame(rows)
