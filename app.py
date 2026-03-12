@@ -363,6 +363,23 @@ def _filter_shared_view(result_df: pd.DataFrame, grouped_df: pd.DataFrame, mode:
     return result2, grouped2
 
 
+def _has_valid_coords(coords):
+    if not isinstance(coords, (tuple, list)) or len(coords) != 2:
+        return False
+    try:
+        lat = float(coords[0])
+        lon = float(coords[1])
+    except (TypeError, ValueError):
+        return False
+    return pd.notna(lat) and pd.notna(lon)
+
+
+def _filter_rows_with_valid_coords(df: pd.DataFrame):
+    if len(df) == 0 or "coords" not in df.columns:
+        return pd.DataFrame(columns=df.columns)
+    return df[df["coords"].apply(_has_valid_coords)].copy()
+
+
 def _build_shared_summary(result_df: pd.DataFrame, grouped_df: pd.DataFrame):
     route_count = safe_int(result_df["route"].nunique()) if len(result_df) > 0 and "route" in result_df.columns else 0
     driver_count = safe_int(result_df["assigned_driver"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()) if len(result_df) > 0 and "assigned_driver" in result_df.columns else 0
@@ -425,13 +442,30 @@ def _build_driver_overview_df(result_df: pd.DataFrame, grouped_df: pd.DataFrame)
         )
     ) if len(grouped2) > 0 else pd.DataFrame(columns=["assigned_driver", "소형합", "중형합", "대형합"])
 
+    route_time_source = assigned.copy()
+    if "time_minutes" not in route_time_source.columns:
+        route_time_source["time_minutes"] = pd.to_numeric(route_time_source.get("time_str"), errors="coerce")
+    else:
+        route_time_source["time_minutes"] = pd.to_numeric(route_time_source["time_minutes"], errors="coerce")
+
+    route_time_summary = (
+        route_time_source.dropna(subset=["route", "time_minutes"])
+        .groupby(["assigned_driver", "route"], as_index=False)
+        .agg(start_min=("time_minutes", "min"), end_max=("time_minutes", "max"))
+    )
+
+    if len(route_time_summary) > 0:
+        route_time_summary["route_minutes"] = (
+            route_time_summary["end_max"] - route_time_summary["start_min"]
+        ).clip(lower=0)
+
     time_summary = (
-        assigned.groupby("assigned_driver", as_index=False)
+        route_time_summary.groupby("assigned_driver", as_index=False)
         .agg(
-            총걸린분=("time_minutes", "max"),
+            총걸린분=("route_minutes", "sum"),
             route_count=("route", "nunique"),
         )
-    )
+    ) if len(route_time_summary) > 0 else pd.DataFrame(columns=["assigned_driver", "총걸린분", "route_count"])
 
     out = time_summary.merge(box_summary, on="assigned_driver", how="left")
     for col in ["소형합", "중형합", "대형합", "총걸린분", "route_count"]:
@@ -1515,6 +1549,9 @@ if shared_map:
         if result_rows and grouped_rows:
             shared_result_df = _records_to_df_with_coords(result_rows)
             shared_grouped_df = _records_to_df_with_coords(grouped_rows)
+
+            shared_result_df = _filter_rows_with_valid_coords(shared_result_df)
+            shared_grouped_df = _filter_rows_with_valid_coords(shared_grouped_df)
 
             route_prefix_map_payload = payload.get("route_prefix_map", {})
             truck_request_map_payload = payload.get("truck_request_map", {})
