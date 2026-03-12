@@ -385,6 +385,62 @@ def _build_shared_summary(result_df: pd.DataFrame, grouped_df: pd.DataFrame):
     return route_count, driver_count, group_count, small_box_total, medium_box_total, large_box_total, box_total, overlap_count
 
 
+
+
+def _build_driver_overview_df(result_df: pd.DataFrame, grouped_df: pd.DataFrame):
+    empty_overview = pd.DataFrame(
+        columns=["assigned_driver", "총걸린분", "route_count", "소형합", "중형합", "대형합", "총박스"]
+    )
+
+    if len(result_df) == 0 or "assigned_driver" not in result_df.columns:
+        return empty_overview.copy()
+
+    assigned = result_df.copy()
+    assigned["assigned_driver"] = assigned["assigned_driver"].fillna("").astype(str).str.strip()
+    assigned = assigned[assigned["assigned_driver"] != ""].copy()
+    if len(assigned) == 0:
+        return empty_overview.copy()
+
+    route_driver_df = (
+        assigned[["route", "assigned_driver"]]
+        .dropna(subset=["route"])
+        .drop_duplicates(subset=["route"])
+    )
+
+    grouped2 = grouped_df.copy()
+    if len(grouped2) == 0:
+        grouped2 = pd.DataFrame(columns=["route", "assigned_driver", "ae_sum", "af_sum", "ag_sum"])
+    elif "assigned_driver" not in grouped2.columns:
+        grouped2 = grouped2.merge(route_driver_df, on="route", how="left")
+
+    grouped2["assigned_driver"] = grouped2.get("assigned_driver", "").fillna("").astype(str).str.strip()
+    grouped2 = grouped2[grouped2["assigned_driver"] != ""].copy()
+
+    box_summary = (
+        grouped2.groupby("assigned_driver", as_index=False)
+        .agg(
+            소형합=("ae_sum", "sum"),
+            중형합=("af_sum", "sum"),
+            대형합=("ag_sum", "sum"),
+        )
+    ) if len(grouped2) > 0 else pd.DataFrame(columns=["assigned_driver", "소형합", "중형합", "대형합"])
+
+    time_summary = (
+        assigned.groupby("assigned_driver", as_index=False)
+        .agg(
+            총걸린분=("time_minutes", "max"),
+            route_count=("route", "nunique"),
+        )
+    )
+
+    out = time_summary.merge(box_summary, on="assigned_driver", how="left")
+    for col in ["소형합", "중형합", "대형합", "총걸린분", "route_count"]:
+        out[col] = pd.to_numeric(out.get(col, 0), errors="coerce").fillna(0).astype(int)
+
+    out["총박스"] = out["소형합"] + out["중형합"] + out["대형합"]
+    out = out.sort_values(["총박스", "총걸린분", "assigned_driver"], ascending=[False, False, True]).reset_index(drop=True)
+    return out
+
 def make_stop_div_icon(route_color: str, stop_text: str, size_scale: float = 1.0, border_color: str = "#ffffff"):
     base_size = 28
     icon_size = max(16, int(round(base_size * size_scale)))
@@ -1084,6 +1140,7 @@ def render_map(
     route_driver_map: dict,
     route_camp_map: dict,
     camp_coords: dict,
+    highlighted_driver: str = "",
 ):
     # 지도 중심
     center_lat, center_lon = 37.55, 126.98
@@ -1164,6 +1221,8 @@ def render_map(
         overlap_info_map[key]["routes"] = route_names
         overlap_info_map[key]["drivers"] = driver_names
 
+    active_driver = str(highlighted_driver or "").strip()
+
     for route in route_list:
         truck_request_id = truck_request_map.get(route, "")
         camp_code = route_camp_map.get(route, "")
@@ -1187,17 +1246,23 @@ def render_map(
 
         route_driver = route_driver_map.get(route, "")
         is_assigned_route = str(route_driver).strip() != ""
+        is_highlight_target = active_driver != "" and str(route_driver).strip() == active_driver
+        is_dimmed_route = active_driver != "" and not is_highlight_target
 
         if is_assigned_route:
             line_color = driver_color_map.get(route_driver, "#1e88e5")
-            under_weight = 6
-            main_weight = 4
+            under_weight = 5 if is_dimmed_route else 7
+            main_weight = 3 if is_dimmed_route else 5
             dash_value = "10, 8"
         else:
             line_color = route_color_map.get(route, "#1e88e5")
-            under_weight = 10
-            main_weight = 7
+            under_weight = 6 if is_dimmed_route else 10
+            main_weight = 4 if is_dimmed_route else 7
             dash_value = None
+
+        line_opacity_main = 0.2 if is_dimmed_route else 0.95
+        line_opacity_under = 0.15 if is_dimmed_route else 0.55
+        connector_opacity = 0.2 if is_dimmed_route else 0.7
 
         # 캠프 -> 마지막 배송지 연결선
         camp_coord = camp_coords.get(camp_code)
@@ -1206,7 +1271,7 @@ def render_map(
                 [[camp_coord[0], camp_coord[1]], line_points[-1]],
                 color="#444444",
                 weight=2,
-                opacity=0.7,
+                opacity=connector_opacity,
                 dash_array="4, 6",
                 tooltip=f"{route_prefix_map.get(route, '')} 도착센터: {camp_name}"
             ).add_to(route_group)
@@ -1217,7 +1282,7 @@ def render_map(
                 line_points,
                 color="#111111",
                 weight=under_weight,
-                opacity=0.55,
+                opacity=line_opacity_under,
                 tooltip=route_line_label.get(route, truck_request_id),
                 dash_array=dash_value
             ).add_to(route_group)
@@ -1226,7 +1291,7 @@ def render_map(
                 line_points,
                 color=line_color,
                 weight=main_weight,
-                opacity=0.95,
+                opacity=line_opacity_main,
                 tooltip=route_line_label.get(route, truck_request_id),
                 dash_array=dash_value
             ).add_to(route_group)
@@ -1293,6 +1358,7 @@ def render_map(
                 [lat, lon],
                 popup=popup_html,
                 tooltip=tooltip_text,
+                opacity=0.35 if (active_driver != "" and str(driver_name).strip() != active_driver) else 1.0,
                 icon=icon_obj
             ).add_to(route_group)
 
@@ -1458,31 +1524,61 @@ if shared_map:
 
             st.subheader("대표님 보고용 공유 지도")
 
-            left_col, right_col = st.columns([1.3, 8.7], gap="medium")
+            left_col, right_col = st.columns([1, 5], gap="medium")
+
+            filtered_result = shared_result_df.copy()
+            filtered_grouped = shared_grouped_df.copy()
+            driver_overview_df = _build_driver_overview_df(shared_result_df, shared_grouped_df)
+
+            route_list_shared = sorted(
+                shared_result_df["route"].dropna().unique().tolist(),
+                key=lambda x: route_prefix_map_payload.get(x, "")
+            ) if "route" in shared_result_df.columns else []
+            driver_list_shared = [
+                d for d in shared_result_df.get("assigned_driver", pd.Series(dtype=str)).fillna("").unique().tolist()
+                if str(d).strip() != ""
+            ]
+            driver_color_map_shared = {
+                driver: ROUTE_COLORS[(i + len(route_list_shared)) % len(ROUTE_COLORS)]
+                for i, driver in enumerate(driver_list_shared)
+            }
 
             with left_col:
-                st.markdown("### 추천그룹 선택")
-                group_options = sorted([g for g in shared_result_df["추천그룹"].fillna("").astype(str).unique().tolist() if g.strip() != ""])
-                selectable_groups = ["전체"] + group_options if group_options else ["전체"]
-                selected_group = st.selectbox("추천그룹", selectable_groups, label_visibility="collapsed")
-                shared_view_mode = "추천그룹별 보기" if selected_group != "전체" else "전체 보기"
+                st.markdown("### 전체 요약")
+                total_drivers = safe_int(driver_overview_df["assigned_driver"].nunique()) if len(driver_overview_df) > 0 else 0
+                total_boxes = safe_int(driver_overview_df["총박스"].sum()) if len(driver_overview_df) > 0 else 0
+                avg_minutes = safe_int(driver_overview_df["총걸린분"].mean()) if len(driver_overview_df) > 0 else 0
+                max_minutes = safe_int(driver_overview_df["총걸린분"].max()) if len(driver_overview_df) > 0 else 0
 
-                filtered_result, filtered_grouped = _filter_shared_view(
-                    shared_result_df,
-                    shared_grouped_df,
-                    mode=shared_view_mode,
-                    selected_driver="",
-                    selected_group=selected_group if selected_group != "전체" else "",
+                st.caption(f"기사 {total_drivers}명")
+                st.caption(f"총 박스 {total_boxes}개")
+                st.caption(f"평균 {avg_minutes}분")
+                st.caption(f"최대 {max_minutes}분")
+
+                driver_options = ["전체 기사"] + driver_overview_df["assigned_driver"].tolist()
+                selected_driver = st.radio(
+                    "기사 라우트 보기",
+                    driver_options,
+                    label_visibility="collapsed",
                 )
+                highlighted_driver = "" if selected_driver == "전체 기사" else selected_driver
 
-                route_count, driver_count, group_count, small_box_total, medium_box_total, large_box_total, box_total, overlap_count = _build_shared_summary(filtered_result, filtered_grouped)
-                st.markdown("### 핵심 요약")
-                st.metric("라우트", route_count)
-                st.metric("기사", driver_count)
-                st.metric("추천그룹", group_count)
-                st.metric("박스 총합", f"{box_total}개")
-                st.caption(f"소 {small_box_total} / 중 {medium_box_total} / 대 {large_box_total}")
-                st.caption(f"동일위치 겹침 {overlap_count}건")
+                if len(driver_overview_df) == 0:
+                    st.info("배정된 기사가 없습니다.")
+                else:
+                    st.markdown("### 기사 배정 현황")
+                    for _, drow in driver_overview_df.iterrows():
+                        driver_name = str(drow["assigned_driver"])
+                        is_selected = highlighted_driver != "" and driver_name == highlighted_driver
+                        line_prefix = "➡️ " if is_selected else ""
+                        color_chip = driver_color_map_shared.get(driver_name, "#1e88e5")
+                        st.markdown(
+                            f"<span style='display:inline-block;width:8px;height:8px;border-radius:50%;background:{color_chip};margin-right:6px;'></span>"
+                            f"**{line_prefix}{driver_name}**",
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(f"소 {safe_int(drow['소형합'])} / 중 {safe_int(drow['중형합'])} / 대 {safe_int(drow['대형합'])}")
+                        st.caption(f"총합 {safe_int(drow['총박스'])} · 예상시간 {safe_int(drow['총걸린분'])}분")
 
             route_driver_map = {}
             if len(filtered_result) > 0 and "route" in filtered_result.columns and "assigned_driver" in filtered_result.columns:
@@ -1499,6 +1595,7 @@ if shared_map:
                         route_driver_map=route_driver_map,
                         route_camp_map=route_camp_map_payload,
                         camp_coords=camp_coords_payload,
+                        highlighted_driver=highlighted_driver,
                     )
                 st_folium(shared_map_obj, width=None, height=980)
 
@@ -1506,8 +1603,8 @@ if shared_map:
             assignment_rows = payload.get("assignment_rows", [])
             if assignment_rows:
                 assignment_df_payload = pd.DataFrame(assignment_rows)
-                if shared_view_mode == "추천그룹별 보기" and selected_group and selected_group != "전체" and "추천그룹" in assignment_df_payload.columns:
-                    assignment_df_payload = assignment_df_payload[assignment_df_payload["추천그룹"].fillna("").astype(str) == selected_group].copy()
+                if highlighted_driver and "assigned_driver" in assignment_df_payload.columns:
+                    assignment_df_payload = assignment_df_payload[assignment_df_payload["assigned_driver"].fillna("").astype(str) == highlighted_driver].copy()
                 st.dataframe(assignment_df_payload, use_container_width=True)
 
         else:
