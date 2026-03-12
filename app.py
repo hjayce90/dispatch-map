@@ -2,6 +2,7 @@ import os
 import re
 import json
 import math
+import logging
 from io import BytesIO
 
 import requests
@@ -77,6 +78,45 @@ os.makedirs(MAP_DIR, exist_ok=True)
 os.makedirs(SHARE_DIR, exist_ok=True)
 
 uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx"])
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_coords(coords):
+    if isinstance(coords, str):
+        text = coords.strip()
+        if text == "":
+            return None
+        text = text.strip("()[]")
+        parts = [p.strip() for p in text.split(",")]
+        if len(parts) == 2:
+            coords = parts
+
+    if not (isinstance(coords, (list, tuple)) and len(coords) == 2):
+        return None
+
+    try:
+        lat = float(coords[0])
+        lon = float(coords[1])
+    except (TypeError, ValueError):
+        return None
+
+    if any(pd.isna(v) for v in [lat, lon]):
+        return None
+
+    return (lat, lon)
+
+
+def _sanitize_coords_column(df: pd.DataFrame, log_label: str = ""):
+    if len(df) == 0 or "coords" not in df.columns:
+        return df.copy(), 0
+
+    out = df.copy()
+    out["coords"] = out["coords"].apply(_normalize_coords)
+    invalid_count = safe_int(out["coords"].isna().sum())
+    if invalid_count > 0 and log_label:
+        logger.debug("[%s] invalid coords rows skipped: %s", log_label, invalid_count)
+    return out, invalid_count
 
 # =========================
 # 공통 함수
@@ -296,11 +336,7 @@ def _records_to_df_with_coords(records):
         return df
 
     if "coords" in df.columns:
-        def to_tuple(v):
-            if isinstance(v, (list, tuple)) and len(v) == 2:
-                return (float(v[0]), float(v[1]))
-            return None
-        df["coords"] = df["coords"].apply(to_tuple)
+        df["coords"] = df["coords"].apply(_normalize_coords)
     return df
 
 
@@ -357,6 +393,9 @@ def _filter_shared_view(result_df: pd.DataFrame, grouped_df: pd.DataFrame, mode:
     elif mode == "추천그룹별 보기" and str(selected_group).strip() != "":
         result2 = result2[result2["추천그룹"].fillna("").astype(str) == str(selected_group)].copy()
         grouped2 = grouped2[grouped2["추천그룹"].fillna("").astype(str) == str(selected_group)].copy()
+
+    result2, _ = _sanitize_coords_column(result2, log_label="shared_result_filter")
+    grouped2, _ = _sanitize_coords_column(grouped2, log_label="shared_grouped_filter")
 
     result2 = result2[result2["coords"].notna()].copy() if "coords" in result2.columns else pd.DataFrame()
     grouped2 = grouped2[grouped2["coords"].notna()].copy() if "coords" in grouped2.columns else pd.DataFrame()
@@ -1120,6 +1159,9 @@ def build_map_data(result_delivery: pd.DataFrame, grouped_delivery: pd.DataFrame
         map_result = result2[result2["assigned_driver"] == selected_filter].copy()
         map_grouped = grouped2[grouped2["assigned_driver"] == selected_filter].copy()
 
+    map_result, _ = _sanitize_coords_column(map_result, log_label="build_map_data_result")
+    map_grouped, _ = _sanitize_coords_column(map_grouped, log_label="build_map_data_grouped")
+
     valid_result = map_result[map_result["coords"].notna()].copy()
     valid_grouped = map_grouped[map_grouped["coords"].notna()].copy()
 
@@ -1141,14 +1183,26 @@ def render_map(
     center_lat, center_lon = 37.55, 126.98
 
     for camp_code in CAMP_INFO.keys():
-        coords = camp_coords.get(camp_code)
+        coords = _normalize_coords(camp_coords.get(camp_code))
         if coords:
             center_lat, center_lon = coords
             break
 
-    if len(valid_result) > 0 and valid_result.iloc[0]["coords"] is not None:
-        center_lat = valid_result.iloc[0]["coords"][0]
-        center_lon = valid_result.iloc[0]["coords"][1]
+    valid_result_safe, invalid_result_count = _sanitize_coords_column(valid_result, log_label="render_map_result")
+    valid_grouped_safe, invalid_grouped_count = _sanitize_coords_column(valid_grouped, log_label="render_map_grouped")
+    valid_result_safe = valid_result_safe[valid_result_safe["coords"].notna()].copy() if "coords" in valid_result_safe.columns else pd.DataFrame()
+    valid_grouped_safe = valid_grouped_safe[valid_grouped_safe["coords"].notna()].copy() if "coords" in valid_grouped_safe.columns else pd.DataFrame()
+
+    if invalid_result_count > 0 or invalid_grouped_count > 0:
+        logger.debug(
+            "[render_map] skipped invalid coords rows result=%s grouped=%s",
+            invalid_result_count,
+            invalid_grouped_count,
+        )
+
+    if len(valid_result_safe) > 0 and valid_result_safe.iloc[0]["coords"] is not None:
+        center_lat = valid_result_safe.iloc[0]["coords"][0]
+        center_lon = valid_result_safe.iloc[0]["coords"][1]
 
     m = folium.Map(
         location=[center_lat, center_lon],
@@ -1160,7 +1214,7 @@ def render_map(
     camp_group = folium.FeatureGroup(name="캠프", show=True)
 
     for camp_code, info in CAMP_INFO.items():
-        coords = camp_coords.get(camp_code)
+        coords = _normalize_coords(camp_coords.get(camp_code))
         if not coords:
             continue
 
@@ -1184,7 +1238,7 @@ def render_map(
 
     # 라우트별 색상
     route_list = sorted(
-        valid_result["route"].dropna().unique().tolist(),
+        valid_result_safe["route"].dropna().unique().tolist(),
         key=lambda x: route_prefix_map.get(x, "")
     )
 
@@ -1194,7 +1248,7 @@ def render_map(
     }
 
     driver_list = [
-        d for d in valid_result["assigned_driver"].fillna("").unique().tolist()
+        d for d in valid_result_safe["assigned_driver"].fillna("").unique().tolist()
         if str(d).strip() != ""
     ]
     driver_color_map = {
@@ -1202,10 +1256,10 @@ def render_map(
         for i, driver in enumerate(driver_list)
     }
 
-    overlap_info_map = build_overlap_info_map(valid_grouped)
+    overlap_info_map = build_overlap_info_map(valid_grouped_safe)
 
-    for key, part in valid_grouped.assign(
-        coord_key=valid_grouped["coords"].apply(
+    for key, part in valid_grouped_safe.assign(
+        coord_key=valid_grouped_safe["coords"].apply(
             lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else ""
         )
     ).groupby("coord_key"):
@@ -1228,15 +1282,18 @@ def render_map(
             show=True
         )
 
-        route_df_line = valid_result[
-            (valid_result["route"] == route)
+        route_df_line = valid_result_safe[
+            (valid_result_safe["route"] == route)
         ].sort_values("house_order")
 
         line_points = []
         route_df_line_house = route_df_line.drop_duplicates(subset=["address_norm"], keep="first")
 
         for _, row in route_df_line_house.iterrows():
-            lat, lon = row["coords"]
+            coords = _normalize_coords(row.get("coords"))
+            if coords is None:
+                continue
+            lat, lon = coords
             line_points.append([lat, lon])
 
         route_driver = route_driver_map.get(route, "")
@@ -1261,6 +1318,7 @@ def render_map(
 
         # 캠프 -> 마지막 배송지 연결선
         camp_coord = camp_coords.get(camp_code)
+        camp_coord = _normalize_coords(camp_coord)
         if camp_coord and len(line_points) >= 1:
             folium.PolyLine(
                 [[camp_coord[0], camp_coord[1]], line_points[-1]],
@@ -1291,10 +1349,13 @@ def render_map(
                 dash_array=dash_value
             ).add_to(route_group)
 
-        route_grouped = valid_grouped[valid_grouped["route"] == route].copy()
+        route_grouped = valid_grouped_safe[valid_grouped_safe["route"] == route].copy()
 
         for _, row in route_grouped.iterrows():
-            lat, lon = row["coords"]
+            coords = _normalize_coords(row.get("coords"))
+            if coords is None:
+                continue
+            lat, lon = coords
             coord_key = f"{round(float(lat), 6)}_{round(float(lon), 6)}"
             overlap_info = overlap_info_map.get(coord_key, {})
             lat, lon, overlap_count = spread_overlapping_marker(lat, lon, overlap_info, row)
@@ -1510,12 +1571,19 @@ if shared_map:
         if result_rows and grouped_rows:
             shared_result_df = _records_to_df_with_coords(result_rows)
             shared_grouped_df = _records_to_df_with_coords(grouped_rows)
+            shared_result_df, _ = _sanitize_coords_column(shared_result_df, log_label="shared_payload_result")
+            shared_grouped_df, _ = _sanitize_coords_column(shared_grouped_df, log_label="shared_payload_grouped")
 
             route_prefix_map_payload = payload.get("route_prefix_map", {})
             truck_request_map_payload = payload.get("truck_request_map", {})
             route_line_label_payload = payload.get("route_line_label", {})
             route_camp_map_payload = payload.get("route_camp_map", {})
             camp_coords_payload = payload.get("camp_coords", {})
+            if isinstance(camp_coords_payload, dict):
+                camp_coords_payload = {
+                    k: _normalize_coords(v)
+                    for k, v in camp_coords_payload.items()
+                }
 
             st.subheader("대표님 보고용 공유 지도")
 
