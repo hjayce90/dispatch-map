@@ -1739,12 +1739,12 @@ manual_group_count = None
 if group_count_mode == "직접입력":
     manual_group_count = st.number_input("추천그룹 수", min_value=1, max_value=max(1, len(route_summary)), value=2, step=1)
 else:
-    route_feature_df_for_count = build_route_feature_df(route_summary, grouped_delivery)
+    route_feature_df_for_count = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
     auto_group_count = choose_auto_group_count(route_feature_df_for_count)
     st.caption(f"자동 추천그룹 수: {auto_group_count}")
 
 if st.button("추천그룹 자동 추천 실행"):
-    route_feature_df = build_route_feature_df(route_summary, grouped_delivery)
+    route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
     recommended_group_count = resolve_group_count(route_feature_df, manual_group_count=manual_group_count)
     recommended_group_map = recommend_route_groups(route_feature_df, manual_group_count=manual_group_count)
     st.session_state["recommended_group_map"] = recommended_group_map
@@ -1752,7 +1752,7 @@ if st.button("추천그룹 자동 추천 실행"):
     st.success("추천그룹 생성을 완료했습니다.")
 
 if "recommended_group_map" in st.session_state:
-    route_feature_df = build_route_feature_df(route_summary, grouped_delivery)
+    route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
     recommended_group_map = st.session_state["recommended_group_map"]
     group_assignment_df = build_group_assignment_df(route_feature_df, recommended_group_map)
     group_summary_df = build_group_summary_df(group_assignment_df)

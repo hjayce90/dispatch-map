@@ -5,6 +5,10 @@ from typing import Dict, List, Tuple
 import pandas as pd
 
 
+AVERAGE_TRAVEL_SPEED_KMPH = 30.0
+MAX_ROUTE_MINUTES = 240
+
+
 def safe_int(v) -> int:
     try:
         if pd.isna(v):
@@ -80,12 +84,76 @@ def estimate_adjusted_minutes(total_minutes, total_boxes) -> int:
     return base + 10
 
 
-def build_route_feature_df(route_summary: pd.DataFrame, grouped_delivery: pd.DataFrame) -> pd.DataFrame:
+def estimate_travel_minutes_by_coords(start_coords, end_coords, speed_kmph: float = AVERAGE_TRAVEL_SPEED_KMPH) -> int:
+    if not isinstance(start_coords, (list, tuple)) or len(start_coords) != 2:
+        return 0
+    if not isinstance(end_coords, (list, tuple)) or len(end_coords) != 2:
+        return 0
+
+    distance_km = calc_distance_km(start_coords[0], start_coords[1], end_coords[0], end_coords[1])
+    if speed_kmph <= 0:
+        return 0
+    return max(0, int(round((distance_km / speed_kmph) * 60)))
+
+
+def compute_group_operating_minutes(group_routes_df: pd.DataFrame) -> Dict[str, int]:
+    if len(group_routes_df) == 0:
+        return {
+            "next_route_first_stop_travel_time": 0,
+            "center_return_time": 0,
+            "total_route_time": 0,
+            "exceeds_max_minutes": False,
+        }
+
+    order_keys = []
+    if "start_min" in group_routes_df.columns:
+        order_keys.append("start_min")
+    if "route_prefix" in group_routes_df.columns:
+        order_keys.append("route_prefix")
+    order_keys.append("route")
+
+    ordered = group_routes_df.sort_values(order_keys).reset_index(drop=True)
+
+    first_row = ordered.iloc[0]
+    center_coords = first_row.get("center_coords")
+    first_stop_coords = first_row.get("first_stop_coords")
+
+    start_to_first_stop_minutes = estimate_travel_minutes_by_coords(center_coords, first_stop_coords)
+    service_minutes = safe_int(ordered["보정걸린분"].sum())
+
+    next_route_first_stop_travel_time = 0
+    for idx in range(len(ordered) - 1):
+        current_last = ordered.iloc[idx].get("last_stop_coords")
+        next_first = ordered.iloc[idx + 1].get("first_stop_coords")
+        next_route_first_stop_travel_time += estimate_travel_minutes_by_coords(current_last, next_first)
+
+    last_row = ordered.iloc[-1]
+    last_stop_coords = last_row.get("last_stop_coords")
+    center_return_time = estimate_travel_minutes_by_coords(last_stop_coords, center_coords)
+
+    total_route_time = (
+        start_to_first_stop_minutes
+        + service_minutes
+        + next_route_first_stop_travel_time
+        + center_return_time
+    )
+
+    return {
+        "next_route_first_stop_travel_time": safe_int(next_route_first_stop_travel_time),
+        "center_return_time": safe_int(center_return_time),
+        "total_route_time": safe_int(total_route_time),
+        "exceeds_max_minutes": safe_int(total_route_time) > MAX_ROUTE_MINUTES,
+    }
+
+
+def build_route_feature_df(route_summary: pd.DataFrame, grouped_delivery: pd.DataFrame, camp_coords: Dict[str, Tuple[float, float]] = None) -> pd.DataFrame:
     rows = []
+    camp_coords = camp_coords or {}
 
     for _, route_row in route_summary.iterrows():
         route = str(route_row["route"]).strip()
         route_points = grouped_delivery[grouped_delivery["route"] == route].copy()
+        route_points = route_points.sort_values("house_order")
 
         coords = []
         for _, p in route_points.iterrows():
@@ -96,9 +164,16 @@ def build_route_feature_df(route_summary: pd.DataFrame, grouped_delivery: pd.Dat
         if coords:
             centroid_lat = sum(x[0] for x in coords) / len(coords)
             centroid_lon = sum(x[1] for x in coords) / len(coords)
+            first_stop_coords = coords[0]
+            last_stop_coords = coords[-1]
         else:
             centroid_lat = None
             centroid_lon = None
+            first_stop_coords = None
+            last_stop_coords = None
+
+        camp_code = route_row.get("camp_code", "")
+        center_coords = camp_coords.get(camp_code)
 
         route_spread_km = max_pairwise_distance(coords)
 
@@ -107,6 +182,7 @@ def build_route_feature_df(route_summary: pd.DataFrame, grouped_delivery: pd.Dat
             "truck_request_id": route_row["truck_request_id"],
             "route_prefix": route_row.get("route_prefix", ""),
             "camp_name": route_row.get("camp_name", ""),
+            "camp_code": camp_code,
             "스톱수": safe_int(route_row["스톱수"]),
             "소형합": safe_int(route_row["소형합"]),
             "중형합": safe_int(route_row["중형합"]),
@@ -115,9 +191,13 @@ def build_route_feature_df(route_summary: pd.DataFrame, grouped_delivery: pd.Dat
             "총걸린분": safe_int(route_row["총걸린분"]),
             "보정걸린분": estimate_adjusted_minutes(route_row["총걸린분"], route_row["총합"]),
             "coords_list": coords,
+            "first_stop_coords": first_stop_coords,
+            "last_stop_coords": last_stop_coords,
+            "center_coords": center_coords,
             "centroid_lat": centroid_lat,
             "centroid_lon": centroid_lon,
             "route_spread_km": route_spread_km,
+            "start_min": safe_int(route_row.get("start_min", 0)),
         })
 
     return pd.DataFrame(rows)
@@ -301,18 +381,28 @@ def evaluate_group_score(route_feature_df: pd.DataFrame, group_map: Dict[str, st
         spread_km = max_pairwise_distance(all_coords)
         total_stops = part["스톱수"].sum()
         total_boxes = part["총합"].sum()
-        total_minutes = part["보정걸린분"].sum()
+        operating_time = compute_group_operating_minutes(part)
+        total_minutes = safe_int(operating_time["total_route_time"])
 
-        # 1순위: 퍼짐이 작을수록 좋음
-        score += spread_km * 10.0
+        # 1순위: 4시간 하드 제한 (초과 시 사실상 배정 불가)
+        if operating_time["exceeds_max_minutes"]:
+            score += 1_000_000 + (total_minutes - MAX_ROUTE_MINUTES) * 1_000
+
+        # 2순위: 총 소요시간이 짧을수록 우선
+        score += total_minutes * 8.0
+
+        # 3순위: 거리/퍼짐은 보조 지표
+        score += spread_km * 2.5
 
         # 너무 길게 찢어진 그룹 강한 패널티
         if spread_km > 20:
             score += (spread_km - 20) * 12.0
 
-        # 시간은 참고용 패널티
-        if total_minutes > 270:
-            score += (total_minutes - 270) * 2.0
+        # 라우트 간 연결(이전 라우트 마지막 -> 다음 라우트 첫집) 이동이 길면 추가 패널티
+        score += safe_int(operating_time["next_route_first_stop_travel_time"]) * 3.0
+
+        # 마지막 집 -> 센터 복귀 반영 패널티
+        score += safe_int(operating_time["center_return_time"]) * 2.0
 
         stops_by_group.append(total_stops)
         boxes_by_group.append(total_boxes)
