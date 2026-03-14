@@ -9,6 +9,35 @@ AVERAGE_TRAVEL_SPEED_KMPH = 30.0
 MAX_ROUTE_MINUTES = 240
 
 
+def compute_box_balance_metrics(boxes_by_group: List[int]) -> Dict[str, float]:
+    if not boxes_by_group:
+        return {
+            "box_count_gap": 0.0,
+            "box_count_stddev": 0.0,
+            "box_fairness_score": 0.0,
+        }
+
+    max_boxes = max(boxes_by_group)
+    min_boxes = min(boxes_by_group)
+    box_count_gap = float(max_boxes - min_boxes)
+
+    avg_boxes = sum(boxes_by_group) / len(boxes_by_group)
+    if avg_boxes <= 0:
+        box_count_stddev = 0.0
+    else:
+        variance = sum((b - avg_boxes) ** 2 for b in boxes_by_group) / len(boxes_by_group)
+        box_count_stddev = math.sqrt(variance)
+
+    # 낮을수록 좋은 페널티 점수(기사 간 박스 불균형)
+    box_fairness_score = box_count_gap + (box_count_stddev * 1.5)
+
+    return {
+        "box_count_gap": box_count_gap,
+        "box_count_stddev": float(box_count_stddev),
+        "box_fairness_score": float(box_fairness_score),
+    }
+
+
 def safe_int(v) -> int:
     try:
         if pd.isna(v):
@@ -364,8 +393,13 @@ def evaluate_group_score(route_feature_df: pd.DataFrame, group_map: Dict[str, st
         return 0.0
 
     score = 0.0
-    stops_by_group = []
     boxes_by_group = []
+    total_route_time = 0
+    total_spread_km = 0.0
+    total_next_route_first_stop_travel_time = 0
+    total_center_return_time = 0
+    infeasible_group_count = 0
+    infeasible_over_minutes = 0
 
     group_names = sorted(set(group_map.values()), key=lambda x: int(str(x).replace("추천그룹 ", "")))
 
@@ -379,54 +413,46 @@ def evaluate_group_score(route_feature_df: pd.DataFrame, group_map: Dict[str, st
             all_coords.extend(row["coords_list"])
 
         spread_km = max_pairwise_distance(all_coords)
-        total_stops = part["스톱수"].sum()
         total_boxes = part["총합"].sum()
         operating_time = compute_group_operating_minutes(part)
-        total_minutes = safe_int(operating_time["total_route_time"])
+        group_total_route_time = safe_int(operating_time["total_route_time"])
+        next_route_first_stop_travel_time = safe_int(operating_time["next_route_first_stop_travel_time"])
+        center_return_time = safe_int(operating_time["center_return_time"])
+        exceeds_max_minutes = bool(operating_time["exceeds_max_minutes"])
 
-        # 1순위: 4시간 하드 제한 (초과 시 사실상 배정 불가)
-        if operating_time["exceeds_max_minutes"]:
-            score += 1_000_000 + (total_minutes - MAX_ROUTE_MINUTES) * 1_000
+        if exceeds_max_minutes:
+            infeasible_group_count += 1
+            infeasible_over_minutes += max(0, group_total_route_time - MAX_ROUTE_MINUTES)
 
-        # 2순위: 총 소요시간이 짧을수록 우선
-        score += total_minutes * 8.0
-
-        # 3순위: 거리/퍼짐은 보조 지표
-        score += spread_km * 2.5
-
-        # 너무 길게 찢어진 그룹 강한 패널티
-        if spread_km > 20:
-            score += (spread_km - 20) * 12.0
-
-        # 라우트 간 연결(이전 라우트 마지막 -> 다음 라우트 첫집) 이동이 길면 추가 패널티
-        score += safe_int(operating_time["next_route_first_stop_travel_time"]) * 3.0
-
-        # 마지막 집 -> 센터 복귀 반영 패널티
-        score += safe_int(operating_time["center_return_time"]) * 2.0
-
-        stops_by_group.append(total_stops)
+        total_route_time += group_total_route_time
+        total_spread_km += spread_km
+        total_next_route_first_stop_travel_time += next_route_first_stop_travel_time
+        total_center_return_time += center_return_time
         boxes_by_group.append(total_boxes)
 
-    if stops_by_group:
-        avg_stops = sum(stops_by_group) / len(stops_by_group)
-        imbalance = sum(abs(x - avg_stops) for x in stops_by_group)
-        score += imbalance * 1.5
+    box_balance = compute_box_balance_metrics(boxes_by_group)
+    box_fairness_score = float(box_balance["box_fairness_score"])
+    box_count_gap = float(box_balance["box_count_gap"])
+    box_count_stddev = float(box_balance["box_count_stddev"])
 
-    if boxes_by_group:
-        avg_boxes = sum(boxes_by_group) / len(boxes_by_group)
-        if avg_boxes > 0:
-            box_imbalance = 0.0
-            over_20_penalty = 0.0
-            for boxes in boxes_by_group:
-                deviation_rate = abs(boxes - avg_boxes) / avg_boxes
-                box_imbalance += deviation_rate
-                if deviation_rate > 0.2:
-                    over_20_penalty += (deviation_rate - 0.2) ** 2
+    # 우선순위 1) 시간 가능 여부(240분 초과 그룹 수/초과 분)
+    score += infeasible_group_count * 1_000_000_000
+    score += infeasible_over_minutes * 1_000_000
 
-            # 3순위 소프트 제약: 기본적으로는 균형을 유도하되,
-            # 20%를 넘는 경우에만 강한 페널티를 추가해 "최대한 맞추되 불가 시 덜 나쁜 해"를 선택하도록 함.
-            score += box_imbalance * 6.0
-            score += over_20_penalty * 220.0
+    # 우선순위 2) 기사 간 박스 균형(편차/표준편차가 작을수록 우수)
+    score += box_fairness_score * 10_000
+    score += box_count_gap * 250
+    score += box_count_stddev * 120
+
+    # 우선순위 3) 시간 효율(시간 가능 후보들끼리 비교)
+    score += total_route_time * 10.0
+    score += total_next_route_first_stop_travel_time * 3.0
+    score += total_center_return_time * 2.0
+
+    # 우선순위 4) 거리/기존 효율 지표(보조)
+    score += total_spread_km * 2.0
+    if total_spread_km > (20 * max(1, len(group_names))):
+        score += (total_spread_km - (20 * max(1, len(group_names)))) * 8.0
 
     return score
 
