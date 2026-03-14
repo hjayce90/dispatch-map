@@ -115,21 +115,35 @@ def compute_group_operating_minutes(group_routes_df: pd.DataFrame) -> Dict[str, 
     ordered = group_routes_df.sort_values(order_keys).reset_index(drop=True)
 
     first_row = ordered.iloc[0]
-    center_coords = first_row.get("center_coords")
+    first_center_coords = first_row.get("center_coords")
     first_stop_coords = first_row.get("first_stop_coords")
 
-    start_to_first_stop_minutes = estimate_travel_minutes_by_coords(center_coords, first_stop_coords)
+    start_to_first_stop_minutes = estimate_travel_minutes_by_coords(first_center_coords, first_stop_coords)
     service_minutes = safe_int(ordered["보정걸린분"].sum())
 
     next_route_first_stop_travel_time = 0
     for idx in range(len(ordered) - 1):
-        current_last = ordered.iloc[idx].get("last_stop_coords")
-        next_first = ordered.iloc[idx + 1].get("first_stop_coords")
-        next_route_first_stop_travel_time += estimate_travel_minutes_by_coords(current_last, next_first)
+        current_row = ordered.iloc[idx]
+        next_row = ordered.iloc[idx + 1]
+
+        current_last = current_row.get("last_stop_coords")
+        next_first = next_row.get("first_stop_coords")
+        current_center_coords = current_row.get("center_coords")
+        next_center_coords = next_row.get("center_coords")
+
+        if current_center_coords == next_center_coords:
+            next_route_first_stop_travel_time += estimate_travel_minutes_by_coords(current_last, next_first)
+            continue
+
+        # Mixed-camp sequences need camp handoff travel to avoid underestimating time.
+        next_route_first_stop_travel_time += estimate_travel_minutes_by_coords(current_last, current_center_coords)
+        next_route_first_stop_travel_time += estimate_travel_minutes_by_coords(current_center_coords, next_center_coords)
+        next_route_first_stop_travel_time += estimate_travel_minutes_by_coords(next_center_coords, next_first)
 
     last_row = ordered.iloc[-1]
     last_stop_coords = last_row.get("last_stop_coords")
-    center_return_time = estimate_travel_minutes_by_coords(last_stop_coords, center_coords)
+    last_center_coords = last_row.get("center_coords")
+    center_return_time = estimate_travel_minutes_by_coords(last_stop_coords, last_center_coords)
 
     total_route_time = (
         start_to_first_stop_minutes
