@@ -475,6 +475,67 @@ def _build_driver_overview_df(result_df: pd.DataFrame, grouped_df: pd.DataFrame)
     out["총박스"] = out["소형합"] + out["중형합"] + out["대형합"]
     out = out.sort_values(["총박스", "총걸린분", "assigned_driver"], ascending=[False, False, True]).reset_index(drop=True)
     return out
+
+
+def _build_camp_driver_summary_df(result_df: pd.DataFrame, grouped_df: pd.DataFrame, route_camp_map: dict):
+    if len(result_df) == 0:
+        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
+
+    assigned = result_df.copy()
+    assigned["assigned_driver"] = assigned.get("assigned_driver", "").fillna("").astype(str).str.strip()
+    assigned = assigned[assigned["assigned_driver"] != ""].copy()
+    if len(assigned) == 0:
+        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
+
+    route_driver_df = (
+        assigned[["route", "assigned_driver"]]
+        .dropna(subset=["route"])
+        .drop_duplicates(subset=["route"])
+    )
+
+    grouped2 = grouped_df.copy()
+    if len(grouped2) == 0:
+        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
+
+    grouped2 = grouped2.merge(route_driver_df, on="route", how="left", suffixes=("", "_route"))
+    if "assigned_driver_route" in grouped2.columns:
+        grouped2["assigned_driver"] = grouped2.get("assigned_driver_route", "").fillna(grouped2.get("assigned_driver", ""))
+        grouped2 = grouped2.drop(columns=["assigned_driver_route"])
+
+    grouped2["assigned_driver"] = grouped2.get("assigned_driver", "").fillna("").astype(str).str.strip()
+    grouped2 = grouped2[grouped2["assigned_driver"] != ""].copy()
+    if len(grouped2) == 0:
+        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
+
+    grouped2["camp_code"] = grouped2["route"].map(route_camp_map).fillna(grouped2.get("camp_code", ""))
+    grouped2["camp_name"] = grouped2["camp_code"].map(lambda x: CAMP_INFO.get(x, {}).get("camp_name", ""))
+    grouped2["camp_name"] = grouped2["camp_name"].fillna(grouped2.get("camp_name", "")).astype(str).str.strip()
+    grouped2 = grouped2[grouped2["camp_name"] != ""].copy()
+    if len(grouped2) == 0:
+        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
+
+    summary_df = (
+        grouped2.groupby(["camp_name", "assigned_driver"], as_index=False)
+        .agg(
+            회전수=("route", "nunique"),
+            소형합=("ae_sum", "sum"),
+            중형합=("af_sum", "sum"),
+            대형합=("ag_sum", "sum"),
+        )
+    )
+    for col in ["회전수", "소형합", "중형합", "대형합"]:
+        summary_df[col] = pd.to_numeric(summary_df[col], errors="coerce").fillna(0).astype(int)
+    summary_df["총박스"] = summary_df["소형합"] + summary_df["중형합"] + summary_df["대형합"]
+
+    camp_order = [v["camp_name"] for v in CAMP_INFO.values()]
+    summary_df["camp_order"] = summary_df["camp_name"].apply(lambda x: camp_order.index(x) if x in camp_order else len(camp_order))
+    summary_df = summary_df.sort_values(
+        ["camp_order", "camp_name", "총박스", "회전수", "assigned_driver"],
+        ascending=[True, True, False, False, True],
+    ).reset_index(drop=True)
+    return summary_df[["camp_name", "assigned_driver", "회전수", "총박스"]]
+
+
 def make_stop_div_icon(route_color: str, stop_text: str, size_scale: float = 1.0, border_color: str = "#ffffff"):
     base_size = 28
     icon_size = max(16, int(round(base_size * size_scale)))
@@ -1420,7 +1481,6 @@ def render_map(
 
         route_group.add_to(m)
 
-    folium.LayerControl(collapsed=False, position="topright").add_to(m)
     return m
 
 
@@ -1551,7 +1611,6 @@ def render_group_map(
 
         route_group.add_to(m)
 
-    folium.LayerControl(collapsed=False, position="topright").add_to(m)
     return m
 
 
@@ -1586,12 +1645,29 @@ if shared_map:
                 }
 
             st.subheader("대표님 보고용 공유 지도")
+            st.markdown(
+                """
+                <style>
+                @media (max-width: 1024px) {
+                    div[data-testid="stHorizontalBlock"] {
+                        flex-direction: column !important;
+                    }
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
 
-            left_col, right_col = st.columns([1, 5], gap="medium")
+            left_col, right_col = st.columns([1.2, 3.8], gap="medium")
 
             filtered_result = shared_result_df.copy()
             filtered_grouped = shared_grouped_df.copy()
             driver_overview_df = _build_driver_overview_df(shared_result_df, shared_grouped_df)
+            camp_driver_summary_df = _build_camp_driver_summary_df(
+                shared_result_df,
+                shared_grouped_df,
+                route_camp_map_payload,
+            )
 
             route_list_shared = sorted(
                 shared_result_df["route"].dropna().unique().tolist(),
@@ -1643,6 +1719,17 @@ if shared_map:
                         st.caption(f"소 {safe_int(drow['소형합'])} / 중 {safe_int(drow['중형합'])} / 대 {safe_int(drow['대형합'])}")
                         st.caption(f"총합 {safe_int(drow['총박스'])} · 예상시간 {safe_int(drow['총걸린분'])}분")
 
+                st.markdown("### 캠프별 기사 요약")
+                if len(camp_driver_summary_df) == 0:
+                    st.caption("표시할 캠프 배정 정보가 없습니다.")
+                else:
+                    for camp_name, part in camp_driver_summary_df.groupby("camp_name", sort=False):
+                        st.markdown(f"**{camp_name}**")
+                        for _, crow in part.iterrows():
+                            st.markdown(
+                                f"- {crow['assigned_driver']} {safe_int(crow['회전수'])}회전 {safe_int(crow['총박스'])}개"
+                            )
+
             route_driver_map = {}
             if len(filtered_result) > 0 and "route" in filtered_result.columns and "assigned_driver" in filtered_result.columns:
                 route_driver_map = dict(zip(filtered_result["route"], filtered_result["assigned_driver"]))
@@ -1660,7 +1747,7 @@ if shared_map:
                         camp_coords=camp_coords_payload,
                         highlighted_driver=highlighted_driver,
                     )
-                st_folium(shared_map_obj, width=None, height=980)
+                st_folium(shared_map_obj, width=None, height=760)
 
             st.subheader("기사 할당표")
             assignment_rows = payload.get("assignment_rows", [])
@@ -1668,7 +1755,11 @@ if shared_map:
                 assignment_df_payload = pd.DataFrame(assignment_rows)
                 if highlighted_driver and "assigned_driver" in assignment_df_payload.columns:
                     assignment_df_payload = assignment_df_payload[assignment_df_payload["assigned_driver"].fillna("").astype(str) == highlighted_driver].copy()
-                st.dataframe(assignment_df_payload, use_container_width=True)
+                preferred_cols = [c for c in ["route_prefix", "route", "camp_name", "assigned_driver", "총합", "총걸린분"] if c in assignment_df_payload.columns]
+                if preferred_cols:
+                    st.dataframe(assignment_df_payload[preferred_cols], use_container_width=True)
+                else:
+                    st.dataframe(assignment_df_payload, use_container_width=True)
 
         else:
             st.subheader("공유 지도")
@@ -1739,12 +1830,12 @@ manual_group_count = None
 if group_count_mode == "직접입력":
     manual_group_count = st.number_input("추천그룹 수", min_value=1, max_value=max(1, len(route_summary)), value=2, step=1)
 else:
-    route_feature_df_for_count = build_route_feature_df(route_summary, grouped_delivery)
+    route_feature_df_for_count = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
     auto_group_count = choose_auto_group_count(route_feature_df_for_count)
     st.caption(f"자동 추천그룹 수: {auto_group_count}")
 
 if st.button("추천그룹 자동 추천 실행"):
-    route_feature_df = build_route_feature_df(route_summary, grouped_delivery)
+    route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
     recommended_group_count = resolve_group_count(route_feature_df, manual_group_count=manual_group_count)
     recommended_group_map = recommend_route_groups(route_feature_df, manual_group_count=manual_group_count)
     st.session_state["recommended_group_map"] = recommended_group_map
@@ -1752,7 +1843,7 @@ if st.button("추천그룹 자동 추천 실행"):
     st.success("추천그룹 생성을 완료했습니다.")
 
 if "recommended_group_map" in st.session_state:
-    route_feature_df = build_route_feature_df(route_summary, grouped_delivery)
+    route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
     recommended_group_map = st.session_state["recommended_group_map"]
     group_assignment_df = build_group_assignment_df(route_feature_df, recommended_group_map)
     group_summary_df = build_group_summary_df(group_assignment_df)
