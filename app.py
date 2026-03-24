@@ -424,6 +424,11 @@ def _build_shared_summary(result_df: pd.DataFrame, grouped_df: pd.DataFrame):
     return route_count, driver_count, group_count, small_box_total, medium_box_total, large_box_total, box_total, overlap_count
 
 
+def _natural_desc_sort_key(value):
+    text = str(value).strip()
+    return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", text)]
+
+
 
 
 def _build_driver_overview_df(result_df: pd.DataFrame, grouped_df: pd.DataFrame):
@@ -1283,14 +1288,16 @@ def render_map(
         icon_obj = make_camp_icon(camp_code)
 
         popup_html = f"""
-        <b>캠프:</b> {info['camp_name']}<br>
-        <b>코드:</b> {camp_code}<br>
-        <b>주소:</b> {info['address']}
+        <div style="min-width:260px;max-width:340px;line-height:1.45;">
+            <b>캠프:</b> {info['camp_name']}<br>
+            <b>코드:</b> {camp_code}<br>
+            <b>주소:</b> {info['address']}
+        </div>
         """
 
         folium.Marker(
             [lat, lon],
-            popup=popup_html,
+            popup=folium.Popup(popup_html, max_width=380),
             tooltip=info["camp_name"],
             icon=icon_obj
         ).add_to(camp_group)
@@ -1438,19 +1445,21 @@ def render_map(
                 overlap_detail = f"<b>중복배정:</b> 동일 위치 {overlap_count}건<br><b>겹치는 route:</b> {overlap_routes}<br><b>겹치는 기사:</b> {overlap_drivers}<br>"
 
             popup_html = f"""
-            <b>루트:</b> {row['route']}<br>
-            <b>구분:</b> {row.get('route_prefix', '')}<br>
-            <b>캠프:</b> {camp_name}<br>
-            <b>핀번호:</b> {row.get('pin_label', '')}<br>
-            <b>트럭요청ID:</b> {row.get('truck_request_id', '')}<br>
-            <b>기사:</b> {row.get('assigned_driver', '')}<br>
-            <b>업체ID:</b> {row['company_id']}<br>
-            <b>업체명:</b> {row['company_name']}<br>
-            <b>주소:</b> {row['address']}<br>
-            <b>집순서:</b> {safe_int(row['house_order'])}/{safe_int(row['route_total'])}<br>
-            <b>건수:</b> {safe_int(row['stop_count'])}<br>
-            <b>물량:</b> {safe_int(row['ae_sum'])}.{safe_int(row['af_sum'])}.{safe_int(row['ag_sum'])}<br>
-            {overlap_detail}
+            <div style="min-width:300px;max-width:420px;line-height:1.45;">
+                <b>루트:</b> {row['route']}<br>
+                <b>구분:</b> {row.get('route_prefix', '')}<br>
+                <b>캠프:</b> {camp_name}<br>
+                <b>핀번호:</b> {row.get('pin_label', '')}<br>
+                <b>트럭요청ID:</b> {row.get('truck_request_id', '')}<br>
+                <b>기사:</b> {row.get('assigned_driver', '')}<br>
+                <b>업체ID:</b> {row['company_id']}<br>
+                <b>업체명:</b> {row['company_name']}<br>
+                <b>주소:</b> {row['address']}<br>
+                <b>집순서:</b> {safe_int(row['house_order'])}/{safe_int(row['route_total'])}<br>
+                <b>건수:</b> {safe_int(row['stop_count'])}<br>
+                <b>물량:</b> {safe_int(row['ae_sum'])}.{safe_int(row['af_sum'])}.{safe_int(row['ag_sum'])}<br>
+                {overlap_detail}
+            </div>
             """
 
             house_order = safe_int(row.get("house_order", 0))
@@ -1473,7 +1482,7 @@ def render_map(
 
             folium.Marker(
                 [lat, lon],
-                popup=popup_html,
+                popup=folium.Popup(popup_html, max_width=440),
                 tooltip=tooltip_text,
                 opacity=0.35 if (active_driver != "" and str(driver_name).strip() != active_driver) else 1.0,
                 icon=icon_obj
@@ -1516,7 +1525,16 @@ def render_group_map(
 
         folium.Marker(
             [coords[0], coords[1]],
-            popup=f"<b>캠프:</b> {info['camp_name']}<br><b>코드:</b> {camp_code}<br><b>주소:</b> {info['address']}",
+            popup=folium.Popup(
+                f"""
+                <div style="min-width:260px;max-width:340px;line-height:1.45;">
+                    <b>캠프:</b> {info['camp_name']}<br>
+                    <b>코드:</b> {camp_code}<br>
+                    <b>주소:</b> {info['address']}
+                </div>
+                """,
+                max_width=380,
+            ),
             tooltip=info["camp_name"],
             icon=make_camp_icon(camp_code)
         ).add_to(camp_group)
@@ -1582,10 +1600,12 @@ def render_group_map(
             lat, lon, overlap_count = spread_overlapping_marker(lat, lon, overlap_info, row)
             overlap_label = f" / 동일 위치 {overlap_count}건" if overlap_count > 1 else ""
             popup_html = f"""
-            <b>추천그룹:</b> {str(row.get('추천그룹', '')).replace('추천그룹 ', '추천그룹')}<br>
-            <b>주소:</b> {row.get('address', '')}<br>
-            <b>업체명:</b> {row.get('company_name', '')}<br>
-            <b>물량(소/중/대):</b> {safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}
+            <div style="min-width:280px;max-width:380px;line-height:1.45;">
+                <b>추천그룹:</b> {str(row.get('추천그룹', '')).replace('추천그룹 ', '추천그룹')}<br>
+                <b>주소:</b> {row.get('address', '')}<br>
+                <b>업체명:</b> {row.get('company_name', '')}<br>
+                <b>물량(소/중/대):</b> {safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}
+            </div>
             """
 
             house_order = safe_int(row.get("house_order", 0))
@@ -1604,7 +1624,7 @@ def render_group_map(
 
             folium.Marker(
                 [lat, lon],
-                popup=popup_html,
+                popup=folium.Popup(popup_html, max_width=400),
                 tooltip=marker_tooltip,
                 icon=make_stop_div_icon(route_color, str(row.get("pin_label", "")), size_scale=size_scale, border_color=border_color)
             ).add_to(route_group)
@@ -1644,21 +1664,7 @@ if shared_map:
                     for k, v in camp_coords_payload.items()
                 }
 
-            st.subheader("대표님 보고용 공유 지도")
-            st.markdown(
-                """
-                <style>
-                @media (max-width: 1024px) {
-                    div[data-testid="stHorizontalBlock"] {
-                        flex-direction: column !important;
-                    }
-                }
-                </style>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            left_col, right_col = st.columns([1.2, 3.8], gap="medium")
+            st.subheader("공유 지도")
 
             filtered_result = shared_result_df.copy()
             filtered_grouped = shared_grouped_df.copy()
@@ -1682,72 +1688,66 @@ if shared_map:
                 for i, driver in enumerate(driver_list_shared)
             }
 
-            with left_col:
-                st.markdown("### 전체 요약")
-                total_drivers = safe_int(driver_overview_df["assigned_driver"].nunique()) if len(driver_overview_df) > 0 else 0
-                total_boxes = safe_int(driver_overview_df["총박스"].sum()) if len(driver_overview_df) > 0 else 0
-                avg_minutes = safe_int(driver_overview_df["총걸린분"].mean()) if len(driver_overview_df) > 0 else 0
-                max_minutes = safe_int(driver_overview_df["총걸린분"].max()) if len(driver_overview_df) > 0 else 0
-
-                st.caption(f"기사 {total_drivers}명")
-                st.caption(f"총 박스 {total_boxes}개")
-                st.caption(f"평균 {avg_minutes}분")
-                st.caption(f"최대 {max_minutes}분")
-
-                driver_options = ["전체 기사"] + driver_overview_df["assigned_driver"].tolist()
-                selected_driver = st.radio(
-                    "기사 라우트 보기",
-                    driver_options,
-                    label_visibility="collapsed",
-                )
-                highlighted_driver = "" if selected_driver == "전체 기사" else selected_driver
-
-                if len(driver_overview_df) == 0:
-                    st.info("배정된 기사가 없습니다.")
-                else:
-                    st.markdown("### 기사 배정 현황")
-                    for _, drow in driver_overview_df.iterrows():
-                        driver_name = str(drow["assigned_driver"])
-                        is_selected = highlighted_driver != "" and driver_name == highlighted_driver
-                        line_prefix = "➡️ " if is_selected else ""
-                        color_chip = driver_color_map_shared.get(driver_name, "#1e88e5")
-                        st.markdown(
-                            f"<span style='display:inline-block;width:8px;height:8px;border-radius:50%;background:{color_chip};margin-right:6px;'></span>"
-                            f"**{line_prefix}{driver_name}**",
-                            unsafe_allow_html=True,
-                        )
-                        st.caption(f"소 {safe_int(drow['소형합'])} / 중 {safe_int(drow['중형합'])} / 대 {safe_int(drow['대형합'])}")
-                        st.caption(f"총합 {safe_int(drow['총박스'])} · 예상시간 {safe_int(drow['총걸린분'])}분")
-
-                st.markdown("### 캠프별 기사 요약")
-                if len(camp_driver_summary_df) == 0:
-                    st.caption("표시할 캠프 배정 정보가 없습니다.")
-                else:
-                    for camp_name, part in camp_driver_summary_df.groupby("camp_name", sort=False):
-                        st.markdown(f"**{camp_name}**")
-                        for _, crow in part.iterrows():
-                            st.markdown(
-                                f"- {crow['assigned_driver']} {safe_int(crow['회전수'])}회전 {safe_int(crow['총박스'])}개"
-                            )
+            st.markdown("### 기사 선택")
+            driver_options = ["전체 기사"] + driver_overview_df["assigned_driver"].tolist()
+            selected_driver = st.radio(
+                "기사 라우트 보기",
+                driver_options,
+                label_visibility="collapsed",
+            )
+            highlighted_driver = "" if selected_driver == "전체 기사" else selected_driver
 
             route_driver_map = {}
             if len(filtered_result) > 0 and "route" in filtered_result.columns and "assigned_driver" in filtered_result.columns:
                 route_driver_map = dict(zip(filtered_result["route"], filtered_result["assigned_driver"]))
 
-            with right_col:
-                with st.spinner("공유 지도 생성 중..."):
-                    shared_map_obj = render_map(
-                        valid_result=filtered_result,
-                        valid_grouped=filtered_grouped,
-                        route_prefix_map=route_prefix_map_payload,
-                        truck_request_map=truck_request_map_payload,
-                        route_line_label=route_line_label_payload,
-                        route_driver_map=route_driver_map,
-                        route_camp_map=route_camp_map_payload,
-                        camp_coords=camp_coords_payload,
-                        highlighted_driver=highlighted_driver,
+            with st.spinner("공유 지도 생성 중..."):
+                shared_map_obj = render_map(
+                    valid_result=filtered_result,
+                    valid_grouped=filtered_grouped,
+                    route_prefix_map=route_prefix_map_payload,
+                    truck_request_map=truck_request_map_payload,
+                    route_line_label=route_line_label_payload,
+                    route_driver_map=route_driver_map,
+                    route_camp_map=route_camp_map_payload,
+                    camp_coords=camp_coords_payload,
+                    highlighted_driver=highlighted_driver,
+                )
+            st_folium(shared_map_obj, width=None, height=760)
+
+            if len(driver_overview_df) == 0:
+                st.info("배정된 기사가 없습니다.")
+            else:
+                st.markdown("### 기사 배정 현황")
+                for _, drow in driver_overview_df.iterrows():
+                    driver_name = str(drow["assigned_driver"])
+                    is_selected = highlighted_driver != "" and driver_name == highlighted_driver
+                    line_prefix = "➡️ " if is_selected else ""
+                    color_chip = driver_color_map_shared.get(driver_name, "#1e88e5")
+                    st.markdown(
+                        f"<span style='display:inline-block;width:8px;height:8px;border-radius:50%;background:{color_chip};margin-right:6px;'></span>"
+                        f"**{line_prefix}{driver_name}**",
+                        unsafe_allow_html=True,
                     )
-                st_folium(shared_map_obj, width=None, height=760)
+                    st.caption(f"소 {safe_int(drow['소형합'])} / 중 {safe_int(drow['중형합'])} / 대 {safe_int(drow['대형합'])}")
+                    st.caption(f"총합 {safe_int(drow['총박스'])}")
+
+            st.markdown("### 캠프별 기사 요약")
+            if len(camp_driver_summary_df) == 0:
+                st.caption("표시할 캠프 배정 정보가 없습니다.")
+            else:
+                for camp_name, part in camp_driver_summary_df.groupby("camp_name", sort=False):
+                    st.markdown(f"**{camp_name}**")
+                    for _, crow in part.iterrows():
+                        st.markdown(
+                            f"- {crow['assigned_driver']} {safe_int(crow['회전수'])}회전 {safe_int(crow['총박스'])}개"
+                        )
+
+            st.markdown("### 전체 요약")
+            total_drivers = safe_int(driver_overview_df["assigned_driver"].nunique()) if len(driver_overview_df) > 0 else 0
+            total_boxes = safe_int(driver_overview_df["총박스"].sum()) if len(driver_overview_df) > 0 else 0
+            st.caption(f"기사 {total_drivers}명")
+            st.caption(f"총 박스 {total_boxes}개")
 
             st.subheader("기사 할당표")
             assignment_rows = payload.get("assignment_rows", [])
@@ -1755,7 +1755,7 @@ if shared_map:
                 assignment_df_payload = pd.DataFrame(assignment_rows)
                 if highlighted_driver and "assigned_driver" in assignment_df_payload.columns:
                     assignment_df_payload = assignment_df_payload[assignment_df_payload["assigned_driver"].fillna("").astype(str) == highlighted_driver].copy()
-                preferred_cols = [c for c in ["route_prefix", "route", "camp_name", "assigned_driver", "총합", "총걸린분"] if c in assignment_df_payload.columns]
+                preferred_cols = [c for c in ["route_prefix", "route", "camp_name", "assigned_driver", "총합"] if c in assignment_df_payload.columns]
                 if preferred_cols:
                     st.dataframe(assignment_df_payload[preferred_cols], use_container_width=True)
                 else:
@@ -1768,7 +1768,10 @@ if shared_map:
             assigned_summary_rows = payload.get("assigned_summary_rows", [])
             if assigned_summary_rows:
                 st.subheader("기사별 요약")
-                st.dataframe(pd.DataFrame(assigned_summary_rows), use_container_width=True)
+                shared_summary_df = pd.DataFrame(assigned_summary_rows)
+                if "총걸린분" in shared_summary_df.columns:
+                    shared_summary_df = shared_summary_df.drop(columns=["총걸린분"])
+                st.dataframe(shared_summary_df, use_container_width=True)
     else:
         st.error("저장된 공유 데이터를 찾을 수 없습니다. 서버 재시작 등으로 파일이 사라졌을 수 있습니다.")
 
@@ -2061,7 +2064,21 @@ st.success("아래 링크를 복사해서 바로 공유하시면 됩니다.")
 st.markdown(f"### [🔗 지도 + 기사할당표 바로 열기]({share_url})")
 st.text_input("공유 URL", value=share_url, key="share_url_box")
 
-csv_data = assignment_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+export_df = assignment_df.copy()
+if "truck_request_id" not in export_df.columns:
+    export_df["truck_request_id"] = ""
+if "assigned_driver" not in export_df.columns:
+    export_df["assigned_driver"] = ""
+export_df["truck_request_id"] = export_df["truck_request_id"].fillna("").astype(str).str.strip()
+export_df["assigned_driver"] = export_df["assigned_driver"].fillna("").astype(str).str.strip()
+export_df = export_df[["truck_request_id", "assigned_driver"]].copy()
+export_df = export_df.sort_values(
+    by="truck_request_id",
+    key=lambda s: s.map(_natural_desc_sort_key),
+    ascending=False,
+)
+export_df = export_df.rename(columns={"truck_request_id": "트럭요청ID", "assigned_driver": "이름"})
+csv_data = export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 st.download_button(
     "기사 배정표 CSV 다운로드",
     data=csv_data,
