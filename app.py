@@ -290,73 +290,68 @@ def build_driver_assignment_stats_df(
     drivers = sorted(driver_set)
     if len(drivers) == 0:
         return pd.DataFrame(columns=[
-            "기사명", "오늘 배정", "7일 총 라우트", "7일 총 물량", "7일 근무일수", "7일 근무일평균(라우트)", "7일 근무일평균(물량)",
-            "30일 총 라우트", "30일 총 물량", "30일 근무일수", "30일 근무일평균(라우트)", "30일 근무일평균(물량)",
-        ])
+            "기사명", "오늘물량", "최근근무일(1일) 물량", "7일 근무일평균", "30일 근무일평균",
+        ]), None
 
     hist = history_df.copy()
     if len(hist) == 0:
         hist = _empty_assignment_history_df()
 
-    hist["date_dt"] = pd.to_datetime(hist["date"], errors="coerce")
+    hist["date_dt"] = pd.to_datetime(hist["date"], errors="coerce").dt.normalize()
     hist = hist[hist["date_dt"].notna()].copy()
-    for col in ["route_count", "total_qty"]:
-        hist[col] = pd.to_numeric(hist[col], errors="coerce").fillna(0)
+    hist["driver"] = hist["driver"].fillna("").astype(str).str.strip()
+    hist = hist[hist["driver"] != ""].copy()
+    hist["total_qty"] = pd.to_numeric(hist["total_qty"], errors="coerce").fillna(0)
 
     base_dt = pd.to_datetime(base_date, errors="coerce")
     if pd.isna(base_dt):
         base_dt = pd.Timestamp.now().normalize()
+    else:
+        base_dt = base_dt.normalize()
 
-    today_count_map = {}
-    if len(assignment_df) > 0 and "assigned_driver" in assignment_df.columns:
-        current = assignment_df.copy()
-        current["assigned_driver"] = current["assigned_driver"].fillna("").astype(str).str.strip()
-        current = current[(current["assigned_driver"] != "") & (current["assigned_driver"] != "미배정")]
-        today_count_map = current.groupby("assigned_driver")["route"].count().to_dict()
+    today_hist = hist[hist["date_dt"] == base_dt].copy()
+    today_qty_map = today_hist.groupby("driver")["total_qty"].sum().to_dict() if len(today_hist) > 0 else {}
 
-    def period_stats(df, start_dt, end_dt):
+    hist_before_today = hist[hist["date_dt"] < base_dt].copy()
+    common_recent_date = hist_before_today["date_dt"].max() if len(hist_before_today) > 0 else pd.NaT
+    recent_qty_map = {}
+    if not pd.isna(common_recent_date):
+        recent_day_hist = hist_before_today[hist_before_today["date_dt"] == common_recent_date].copy()
+        recent_qty_map = recent_day_hist.groupby("driver")["total_qty"].sum().to_dict()
+
+    def workday_avg_qty(df, start_dt, end_dt):
         period = df[(df["date_dt"] >= start_dt) & (df["date_dt"] <= end_dt)].copy()
         if len(period) == 0:
-            return {}, {}, {}
-        route_sum = period.groupby("driver")["route_count"].sum().to_dict()
+            return {}, {}
         qty_sum = period.groupby("driver")["total_qty"].sum().to_dict()
-        work_days = period.groupby("driver")["date"].nunique().to_dict()
-        return route_sum, qty_sum, work_days
+        work_days = period.groupby("driver")["date_dt"].nunique().to_dict()
+        return qty_sum, work_days
 
     w7_start = base_dt - pd.Timedelta(days=6)
     w30_start = base_dt - pd.Timedelta(days=29)
-    r7, q7, d7 = period_stats(hist, w7_start, base_dt)
-    r30, q30, d30 = period_stats(hist, w30_start, base_dt)
+    q7, d7 = workday_avg_qty(hist, w7_start, base_dt)
+    q30, d30 = workday_avg_qty(hist, w30_start, base_dt)
 
     rows = []
     for d in drivers:
-        v_today = safe_int(today_count_map.get(d, 0))
-        v_r7 = safe_int(r7.get(d, 0))
+        v_today = safe_int(today_qty_map.get(d, 0))
+        v_recent = safe_int(recent_qty_map.get(d, 0))
         v_q7 = safe_int(q7.get(d, 0))
         v_d7 = safe_int(d7.get(d, 0))
-        v_r30 = safe_int(r30.get(d, 0))
         v_q30 = safe_int(q30.get(d, 0))
         v_d30 = safe_int(d30.get(d, 0))
-        avg_r7 = (v_r7 / v_d7) if v_d7 > 0 else 0
         avg_q7 = (v_q7 / v_d7) if v_d7 > 0 else 0
-        avg_r30 = (v_r30 / v_d30) if v_d30 > 0 else 0
         avg_q30 = (v_q30 / v_d30) if v_d30 > 0 else 0
         rows.append({
             "기사명": d,
-            "오늘 배정": v_today,
-            "7일 총 라우트": v_r7,
-            "7일 총 물량": v_q7,
-            "7일 근무일수": v_d7,
-            "7일 근무일평균(라우트)": round(avg_r7, 1),
-            "7일 근무일평균(물량)": round(avg_q7, 1),
-            "30일 총 라우트": v_r30,
-            "30일 총 물량": v_q30,
-            "30일 근무일수": v_d30,
-            "30일 근무일평균(라우트)": round(avg_r30, 1),
-            "30일 근무일평균(물량)": round(avg_q30, 1),
+            "오늘물량": v_today,
+            "최근근무일(1일) 물량": v_recent,
+            "7일 근무일평균": round(avg_q7, 1),
+            "30일 근무일평균": round(avg_q30, 1),
         })
 
-    return pd.DataFrame(rows).sort_values(["기사명"]).reset_index(drop=True)
+    recent_date_str = common_recent_date.strftime("%Y-%m-%d") if not pd.isna(common_recent_date) else None
+    return pd.DataFrame(rows).sort_values(["기사명"]).reset_index(drop=True), recent_date_str
 
 
 def load_geocode_cache():
@@ -2249,14 +2244,18 @@ if st.button("배정 이력 저장"):
         st.warning(f"저장할 배정 데이터가 없어 {base_date_str} 이력은 0건으로 덮어쓰기되었습니다.")
 
 history_df = load_assignment_history()
-stats_df = build_driver_assignment_stats_df(
+stats_df, recent_work_date_str = build_driver_assignment_stats_df(
     assignment_df=assignment_df,
     history_df=history_df,
     driver_candidates=drivers,
     base_date=base_date_str,
 )
 with st.expander("기사별 배정 통계 (최근 7일/30일)", expanded=False):
-    st.caption("오늘 배정은 현재 화면 배정 결과 기준, 7일/30일 통계는 assignment_history.csv 저장 이력 기준입니다.")
+    st.caption("오늘물량/최근근무일(1일) 물량/7일·30일 근무일평균은 assignment_history.csv 저장 이력 기준입니다.")
+    if recent_work_date_str:
+        st.caption(f"최근근무일(1일) 기준일: {recent_work_date_str}")
+    else:
+        st.caption("최근근무일(1일) 기준일: 없음")
     if len(stats_df) == 0:
         st.info("표시할 기사 통계가 없습니다.")
     else:
