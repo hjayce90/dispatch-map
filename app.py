@@ -39,6 +39,7 @@ KAKAO_API_KEY = os.getenv("KAKAO_API_KEY", "080375c5f09bbb8c7db9f368bc752d33")
 TIME_COL_INDEX = 21   # V열
 CACHE_FILE = "geocode_cache.csv"
 DRIVER_FILE = "drivers.csv"
+ASSIGNMENT_HISTORY_FILE = "assignment_history.csv"
 MAP_DIR = "saved_maps"
 SHARE_DIR = "shared_payloads"
 ASSIGNMENT_FILE = "route_assignments.json"
@@ -153,6 +154,209 @@ def load_drivers():
         except Exception:
             return []
     return []
+
+
+def ensure_assignment_history_file():
+    # 이력 파일이 없거나 비어있으면 기본 헤더로 생성
+    required_cols = [
+        "date", "driver", "route", "truck_request_id",
+        "small", "medium", "large", "total_qty",
+        "route_count", "saved_at",
+    ]
+    if not os.path.exists(ASSIGNMENT_HISTORY_FILE):
+        pd.DataFrame(columns=required_cols).to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
+        return
+
+    try:
+        df = pd.read_csv(ASSIGNMENT_HISTORY_FILE)
+        if len(df.columns) == 0:
+            pd.DataFrame(columns=required_cols).to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
+    except Exception:
+        pd.DataFrame(columns=required_cols).to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
+
+
+def infer_assignment_base_date(uploaded_filename: str, route_summary: pd.DataFrame) -> str:
+    # 1순위: route_summary에 날짜성 컬럼이 있으면 사용
+    try:
+        date_like_cols = [c for c in route_summary.columns if "date" in str(c).lower() or "날짜" in str(c)]
+        for col in date_like_cols:
+            parsed = pd.to_datetime(route_summary[col], errors="coerce")
+            parsed = parsed.dropna()
+            if len(parsed) > 0:
+                return parsed.iloc[0].strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    # 2순위: 업로드 파일명에서 YYYY-MM-DD / YYYYMMDD 추출
+    file_text = str(uploaded_filename or "")
+    m1 = re.search(r"(20\d{2})[-_./]?(0[1-9]|1[0-2])[-_./]?(0[1-9]|[12]\d|3[01])", file_text)
+    if m1:
+        yyyy, mm, dd = m1.group(1), m1.group(2), m1.group(3)
+        return f"{yyyy}-{mm}-{dd}"
+
+    # 3순위: 오늘
+    return pd.Timestamp.now().strftime("%Y-%m-%d")
+
+
+def _empty_assignment_history_df():
+    return pd.DataFrame(columns=[
+        "date", "driver", "route", "truck_request_id",
+        "small", "medium", "large", "total_qty",
+        "route_count", "saved_at",
+    ])
+
+
+def load_assignment_history():
+    ensure_assignment_history_file()
+    required_cols = _empty_assignment_history_df().columns.tolist()
+    try:
+        hist = pd.read_csv(ASSIGNMENT_HISTORY_FILE)
+    except Exception:
+        return _empty_assignment_history_df()
+
+    if len(hist) == 0:
+        return _empty_assignment_history_df()
+
+    for col in required_cols:
+        if col not in hist.columns:
+            hist[col] = 0 if col in {"small", "medium", "large", "total_qty", "route_count"} else ""
+
+    hist["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    hist = hist[hist["date"].notna()].copy()
+    hist["driver"] = hist["driver"].fillna("").astype(str).str.strip()
+    hist = hist[hist["driver"] != ""].copy()
+    return hist[required_cols].copy()
+
+
+def save_assignment_history_for_date(assignment_df: pd.DataFrame, base_date: str):
+    ensure_assignment_history_file()
+    hist = load_assignment_history()
+
+    work_df = assignment_df.copy()
+    for col in ["assigned_driver", "route", "truck_request_id", "소형합", "중형합", "대형합", "총합"]:
+        if col not in work_df.columns:
+            work_df[col] = ""
+
+    work_df["assigned_driver"] = work_df["assigned_driver"].fillna("").astype(str).str.strip()
+    # 미배정/공백 기사 제외
+    work_df = work_df[
+        (work_df["assigned_driver"] != "")
+        & (work_df["assigned_driver"] != "미배정")
+    ].copy()
+
+    # 같은 날짜는 덮어쓰기 저장
+    hist = hist[hist["date"] != base_date].copy()
+
+    if len(work_df) == 0:
+        hist.to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
+        return 0
+
+    now_ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_rows = pd.DataFrame({
+        "date": base_date,
+        "driver": work_df["assigned_driver"].astype(str),
+        "route": work_df["route"].astype(str),
+        "truck_request_id": work_df["truck_request_id"].astype(str),
+        "small": pd.to_numeric(work_df["소형합"], errors="coerce").fillna(0).astype(int),
+        "medium": pd.to_numeric(work_df["중형합"], errors="coerce").fillna(0).astype(int),
+        "large": pd.to_numeric(work_df["대형합"], errors="coerce").fillna(0).astype(int),
+        # 기존 총합 로직 재사용
+        "total_qty": pd.to_numeric(work_df["총합"], errors="coerce").fillna(0).astype(int),
+        "route_count": 1,
+        "saved_at": now_ts,
+    })
+
+    merged = pd.concat([hist, save_rows], ignore_index=True)
+    merged.to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
+    return len(save_rows)
+
+
+def build_driver_assignment_stats_df(
+    assignment_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+    driver_candidates,
+    base_date: str,
+):
+    driver_set = {str(d).strip() for d in (driver_candidates or []) if str(d).strip()}
+
+    if len(assignment_df) > 0 and "assigned_driver" in assignment_df.columns:
+        current_drivers = assignment_df["assigned_driver"].fillna("").astype(str).str.strip().tolist()
+        driver_set.update([d for d in current_drivers if d and d != "미배정"])
+
+    if len(history_df) > 0 and "driver" in history_df.columns:
+        hist_drivers = history_df["driver"].fillna("").astype(str).str.strip().tolist()
+        driver_set.update([d for d in hist_drivers if d])
+
+    drivers = sorted(driver_set)
+    if len(drivers) == 0:
+        return pd.DataFrame(columns=[
+            "기사명", "오늘 배정", "7일 총 라우트", "7일 총 물량", "7일 근무일수", "7일 근무일평균(라우트)", "7일 근무일평균(물량)",
+            "30일 총 라우트", "30일 총 물량", "30일 근무일수", "30일 근무일평균(라우트)", "30일 근무일평균(물량)",
+        ])
+
+    hist = history_df.copy()
+    if len(hist) == 0:
+        hist = _empty_assignment_history_df()
+
+    hist["date_dt"] = pd.to_datetime(hist["date"], errors="coerce")
+    hist = hist[hist["date_dt"].notna()].copy()
+    for col in ["route_count", "total_qty"]:
+        hist[col] = pd.to_numeric(hist[col], errors="coerce").fillna(0)
+
+    base_dt = pd.to_datetime(base_date, errors="coerce")
+    if pd.isna(base_dt):
+        base_dt = pd.Timestamp.now().normalize()
+
+    today_count_map = {}
+    if len(assignment_df) > 0 and "assigned_driver" in assignment_df.columns:
+        current = assignment_df.copy()
+        current["assigned_driver"] = current["assigned_driver"].fillna("").astype(str).str.strip()
+        current = current[(current["assigned_driver"] != "") & (current["assigned_driver"] != "미배정")]
+        today_count_map = current.groupby("assigned_driver")["route"].count().to_dict()
+
+    def period_stats(df, start_dt, end_dt):
+        period = df[(df["date_dt"] >= start_dt) & (df["date_dt"] <= end_dt)].copy()
+        if len(period) == 0:
+            return {}, {}, {}
+        route_sum = period.groupby("driver")["route_count"].sum().to_dict()
+        qty_sum = period.groupby("driver")["total_qty"].sum().to_dict()
+        work_days = period.groupby("driver")["date"].nunique().to_dict()
+        return route_sum, qty_sum, work_days
+
+    w7_start = base_dt - pd.Timedelta(days=6)
+    w30_start = base_dt - pd.Timedelta(days=29)
+    r7, q7, d7 = period_stats(hist, w7_start, base_dt)
+    r30, q30, d30 = period_stats(hist, w30_start, base_dt)
+
+    rows = []
+    for d in drivers:
+        v_today = safe_int(today_count_map.get(d, 0))
+        v_r7 = safe_int(r7.get(d, 0))
+        v_q7 = safe_int(q7.get(d, 0))
+        v_d7 = safe_int(d7.get(d, 0))
+        v_r30 = safe_int(r30.get(d, 0))
+        v_q30 = safe_int(q30.get(d, 0))
+        v_d30 = safe_int(d30.get(d, 0))
+        avg_r7 = (v_r7 / v_d7) if v_d7 > 0 else 0
+        avg_q7 = (v_q7 / v_d7) if v_d7 > 0 else 0
+        avg_r30 = (v_r30 / v_d30) if v_d30 > 0 else 0
+        avg_q30 = (v_q30 / v_d30) if v_d30 > 0 else 0
+        rows.append({
+            "기사명": d,
+            "오늘 배정": v_today,
+            "7일 총 라우트": v_r7,
+            "7일 총 물량": v_q7,
+            "7일 근무일수": v_d7,
+            "7일 근무일평균(라우트)": round(avg_r7, 1),
+            "7일 근무일평균(물량)": round(avg_q7, 1),
+            "30일 총 라우트": v_r30,
+            "30일 총 물량": v_q30,
+            "30일 근무일수": v_d30,
+            "30일 근무일평균(라우트)": round(avg_r30, 1),
+            "30일 근무일평균(물량)": round(avg_q30, 1),
+        })
+
+    return pd.DataFrame(rows).sort_values(["기사명"]).reset_index(drop=True)
 
 
 def load_geocode_cache():
@@ -1808,6 +2012,7 @@ route_total_map = built["route_total_map"]
 truck_request_map = built["truck_request_map"]
 route_line_label = built["route_line_label"]
 route_camp_map = built["route_camp_map"]
+base_date_str = infer_assignment_base_date(uploaded_filename, route_summary)
 
 if len(result_all) == 0:
     st.warning("유효한 주소 데이터가 없습니다.")
@@ -2034,6 +2239,28 @@ else:
     if "총걸린분" in view_assigned_summary.columns:
         view_assigned_summary = view_assigned_summary.drop(columns=["총걸린분"])
     st.dataframe(view_assigned_summary, use_container_width=True)
+
+st.caption(f"배정 이력 저장 기준일: {base_date_str} (동일 날짜 재저장 시 덮어쓰기)")
+if st.button("배정 이력 저장"):
+    saved_count = save_assignment_history_for_date(assignment_df, base_date_str)
+    if saved_count > 0:
+        st.success(f"배정 이력을 저장했습니다. 기준일 {base_date_str}, {saved_count}건 저장 완료")
+    else:
+        st.warning(f"저장할 배정 데이터가 없어 {base_date_str} 이력은 0건으로 덮어쓰기되었습니다.")
+
+history_df = load_assignment_history()
+stats_df = build_driver_assignment_stats_df(
+    assignment_df=assignment_df,
+    history_df=history_df,
+    driver_candidates=drivers,
+    base_date=base_date_str,
+)
+with st.expander("기사별 배정 통계 (최근 7일/30일)", expanded=False):
+    st.caption("오늘 배정은 현재 화면 배정 결과 기준, 7일/30일 통계는 assignment_history.csv 저장 이력 기준입니다.")
+    if len(stats_df) == 0:
+        st.info("표시할 기사 통계가 없습니다.")
+    else:
+        st.dataframe(stats_df, use_container_width=True)
 
 shared_result_delivery = result_delivery.copy()
 shared_grouped_delivery = grouped_delivery.copy()
