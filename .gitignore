@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+.venv_django/
+.local_django/db.sqlite3
+.local_django/**/__pycache__/
+
+PERSONAL.XLSB
+assignment_history.csv
+route_assignments.json
+geocode_cache.csv
+saved_maps/
+shared_payloads/
+head_app_snapshot.py

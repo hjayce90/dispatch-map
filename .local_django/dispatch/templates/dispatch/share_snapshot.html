@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ run_name }} - 공유 지도</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #0f1218;
+            --panel: #171b23;
+            --text: #f2f5f9;
+            --muted: #aab4c3;
+            --line: #2a3342;
+            --accent: #53b3ff;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background: linear-gradient(180deg, #0c1016 0%, #111722 100%);
+            color: var(--text);
+            font-family: "Segoe UI", "Apple SD Gothic Neo", sans-serif;
+        }
+        .wrap {
+            max-width: 1320px;
+            margin: 0 auto;
+            padding: 28px 20px 56px;
+        }
+        .hero {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 14px;
+            margin-bottom: 18px;
+        }
+        .card {
+            background: rgba(23, 27, 35, 0.94);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 18px 18px 16px;
+        }
+        .eyebrow {
+            color: var(--muted);
+            font-size: 12px;
+            margin-bottom: 8px;
+        }
+        .value {
+            font-size: 18px;
+            font-weight: 700;
+            line-height: 1.35;
+            word-break: break-word;
+        }
+        .panel {
+            background: rgba(23, 27, 35, 0.96);
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            overflow: hidden;
+            margin-bottom: 18px;
+        }
+        .panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 16px 18px;
+            border-bottom: 1px solid var(--line);
+        }
+        .panel-title {
+            font-size: 18px;
+            font-weight: 700;
+        }
+        .panel-body {
+            padding: 0;
+        }
+        .map-frame {
+            width: 100%;
+            min-height: 760px;
+            border: 0;
+            background: #0b0f14;
+        }
+        .table-wrap {
+            width: 100%;
+            overflow-x: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 680px;
+        }
+        th, td {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--line);
+            text-align: left;
+            font-size: 14px;
+            vertical-align: top;
+            white-space: nowrap;
+        }
+        th {
+            color: var(--muted);
+            font-weight: 600;
+            background: rgba(255, 255, 255, 0.02);
+        }
+        .empty {
+            padding: 24px 18px;
+            color: var(--muted);
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--accent);
+            font-size: 13px;
+            font-weight: 600;
+        }
+        @media (max-width: 900px) {
+            .hero { grid-template-columns: 1fr; }
+            .wrap { padding: 18px 12px 40px; }
+            .map-frame { min-height: 560px; }
+            th, td { padding: 10px 12px; font-size: 13px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="hero">
+            <div class="card">
+                <div class="eyebrow">전체 개수</div>
+                <div class="value">{{ total_count }}</div>
+            </div>
+            <div class="card">
+                <div class="eyebrow">기준일</div>
+                <div class="value">{{ source_date }}</div>
+            </div>
+            <div class="card">
+        <div class="eyebrow">근무인원</div>
+                <div class="value">{{ driver_count }}</div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">
+                <div class="panel-title">공유 지도</div>
+                <div class="badge">읽기 전용</div>
+            </div>
+            <div class="panel-body">
+                {% if map_html %}
+                    <iframe class="map-frame" srcdoc="{{ map_html|escape }}"></iframe>
+                {% else %}
+                    <div class="empty">표시할 지도 데이터가 없습니다.</div>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">
+                <div class="panel-title">기사 할당표</div>
+            </div>
+            <div class="panel-body">
+                {% if assignment_rows %}
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    {% for key in assignment_rows.0.keys %}
+                                        <th>{{ key }}</th>
+                                    {% endfor %}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for row in assignment_rows %}
+                                    <tr>
+                                        {% for value in row.values %}
+                                            <td>{{ value }}</td>
+                                        {% endfor %}
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                {% else %}
+                    <div class="empty">기사 할당표가 없습니다.</div>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">
+                <div class="panel-title">기사별 요약</div>
+            </div>
+            <div class="panel-body">
+                {% if assigned_summary_rows %}
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    {% for key in assigned_summary_rows.0.keys %}
+                                        <th>{{ key }}</th>
+                                    {% endfor %}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for row in assigned_summary_rows %}
+                                    <tr>
+                                        {% for value in row.values %}
+                                            <td>{{ value }}</td>
+                                        {% endfor %}
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                {% else %}
+                    <div class="empty">기사별 요약이 없습니다.</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</body>
+</html>
