@@ -43,12 +43,16 @@ ASSIGNMENT_HISTORY_FILE = "assignment_history.csv"
 MAP_DIR = "saved_maps"
 SHARE_DIR = "shared_payloads"
 ASSIGNMENT_FILE = "route_assignments.json"
+CANCEL_FILE = "cancel_management.json"
 APP_URL = "https://dispatch-map.streamlit.app"  # 본인 배포 주소로 수정
-DJANGO_API_BASE_URL = os.getenv("DJANGO_API_BASE_URL", "http://127.0.0.1:8000/api/dispatch")
+DJANGO_API_BASE_URL = os.getenv("DJANGO_API_BASE_URL", "http://127.0.0.1:8010/api/dispatch")
+DJANGO_API_READ_TIMEOUT = 5
 DJANGO_API_TIMEOUT = 5
-DJANGO_PUBLIC_BASE_URL = os.getenv("DJANGO_PUBLIC_BASE_URL", "http://127.0.0.1:8000")
+DJANGO_PUBLIC_BASE_URL = os.getenv("DJANGO_PUBLIC_BASE_URL", "https://dispatch.nasilfamily.com")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+REQUESTS_SESSION = requests.Session()
+REQUESTS_SESSION.trust_env = False
 
 # 고정 캠프 정보
 CAMP_INFO = {
@@ -83,7 +87,7 @@ PIN_EDGE_BORDER_COLOR = "#111111"
 os.makedirs(MAP_DIR, exist_ok=True)
 os.makedirs(SHARE_DIR, exist_ok=True)
 
-uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx"])
+uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx"], key="dispatch_upload_file")
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +127,13 @@ def _sanitize_coords_column(df: pd.DataFrame, log_label: str = ""):
     if invalid_count > 0 and log_label:
         logger.debug("[%s] invalid coords rows skipped: %s", log_label, invalid_count)
     return out, invalid_count
+
+
+def _coords_to_jsonable(coords):
+    normalized = _normalize_coords(coords)
+    if normalized is None:
+        return ""
+    return [normalized[0], normalized[1]]
 
 # =========================
 # 공통 함수
@@ -169,7 +180,7 @@ def _dispatch_api_url(path: str) -> str:
 
 def _dispatch_api_get(path: str):
     try:
-        response = requests.get(_dispatch_api_url(path), timeout=DJANGO_API_TIMEOUT)
+        response = REQUESTS_SESSION.get(_dispatch_api_url(path), timeout=DJANGO_API_READ_TIMEOUT)
         response.raise_for_status()
         return response.json(), None
     except Exception as exc:
@@ -178,7 +189,11 @@ def _dispatch_api_get(path: str):
 
 def _dispatch_api_post(path: str, payload: dict):
     try:
-        response = requests.post(_dispatch_api_url(path), json=payload, timeout=DJANGO_API_TIMEOUT * 2)
+        response = REQUESTS_SESSION.post(
+            _dispatch_api_url(path),
+            json=payload,
+            timeout=DJANGO_API_TIMEOUT * 2,
+        )
         response.raise_for_status()
         return response.json(), None
     except Exception as exc:
@@ -226,6 +241,40 @@ def load_assignment_runs(source_date: str = "", limit: int = 10):
     if not isinstance(payload, list):
         return [], "invalid assignment run list payload"
     return payload, None
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def cached_load_latest_assignment_run_summary():
+    return load_latest_assignment_run_summary()
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def cached_load_assignment_run_detail(run_id):
+    return load_assignment_run_detail(run_id)
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def cached_load_assignment_runs(source_date: str = "", limit: int = 10):
+    return load_assignment_runs(source_date, limit)
+
+
+def _coerce_run_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return pd.to_datetime(text).date()
+    except Exception:
+        return None
+
+
+def _format_run_option_label(row: dict) -> str:
+    source_date = str(row.get("source_date", "")).strip()
+    name = str(row.get("name", "")).strip()
+    filename = str(row.get("source_filename", "")).strip()
+    route_count = safe_int(row.get("route_count", 0))
+    suffix = f" / {route_count}개" if route_count else ""
+    return f"{source_date} | {name} | {filename}{suffix}"
 
 
 def load_drivers_prefer_backend():
@@ -292,6 +341,85 @@ def sync_assignments_to_backend(run_id, assignment_df: pd.DataFrame):
     )
 
 
+def ensure_backend_run_for_session(uploaded_filename: str, base_date: str, route_summary: pd.DataFrame):
+    existing_run_id = safe_int(st.session_state.get("backend_run_id", 0))
+    if existing_run_id > 0:
+        return existing_run_id, None
+    if not str(uploaded_filename or "").strip():
+        return 0, "missing uploaded filename"
+
+    sync_payload, sync_error = sync_assignment_run_to_backend(uploaded_filename, base_date, route_summary)
+    if sync_error:
+        return 0, sync_error
+
+    backend_run_summary = (sync_payload or {}).get("run") if isinstance(sync_payload, dict) else None
+    backend_run_detail = (sync_payload or {}).get("detail") if isinstance(sync_payload, dict) else None
+    backend_run_id = safe_int((backend_run_summary or {}).get("id"))
+    if backend_run_id <= 0:
+        return 0, "backend run sync returned no run id"
+
+    st.session_state["backend_run_id"] = backend_run_id
+    if backend_run_summary:
+        st.session_state["backend_run_summary"] = backend_run_summary
+    if backend_run_detail:
+        st.session_state["assignment_store"] = apply_backend_assignments_to_store(
+            backend_run_detail,
+            st.session_state.get("assignment_store", {}),
+        )
+    cached_load_latest_assignment_run_summary.clear()
+    cached_load_assignment_runs.clear()
+    cached_load_assignment_run_detail.clear()
+    return backend_run_id, None
+
+
+def persist_assignment_store(
+    route_summary: pd.DataFrame,
+    assignment_store: dict,
+    uploaded_filename: str,
+    base_date: str,
+):
+    save_assignment_store(assignment_store)
+    st.session_state["assignment_store"] = assignment_store
+
+    backend_run_id, backend_run_error = ensure_backend_run_for_session(
+        uploaded_filename=uploaded_filename,
+        base_date=base_date,
+        route_summary=route_summary,
+    )
+    if backend_run_error:
+        return {
+            "ok": False,
+            "saved_count": 0,
+            "message": f"Django assignment sync failed: {backend_run_error}",
+        }
+
+    assignment_df_for_backend = build_assignment_df(route_summary, assignment_store)
+    backend_save_payload, backend_save_error = sync_assignments_to_backend(backend_run_id, assignment_df_for_backend)
+    if backend_save_error:
+        return {
+            "ok": False,
+            "saved_count": 0,
+            "message": f"Django assignment sync failed: {backend_save_error}",
+        }
+
+    saved_count = safe_int((backend_save_payload or {}).get("saved_count", 0))
+    if saved_count <= 0:
+        return {
+            "ok": False,
+            "saved_count": saved_count,
+            "message": "Django assignment sync saved 0 rows.",
+        }
+
+    cached_load_latest_assignment_run_summary.clear()
+    cached_load_assignment_runs.clear()
+    cached_load_assignment_run_detail.clear()
+    return {
+        "ok": True,
+        "saved_count": saved_count,
+        "message": f"Django assignment sync saved {saved_count} rows.",
+    }
+
+
 def sync_run_snapshot_to_backend(run_id, payload: dict, snapshot_kind: str = "recent"):
     if safe_int(run_id) <= 0:
         return None, "missing backend run id"
@@ -333,6 +461,36 @@ def load_customer_memos_for_df(df: pd.DataFrame):
     if not isinstance(payload, dict):
         return {}, "invalid customer memo payload"
     return payload.get("memos", {}) or {}, None
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def cached_load_customer_memos(rows_json: str):
+    try:
+        rows = json.loads(rows_json)
+    except Exception:
+        rows = []
+
+    payload, error = _dispatch_api_post("customer-memos/bulk-lookup/", {"rows": rows})
+    if error:
+        return {}, error
+    if not isinstance(payload, dict):
+        return {}, "invalid customer memo payload"
+    return payload.get("memos", {}) or {}, None
+
+
+def load_customer_memos_cached_for_df(df: pd.DataFrame):
+    if len(df) == 0:
+        return {}, None
+
+    rows = []
+    unique_df = df[["company_id", "address_norm"]].drop_duplicates().fillna("")
+    for _, row in unique_df.iterrows():
+        rows.append({
+            "company_id": str(row.get("company_id", "")).strip(),
+            "address_norm": str(row.get("address_norm", "")).strip(),
+        })
+    rows = sorted(rows, key=lambda r: (r["company_id"], r["address_norm"]))
+    return cached_load_customer_memos(json.dumps(rows, ensure_ascii=False))
 
 
 def save_customer_memo_to_backend(company_id: str, address: str, address_norm: str, company_name: str, note: str):
@@ -382,6 +540,21 @@ def send_telegram_message(text: str):
         return response.json(), None
     except Exception as exc:
         return None, str(exc)
+
+
+def send_assignment_completion_notifications(summary_text: str, memo_text: str):
+    if not str(TELEGRAM_BOT_TOKEN).strip() or not str(TELEGRAM_CHAT_ID).strip():
+        return False, "missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+
+    tg_resp_1, tg_err_1 = send_telegram_message(summary_text)
+    tg_resp_2, tg_err_2 = send_telegram_message(memo_text)
+    error_message = tg_err_1 or tg_err_2
+    if error_message:
+        return False, error_message
+    return True, {
+        "summary": tg_resp_1,
+        "memo": tg_resp_2,
+    }
 
 
 def build_driver_memo_report(grouped_delivery: pd.DataFrame) -> str:
@@ -828,6 +1001,66 @@ def save_assignment_store(store):
         pass
 
 
+def load_cancel_store():
+    if os.path.exists(CANCEL_FILE):
+        try:
+            with open(CANCEL_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_cancel_store(store):
+    try:
+        with open(CANCEL_FILE, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def make_cancel_key(base_date: str, milkrun_no: str, origin_center: str, address_norm: str) -> str:
+    return (
+        f"{str(base_date).strip()}__"
+        f"{str(milkrun_no).strip()}__"
+        f"{str(origin_center).strip()}__"
+        f"{str(address_norm).strip()}"
+    )
+
+
+def build_cancel_management_df(grouped_delivery: pd.DataFrame, route_driver_map: dict, base_date: str, cancel_store: dict):
+    if len(grouped_delivery) == 0:
+        return pd.DataFrame()
+
+    work_df = grouped_delivery.copy()
+    work_df["assigned_driver"] = work_df["route"].map(route_driver_map).fillna("")
+    work_df["cancel_key"] = work_df.apply(
+        lambda row: make_cancel_key(
+            base_date,
+            row.get("milkrun_no", ""),
+            row.get("origin_center", ""),
+            row.get("address_norm", ""),
+        ),
+        axis=1,
+    )
+    work_df["총수량"] = work_df.apply(
+        lambda row: safe_int(row.get("ae_sum", 0)) + safe_int(row.get("af_sum", 0)) + safe_int(row.get("ag_sum", 0)),
+        axis=1,
+    )
+    work_df["취소건수"] = work_df["cancel_key"].map(lambda key: safe_int((cancel_store.get(key) or {}).get("cancel_count", 0)))
+    work_df["취소수량"] = work_df["cancel_key"].map(lambda key: safe_int((cancel_store.get(key) or {}).get("cancel_qty", 0)))
+    work_df["취소사유"] = work_df["cancel_key"].map(lambda key: str((cancel_store.get(key) or {}).get("reason", "")).strip())
+    work_df["정산제외"] = work_df["취소건수"].apply(lambda v: bool(safe_int(v) > 0))
+    cols = [
+        "milkrun_no", "origin_center", "route_prefix", "route", "truck_request_id", "assigned_driver",
+        "house_order", "company_name", "address", "stop_count", "총수량",
+        "취소건수", "취소수량", "정산제외", "취소사유", "address_norm", "cancel_key",
+    ]
+    existing_cols = [c for c in cols if c in work_df.columns]
+    sort_cols = [c for c in ["assigned_driver", "origin_center", "milkrun_no", "route_prefix", "route", "house_order"] if c in work_df.columns]
+    return work_df[existing_cols].sort_values(by=sort_cols).reset_index(drop=True)
+
+
 def make_assignment_key(route: str, truck_request_id: str) -> str:
     return f"{str(route).strip()}__{str(truck_request_id).strip()}"
 
@@ -841,12 +1074,14 @@ def is_header_like_route_values(route_value, truck_request_id_value) -> bool:
 
 
 def _df_to_records_for_json(df: pd.DataFrame):
+    if df is None or len(df) == 0:
+        return []
+
     out = []
     for row in df.fillna("").to_dict(orient="records"):
         r = row.copy()
-        coords = r.get("coords")
-        if isinstance(coords, tuple):
-            r["coords"] = [coords[0], coords[1]]
+        if "coords" in r:
+            r["coords"] = _coords_to_jsonable(r.get("coords"))
         out.append(r)
     return out
 
@@ -1189,8 +1424,9 @@ def build_base_data(file_bytes: bytes):
     for _, row in df.iterrows():
         route_val = row.iloc[0]           # A열
         truck_request_id = row.iloc[2]    # C열
-        center_type = row.iloc[8]         # I열
+        milkrun_no = row.iloc[8]          # I열
         spu_center = row.iloc[12]         # M열
+        origin_center = row.iloc[13]      # N열
         time_val = row.iloc[TIME_COL_INDEX]
         company_id = row.iloc[22]         # W열
         company_name = row.iloc[23]       # X열
@@ -1209,14 +1445,12 @@ def build_base_data(file_bytes: bytes):
         if pd.notna(address) and str(address).strip():
             company_id_str = str(company_id).strip() if pd.notna(company_id) else ""
             company_name_str = str(company_name).strip() if pd.notna(company_name) else ""
-            center_type_str = str(center_type).strip() if pd.notna(center_type) else ""
+            milkrun_no_str = str(milkrun_no).strip() if pd.notna(milkrun_no) else ""
             spu_center_str = str(spu_center).strip() if pd.notna(spu_center) else ""
+            origin_center_str = str(origin_center).strip() if pd.notna(origin_center) else ""
             time_str = format_time_value(time_val)
 
-            is_center_row = (
-                center_type_str == "센터"
-                or spu_center_str in CENTER_CODES
-            )
+            is_center_row = spu_center_str in CENTER_CODES
 
             parsed.append({
                 "route": current_route,
@@ -1231,8 +1465,9 @@ def build_base_data(file_bytes: bytes):
                 "ae": pd.to_numeric(ae, errors="coerce") if pd.notna(ae) else 0,
                 "af": pd.to_numeric(af, errors="coerce") if pd.notna(af) else 0,
                 "ag": pd.to_numeric(ag, errors="coerce") if pd.notna(ag) else 0,
-                "center_type": center_type_str,
+                "milkrun_no": milkrun_no_str,
                 "spu_center": spu_center_str,
+                "origin_center": origin_center_str,
                 "is_center": is_center_row,
             })
 
@@ -1279,18 +1514,18 @@ def build_base_data(file_bytes: bytes):
             "route_camp_map": route_camp_map,
         }
 
-    # 같은 route 안에서 같은 주소는 같은 집으로 처리
+    # 같은 업체/주소라도 센터명이 다르면 별도 행으로 취급해야 한다.
     house_order_df = (
-        result_delivery.groupby(["route", "address_norm"], as_index=False)
+        result_delivery.groupby(["route", "milkrun_no", "origin_center", "address_norm"], as_index=False)
         .agg(first_stop=("stop_order", "min"))
-        .sort_values(["route", "first_stop", "address_norm"])
+        .sort_values(["route", "first_stop", "milkrun_no", "origin_center", "address_norm"])
         .reset_index(drop=True)
     )
     house_order_df["house_order"] = house_order_df.groupby("route").cumcount() + 1
 
     result_delivery = result_delivery.merge(
-        house_order_df[["route", "address_norm", "house_order"]],
-        on=["route", "address_norm"],
+        house_order_df[["route", "milkrun_no", "origin_center", "address_norm", "house_order"]],
+        on=["route", "milkrun_no", "origin_center", "address_norm"],
         how="left"
     )
 
@@ -1332,12 +1567,13 @@ def build_base_data(file_bytes: bytes):
         route_line_label[route] = f"{prefix} | {total}박스 | {small}/{mid}/{large}{camp_text}"
 
     grouped_delivery = (
-        result_delivery.groupby(["route", "address_norm"], as_index=False)
+        result_delivery.groupby(["route", "milkrun_no", "origin_center", "address_norm"], as_index=False)
         .agg(
             truck_request_id=("truck_request_id", "first"),
             company_id=("company_id", "first"),
             company_name=("company_name", "first"),
             address=("address", "first"),
+            origin_center=("origin_center", "first"),
             stop_count=("stop_order", "count"),
             first_stop=("stop_order", "min"),
             house_order=("house_order", "first"),
@@ -1537,19 +1773,25 @@ def apply_group_driver_assignments(
     if len(route_summary) == 0 or len(group_assignment_df) == 0:
         return assignment_store.copy(), 0
 
-    route_to_group = dict(zip(group_assignment_df["route"], group_assignment_df["추천그룹"]))
+    route_to_group = {
+        str(route).strip(): str(group_name).strip()
+        for route, group_name in zip(group_assignment_df["route"], group_assignment_df["추천그룹"])
+        if str(route).strip()
+    }
     updated_store = assignment_store.copy()
     updated_count = 0
 
     for _, row in route_summary.iterrows():
-        route = row["route"]
-        truck_request_id = row["truck_request_id"]
+        route = str(row["route"]).strip()
+        truck_request_id = str(row["truck_request_id"]).strip()
         group_name = route_to_group.get(route, "")
         selected_driver = str(group_driver_selection.get(group_name, "")).strip()
         if not selected_driver:
             continue
 
         assignment_key = make_assignment_key(route, truck_request_id)
+        if str(updated_store.get(assignment_key, "")).strip() == selected_driver:
+            continue
         updated_store[assignment_key] = selected_driver
         updated_count += 1
 
@@ -1561,6 +1803,8 @@ def render_group_driver_assignment_form(
     drivers,
     assignment_store: dict,
     group_assignment_df: pd.DataFrame,
+    uploaded_filename: str,
+    base_date_str: str,
 ):
     if len(group_assignment_df) == 0:
         return assignment_store
@@ -1597,16 +1841,24 @@ def render_group_driver_assignment_form(
             group_assignment_df=group_assignment_df,
             group_driver_selection=group_driver_selection,
         )
-        save_assignment_store(updated_store)
-        st.session_state["assignment_store"] = updated_store
-        st.success(f"추천그룹 배정을 적용했습니다. ({updated_count}개 route 반영)")
-        backend_run_id = safe_int(st.session_state.get("backend_run_id", 0))
-        assignment_df_for_backend = build_assignment_df(route_summary, updated_store)
-        backend_save_payload, backend_save_error = sync_assignments_to_backend(backend_run_id, assignment_df_for_backend)
-        if backend_save_error:
-            st.warning(f"Django assignment sync failed: {backend_save_error}")
-        elif backend_save_payload is not None:
-            st.caption(f"Django assignment sync saved {safe_int(backend_save_payload.get('saved_count', 0))} rows.")
+        if updated_count <= 0:
+            st.warning("추천그룹 배정으로 실제 변경된 route가 없습니다.")
+            return assignment_store
+
+        persist_result = persist_assignment_store(
+            route_summary=route_summary,
+            assignment_store=updated_store,
+            uploaded_filename=uploaded_filename,
+            base_date=base_date_str,
+        )
+        if persist_result["ok"]:
+            st.success(
+                f"추천그룹 배정을 적용했습니다. ({updated_count}개 route 반영, 서버 저장 {persist_result['saved_count']}건)"
+            )
+        else:
+            st.error(
+                f"추천그룹 배정은 로컬에만 반영됐고 서버 저장은 실패했습니다. {persist_result['message']}"
+            )
         return updated_store
 
     return assignment_store
@@ -1667,7 +1919,13 @@ def spread_overlapping_marker(lat: float, lon: float, overlap_info: dict, row: p
     return lat, lon, overlap_count
 
 
-def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_store: dict):
+def render_assignment_form(
+    route_summary: pd.DataFrame,
+    drivers,
+    assignment_store: dict,
+    uploaded_filename: str,
+    base_date_str: str,
+):
     st.subheader("기사 배정")
     st.caption("구분 / 캠프 / truck_request_id / 스톱 / 시작시간 / 종료시간 / 소형 / 중형 / 대형 / 총합 / 기사")
 
@@ -1713,16 +1971,16 @@ def render_assignment_form(route_summary: pd.DataFrame, drivers, assignment_stor
         submitted = st.form_submit_button("기사 배정 적용")
 
     if submitted:
-        save_assignment_store(new_assignment_store)
-        st.session_state["assignment_store"] = new_assignment_store
-        st.success("기사 배정을 저장했습니다.")
-        backend_run_id = safe_int(st.session_state.get("backend_run_id", 0))
-        assignment_df_for_backend = build_assignment_df(route_summary, new_assignment_store)
-        backend_save_payload, backend_save_error = sync_assignments_to_backend(backend_run_id, assignment_df_for_backend)
-        if backend_save_error:
-            st.warning(f"Django assignment sync failed: {backend_save_error}")
-        elif backend_save_payload is not None:
-            st.caption(f"Django assignment sync saved {safe_int(backend_save_payload.get('saved_count', 0))} rows.")
+        persist_result = persist_assignment_store(
+            route_summary=route_summary,
+            assignment_store=new_assignment_store,
+            uploaded_filename=uploaded_filename,
+            base_date=base_date_str,
+        )
+        if persist_result["ok"]:
+            st.success(f"기사 배정을 저장했습니다. (서버 저장 {persist_result['saved_count']}건)")
+        else:
+            st.error(f"기사 배정은 로컬에만 저장됐고 서버 저장은 실패했습니다. {persist_result['message']}")
         return new_assignment_store
 
     return assignment_store
@@ -2318,9 +2576,12 @@ if shared_map:
 # 시작
 # =========================
 drivers, driver_source = load_drivers_prefer_backend()
-latest_run_summary, latest_run_error = load_latest_assignment_run_summary()
-today_run_options, today_run_error = load_assignment_runs(pd.Timestamp.now().strftime("%Y-%m-%d"), limit=10)
-recent_run_options, recent_run_error = load_assignment_runs(limit=10)
+latest_run_summary, latest_run_error = cached_load_latest_assignment_run_summary()
+today_run_options, today_run_error = [], None
+recent_run_options, recent_run_error = [], None
+
+if uploaded_file is not None:
+    st.caption(f"업로드 파일: {uploaded_file.name}")
 
 with st.sidebar:
     st.subheader("백엔드 상태")
@@ -2340,38 +2601,83 @@ with st.sidebar:
 
 if "assignment_store" not in st.session_state:
     st.session_state["assignment_store"] = load_assignment_store()
+if "cancel_store" not in st.session_state:
+    st.session_state["cancel_store"] = load_cancel_store()
 
 restored_mode = False
 restored_selected_filter = "전체"
 restored_selected_group_filter = "전체"
 
 if not uploaded_file:
-    chosen_run_summary = latest_run_summary
-    run_candidates = []
-    seen_run_ids = set()
-    for row in (today_run_options or []) + (recent_run_options or []):
-        run_id = safe_int(row.get("id", 0))
-        if run_id > 0 and run_id not in seen_run_ids:
-            seen_run_ids.add(run_id)
-            run_candidates.append(row)
+    today_run_options, today_run_error = cached_load_assignment_runs(pd.Timestamp.now().strftime("%Y-%m-%d"), limit=10)
+    recent_run_options, recent_run_error = cached_load_assignment_runs(limit=10)
+    st.subheader("저장된 지도 열기")
 
-    if run_candidates:
-        st.subheader("저장된 작업 선택")
-        run_labels = []
-        default_run_index = 0
-        latest_run_id = safe_int(latest_run_summary.get("id")) if isinstance(latest_run_summary, dict) else 0
-        for idx, row in enumerate(run_candidates):
-            label = f"{row.get('source_date', '')} | {row.get('name', '')} | {row.get('source_filename', '')}"
-            run_labels.append(label)
-            if safe_int(row.get("id")) == latest_run_id:
-                default_run_index = idx
-        selected_run_label = st.selectbox("열 작업", run_labels, index=default_run_index, key="saved_run_selector")
-        chosen_run_summary = run_candidates[run_labels.index(selected_run_label)]
-    elif today_run_error or recent_run_error:
-        st.caption(f"작업 목록 조회 실패: {today_run_error or recent_run_error}")
+    latest_run_date = _coerce_run_date(latest_run_summary.get("source_date")) if isinstance(latest_run_summary, dict) else None
+    default_browse_date = latest_run_date or pd.Timestamp.now().date()
+    browse_col1, browse_col2 = st.columns([1.1, 1.9])
+    with browse_col1:
+        browse_date = st.date_input(
+            "조회 날짜",
+            value=default_browse_date,
+            key="saved_run_browse_date",
+            help="원하는 날짜를 고르면 그날 저장된 배차지도를 바로 불러올 수 있습니다.",
+        )
+
+    selected_date_str = pd.Timestamp(browse_date).strftime("%Y-%m-%d")
+    selected_date_runs, selected_date_error = cached_load_assignment_runs(selected_date_str, limit=30)
+    chosen_run_summary = None
+    latest_run_id = safe_int(latest_run_summary.get("id")) if isinstance(latest_run_summary, dict) else 0
+
+    with browse_col2:
+        if selected_date_runs:
+            run_labels = [_format_run_option_label(row) for row in selected_date_runs]
+            default_run_index = 0
+            for idx, row in enumerate(selected_date_runs):
+                if safe_int(row.get("id")) == latest_run_id:
+                    default_run_index = idx
+                    break
+            selected_run_label = st.selectbox(
+                "저장된 작업",
+                run_labels,
+                index=default_run_index,
+                key="saved_run_selector",
+                help="같은 날짜에 여러 번 저장된 작업이 있으면 여기서 선택합니다.",
+            )
+            chosen_run_summary = selected_date_runs[run_labels.index(selected_run_label)]
+        elif selected_date_error:
+            st.caption(f"저장된 작업 조회 실패: {selected_date_error}")
+        else:
+            st.caption(f"{selected_date_str} 날짜에 저장된 작업이 아직 없습니다.")
+
+    with st.expander("최근 작업 빠르게 보기", expanded=False):
+        quick_candidates = []
+        seen_run_ids = set()
+        for row in (today_run_options or []) + (recent_run_options or []):
+            run_id = safe_int(row.get("id", 0))
+            if run_id > 0 and run_id not in seen_run_ids:
+                seen_run_ids.add(run_id)
+                quick_candidates.append(row)
+        if quick_candidates:
+            quick_df = pd.DataFrame(
+                [
+                    {
+                        "기준일": row.get("source_date", ""),
+                        "작업명": row.get("name", ""),
+                        "파일명": row.get("source_filename", ""),
+                        "route수": safe_int(row.get("route_count", 0)),
+                    }
+                    for row in quick_candidates[:20]
+                ]
+            )
+            st.dataframe(quick_df, use_container_width=True)
+        elif today_run_error or recent_run_error:
+            st.caption(f"최근 작업 목록 조회 실패: {today_run_error or recent_run_error}")
+        else:
+            st.caption("최근 작업 이력이 아직 없습니다.")
 
     if chosen_run_summary:
-        latest_run_detail, latest_run_detail_error = load_assignment_run_detail(chosen_run_summary.get("id"))
+        latest_run_detail, latest_run_detail_error = cached_load_assignment_run_detail(chosen_run_summary.get("id"))
         latest_snapshot = latest_run_detail.get("latest_snapshot") if latest_run_detail else None
         latest_snapshot_payload = latest_snapshot.get("payload", {}) if isinstance(latest_snapshot, dict) else {}
         latest_result_delivery_rows = latest_snapshot_payload.get("result_delivery_rows", [])
@@ -2495,17 +2801,23 @@ with st.spinner("주소 좌표 확인 중..."):
     camp_coords, cache = resolve_camp_coords(cache)
     save_geocode_cache(cache)
 
-customer_memo_map, customer_memo_error = load_customer_memos_for_df(grouped_delivery)
+customer_memo_map, customer_memo_error = load_customer_memos_cached_for_df(grouped_delivery)
 if customer_memo_error:
     st.caption(f"업체 메모 조회 실패: {customer_memo_error}")
 result_delivery = attach_customer_memos(result_delivery, customer_memo_map)
 grouped_delivery = attach_customer_memos(grouped_delivery, customer_memo_map)
 
-with st.expander("업체 메모 관리", expanded=False):
-    memo_source_df = grouped_delivery.copy()
-    memo_source_df["_memo_match_key"] = memo_source_df.apply(
-        lambda row: (
-            str(row.get("company_id", "")).strip()
+tab_basic, tab_recommend, tab_memo, tab_stats, tab_report = st.tabs(
+    ["\uae30\ubcf8", "\ucd94\ucc9c", "\uba54\ubaa8", "\ud1b5\uacc4", "\ubcf4\uace0"]
+)
+
+with tab_memo:
+    st.subheader("업체 메모 관리")
+    with st.expander("업체 메모 관리", expanded=False):
+        memo_source_df = grouped_delivery.copy()
+        memo_source_df["_memo_match_key"] = memo_source_df.apply(
+            lambda row: (
+                str(row.get("company_id", "")).strip()
             if str(row.get("company_id", "")).strip()
             else str(row.get("address_norm", "")).strip()
         ),
@@ -2520,19 +2832,40 @@ with st.expander("업체 메모 관리", expanded=False):
     if len(memo_source_df) == 0:
         st.info("메모를 등록할 업체가 없습니다.")
     else:
-        memo_labels = memo_source_df.apply(
+        memo_source_df["_memo_company_name"] = memo_source_df["company_name"].fillna("").astype(str)
+        memo_source_df["_memo_address"] = memo_source_df["address"].fillna("").astype(str)
+        memo_search = st.text_input(
+            "업체 검색",
+            key="customer_memo_search",
+            placeholder="업체명 또는 주소로 검색",
+        ).strip()
+        filtered_memo_df = memo_source_df
+        if memo_search:
+            filtered_memo_df = memo_source_df[
+                memo_source_df["_memo_company_name"].str.contains(memo_search, case=False, na=False)
+                | memo_source_df["_memo_address"].str.contains(memo_search, case=False, na=False)
+            ].reset_index(drop=True)
+        st.caption(f"검색 결과 {len(filtered_memo_df)}건 / 전체 {len(memo_source_df)}건")
+        if len(filtered_memo_df) == 0:
+            st.info("검색 결과가 없습니다.")
+            preview_cols = [c for c in ["company_name", "address", "customer_memo"] if c in memo_source_df.columns]
+            st.dataframe(memo_source_df[preview_cols], use_container_width=True)
+            filtered_memo_df = pd.DataFrame()
+
+    if len(memo_source_df) > 0 and len(filtered_memo_df) > 0:
+        memo_labels = filtered_memo_df.apply(
             lambda row: f"{str(row.get('company_name', '')).strip() or '업체명없음'} | {str(row.get('address', '')).strip()}",
             axis=1,
         ).tolist()
         selected_memo_label = st.selectbox("메모 등록 업체", memo_labels, key="customer_memo_selector")
-        selected_memo_row = memo_source_df.iloc[memo_labels.index(selected_memo_label)]
+        selected_memo_row = filtered_memo_df.iloc[memo_labels.index(selected_memo_label)]
         current_note = str(selected_memo_row.get("customer_memo", "")).strip()
         note_value = st.text_area(
             "업체 메모",
             value=current_note,
             height=140,
             key=f"customer_memo_text_{safe_int(selected_memo_row.name)}",
-            help="다음번 같은 업체 또는 주소가 나오면 이 메모가 다시 표시됩니다.",
+            help="같은 업체 ID 또는 정규화 주소가 다시 나오면 이 메모가 함께 표시됩니다.",
         )
         if st.button("업체 메모 저장", key="customer_memo_save_button"):
             save_payload, save_error = save_customer_memo_to_backend(
@@ -2546,351 +2879,496 @@ with st.expander("업체 메모 관리", expanded=False):
                 st.warning(f"업체 메모 저장 실패: {save_error}")
             else:
                 st.success("업체 메모를 저장했습니다.")
-                customer_memo_map, customer_memo_error = load_customer_memos_for_df(grouped_delivery)
+                cached_load_customer_memos.clear()
+                customer_memo_map, customer_memo_error = load_customer_memos_cached_for_df(grouped_delivery)
                 result_delivery = attach_customer_memos(result_delivery, customer_memo_map)
                 grouped_delivery = attach_customer_memos(grouped_delivery, customer_memo_map)
-        preview_cols = [c for c in ["company_name", "address", "customer_memo"] if c in memo_source_df.columns]
-        st.dataframe(memo_source_df[preview_cols], use_container_width=True)
+        preview_cols = [c for c in ["company_name", "address", "customer_memo"] if c in filtered_memo_df.columns]
+        st.dataframe(filtered_memo_df[preview_cols], use_container_width=True)
 
-# 추천배정 엔진 (기존 기사배정과 분리)
-st.subheader("추천배정 엔진")
-group_count_mode = st.radio("추천그룹 수 설정", ["자동", "직접입력"], horizontal=True)
-manual_group_count = None
+with tab_recommend:
+    # 추천배정 엔진 (기존 기사배정과 분리)
+    st.subheader("추천배정 엔진")
+    group_count_mode = st.radio("추천그룹 수 설정", ["자동", "직접입력"], horizontal=True)
+    manual_group_count = None
 
-if group_count_mode == "직접입력":
-    manual_group_count = st.number_input("추천그룹 수", min_value=1, max_value=max(1, len(route_summary)), value=2, step=1)
-else:
-    route_feature_df_for_count = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
-    auto_group_count = choose_auto_group_count(route_feature_df_for_count)
-    st.caption(f"자동 추천그룹 수: {auto_group_count}")
-
-if st.button("추천그룹 자동 추천 실행"):
-    route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
-    recommended_group_count = resolve_group_count(route_feature_df, manual_group_count=manual_group_count)
-    recommended_group_map = recommend_route_groups(route_feature_df, manual_group_count=manual_group_count)
-    st.session_state["recommended_group_map"] = recommended_group_map
-    st.session_state["recommended_group_count"] = recommended_group_count
-    st.success("추천그룹 생성을 완료했습니다.")
-
-if "recommended_group_map" in st.session_state:
-    route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
-    recommended_group_map = st.session_state["recommended_group_map"]
-    group_assignment_df = build_group_assignment_df(route_feature_df, recommended_group_map)
-    group_summary_df = build_group_summary_df(group_assignment_df)
-
-    st.subheader("추천그룹 요약")
-    st.dataframe(group_summary_df, use_container_width=True)
-
-    with st.expander("추천그룹 수정", expanded=False):
-        edit_map = default_group_edit_map(group_assignment_df)
-        recommended_group_count = safe_int(st.session_state.get("recommended_group_count", 0))
-        if recommended_group_count <= 0:
-            recommended_group_count = max(1, safe_int(group_assignment_df["추천그룹"].nunique()))
-        group_options = [f"추천그룹 {i}" for i in range(1, recommended_group_count + 1)]
-        with st.form("group_edit_form", clear_on_submit=False):
-            new_group_map = edit_map.copy()
-            edit_rows = group_assignment_df.sort_values(["route_prefix", "route"]).reset_index(drop=True)
-
-            for _, row in edit_rows.iterrows():
-                route = row["route"]
-                current_group = recommended_group_map.get(route, row["추천그룹"])
-                default_idx = group_options.index(current_group) if current_group in group_options else 0
-
-                c1, c2, c3, c4 = st.columns([1.0, 0.8, 1.2, 1.2])
-                c1.write(str(route))
-                c2.write(str(row.get("route_prefix", "")))
-                c3.write(str(row.get("truck_request_id", "")))
-                selected_group = c4.selectbox(
-                    f"추천그룹선택_{route}",
-                    options=group_options,
-                    index=default_idx,
-                    label_visibility="collapsed",
-                    key=f"group_select_{route}"
-                )
-                new_group_map[route] = selected_group
-
-            group_submitted = st.form_submit_button("추천그룹 수정 적용")
-
-        if group_submitted:
-            updated_assignment_df = apply_group_edit_map(route_feature_df, new_group_map)
-            st.session_state["recommended_group_map"] = default_group_edit_map(updated_assignment_df)
-            st.success("추천그룹 수동 수정을 반영했습니다.")
-
-    final_group_map = st.session_state["recommended_group_map"]
-    group_map_result, group_map_grouped = build_group_map_data(result_delivery, grouped_delivery, final_group_map)
-
-    latest_assignment_df = build_group_assignment_df(route_feature_df, final_group_map)
-    st.session_state["latest_group_assignment_df"] = latest_assignment_df.copy()
-    group_detail_df = build_group_detail_stats_df(latest_assignment_df)
-
-    st.subheader("추천그룹 지도")
-    selectable_groups = ["전체"] + group_detail_df["추천그룹"].astype(str).tolist()
-    selected_group_index = selectable_groups.index(restored_selected_group_filter) if restored_selected_group_filter in selectable_groups else 0
-    selected_group_filter = st.selectbox("추천그룹 선택", selectable_groups, index=selected_group_index, key="selected_group_filter")
-
-    if selected_group_filter == "전체":
-        selected_info_df = group_detail_df.copy()
-        route_count = safe_int(selected_info_df["라우트개수"].sum())
-        box_total = safe_int(selected_info_df["박스총개수"].sum())
-        small_total = safe_int(selected_info_df["소형합"].sum())
-        medium_total = safe_int(selected_info_df["중형합"].sum())
-        large_total = safe_int(selected_info_df["대형합"].sum())
+    if group_count_mode == "직접입력":
+        manual_group_count = st.number_input("추천그룹 수", min_value=1, max_value=max(1, len(route_summary)), value=2, step=1)
     else:
-        selected_info_df = group_detail_df[group_detail_df["추천그룹"] == selected_group_filter]
-        if len(selected_info_df) == 0:
-            route_count = box_total = small_total = medium_total = large_total = 0
+        route_feature_df_for_count = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
+        auto_group_count = choose_auto_group_count(route_feature_df_for_count)
+        st.caption(f"자동 추천그룹 수: {auto_group_count}")
+
+    if st.button("추천그룹 자동 추천 실행"):
+        route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
+        recommended_group_count = resolve_group_count(route_feature_df, manual_group_count=manual_group_count)
+        recommended_group_map = recommend_route_groups(route_feature_df, manual_group_count=manual_group_count)
+        st.session_state["recommended_group_map"] = recommended_group_map
+        st.session_state["recommended_group_count"] = recommended_group_count
+        st.success("추천그룹 생성을 완료했습니다.")
+
+    if "recommended_group_map" in st.session_state:
+        route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
+        recommended_group_map = st.session_state["recommended_group_map"]
+        group_assignment_df = build_group_assignment_df(route_feature_df, recommended_group_map)
+        group_summary_df = build_group_summary_df(group_assignment_df)
+
+        st.subheader("추천그룹 요약")
+        st.dataframe(group_summary_df, use_container_width=True)
+
+        with st.expander("추천그룹 수정", expanded=False):
+            edit_map = default_group_edit_map(group_assignment_df)
+            recommended_group_count = safe_int(st.session_state.get("recommended_group_count", 0))
+            if recommended_group_count <= 0:
+                recommended_group_count = max(1, safe_int(group_assignment_df["추천그룹"].nunique()))
+            group_options = [f"추천그룹 {i}" for i in range(1, recommended_group_count + 1)]
+            with st.form("group_edit_form", clear_on_submit=False):
+                new_group_map = edit_map.copy()
+                edit_rows = group_assignment_df.sort_values(["route_prefix", "route"]).reset_index(drop=True)
+
+                for _, row in edit_rows.iterrows():
+                    route = row["route"]
+                    current_group = recommended_group_map.get(route, row["추천그룹"])
+                    default_idx = group_options.index(current_group) if current_group in group_options else 0
+
+                    c1, c2, c3, c4 = st.columns([1.0, 0.8, 1.2, 1.2])
+                    c1.write(str(route))
+                    c2.write(str(row.get("route_prefix", "")))
+                    c3.write(str(row.get("truck_request_id", "")))
+                    selected_group = c4.selectbox(
+                        f"추천그룹선택_{route}",
+                        options=group_options,
+                        index=default_idx,
+                        label_visibility="collapsed",
+                        key=f"group_select_{route}"
+                    )
+                    new_group_map[route] = selected_group
+
+                group_submitted = st.form_submit_button("추천그룹 수정 적용")
+
+            if group_submitted:
+                updated_assignment_df = apply_group_edit_map(route_feature_df, new_group_map)
+                st.session_state["recommended_group_map"] = default_group_edit_map(updated_assignment_df)
+                st.success("추천그룹 수동 수정을 반영했습니다.")
+
+        final_group_map = st.session_state["recommended_group_map"]
+        group_map_result, group_map_grouped = build_group_map_data(result_delivery, grouped_delivery, final_group_map)
+
+        latest_assignment_df = build_group_assignment_df(route_feature_df, final_group_map)
+        st.session_state["latest_group_assignment_df"] = latest_assignment_df.copy()
+        group_detail_df = build_group_detail_stats_df(latest_assignment_df)
+
+        st.subheader("추천그룹 지도")
+        selectable_groups = ["전체"] + group_detail_df["추천그룹"].astype(str).tolist()
+        selected_group_index = selectable_groups.index(restored_selected_group_filter) if restored_selected_group_filter in selectable_groups else 0
+        selected_group_filter = st.selectbox("추천그룹 선택", selectable_groups, index=selected_group_index, key="selected_group_filter")
+
+        if selected_group_filter == "전체":
+            selected_info_df = group_detail_df.copy()
+            route_count = safe_int(selected_info_df["라우트개수"].sum())
+            box_total = safe_int(selected_info_df["박스총개수"].sum())
+            small_total = safe_int(selected_info_df["소형합"].sum())
+            medium_total = safe_int(selected_info_df["중형합"].sum())
+            large_total = safe_int(selected_info_df["대형합"].sum())
         else:
-            row = selected_info_df.iloc[0]
-            route_count = safe_int(row["라우트개수"])
-            box_total = safe_int(row["박스총개수"])
-            small_total = safe_int(row["소형합"])
-            medium_total = safe_int(row["중형합"])
-            large_total = safe_int(row["대형합"])
+            selected_info_df = group_detail_df[group_detail_df["추천그룹"] == selected_group_filter]
+            if len(selected_info_df) == 0:
+                route_count = box_total = small_total = medium_total = large_total = 0
+            else:
+                row = selected_info_df.iloc[0]
+                route_count = safe_int(row["라우트개수"])
+                box_total = safe_int(row["박스총개수"])
+                small_total = safe_int(row["소형합"])
+                medium_total = safe_int(row["중형합"])
+                large_total = safe_int(row["대형합"])
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("라우트개수", route_count)
-    m2.metric("박스총개수", box_total)
-    m3.metric("소형", small_total)
-    m4.metric("중형", medium_total)
-    m5.metric("대형", large_total)
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("라우트개수", route_count)
+        m2.metric("박스총개수", box_total)
+        m3.metric("소형", small_total)
+        m4.metric("중형", medium_total)
+        m5.metric("대형", large_total)
 
-    st.caption("추천그룹 지도와 지표는 선택한 그룹 기준으로 표시됩니다.")
+        st.caption("추천그룹 지도와 지표는 선택한 그룹 기준으로 표시됩니다.")
 
-    group_map_view = render_group_map(
-        valid_result=group_map_result,
-        valid_grouped=group_map_grouped,
-        route_prefix_map=route_prefix_map,
-        route_camp_map=route_camp_map,
-        camp_coords=camp_coords,
-        selected_group=selected_group_filter,
-    )
-    st_folium(group_map_view, width=None, height=700)
+        group_map_view = render_group_map(
+            valid_result=group_map_result,
+            valid_grouped=group_map_grouped,
+            route_prefix_map=route_prefix_map,
+            route_camp_map=route_camp_map,
+            camp_coords=camp_coords,
+            selected_group=selected_group_filter,
+        )
+        st_folium(group_map_view, width=None, height=700)
 
-    with st.expander("기사 선호 예상 순위 (참고용)", expanded=False):
-        st.caption("추천그룹별 물량·스톱·예상시간·퍼짐 기준의 휴리스틱 참고 순위입니다.")
-        preference_df = build_driver_preference_df(route_feature_df, final_group_map)
-        st.dataframe(
-            preference_df.assign(
-                선호예상점수=lambda df: df["선호예상점수"].round(1),
-                route_spread_km=lambda df: df["route_spread_km"].round(1),
-            ).rename(columns={"route_spread_km": "그룹평균퍼짐km"}),
-            use_container_width=True,
+        with st.expander("기사 선호 예상 순위 (참고용)", expanded=False):
+            st.caption("추천그룹별 물량·스톱·예상시간·퍼짐 기준의 휴리스틱 참고 순위입니다.")
+            preference_df = build_driver_preference_df(route_feature_df, final_group_map)
+            st.dataframe(
+                preference_df.assign(
+                    선호예상점수=lambda df: df["선호예상점수"].round(1),
+                    route_spread_km=lambda df: df["route_spread_km"].round(1),
+                ).rename(columns={"route_spread_km": "그룹평균퍼짐km"}),
+                use_container_width=True,
+            )
+
+with tab_basic:
+    st.subheader("지도")
+
+    assignment_store = st.session_state["assignment_store"]
+    latest_group_assignment_df = st.session_state.get("latest_group_assignment_df", pd.DataFrame())
+    if len(latest_group_assignment_df) > 0:
+        assignment_store = render_group_driver_assignment_form(
+            route_summary=route_summary,
+            drivers=drivers,
+            assignment_store=assignment_store,
+            group_assignment_df=latest_group_assignment_df,
+            uploaded_filename=uploaded_filename,
+            base_date_str=base_date_str,
         )
 
-st.subheader("지도")
+    assignment_store = render_assignment_form(
+        route_summary,
+        drivers,
+        assignment_store,
+        uploaded_filename,
+        base_date_str,
+    )
+    st.session_state["assignment_store"] = assignment_store
 
-assignment_store = st.session_state["assignment_store"]
-latest_group_assignment_df = st.session_state.get("latest_group_assignment_df", pd.DataFrame())
-if len(latest_group_assignment_df) > 0:
-    assignment_store = render_group_driver_assignment_form(
-        route_summary=route_summary,
-        drivers=drivers,
-        assignment_store=assignment_store,
-        group_assignment_df=latest_group_assignment_df,
+    assignment_df = build_assignment_df(route_summary, assignment_store)
+
+    group_route_map = {}
+    if len(latest_group_assignment_df) > 0 and "route" in latest_group_assignment_df.columns and "추천그룹" in latest_group_assignment_df.columns:
+        group_route_map = dict(zip(latest_group_assignment_df["route"], latest_group_assignment_df["추천그룹"]))
+
+    st.subheader("기사별 필터")
+    driver_filter_options = ["전체", "미배정"] + drivers
+    selected_filter_index = driver_filter_options.index(restored_selected_filter) if restored_selected_filter in driver_filter_options else 0
+    selected_filter = st.selectbox("지도 표시 대상", driver_filter_options, index=selected_filter_index)
+
+    valid_result, valid_grouped, route_driver_map = build_map_data(
+        result_delivery=result_delivery,
+        grouped_delivery=grouped_delivery,
+        assignment_df=assignment_df,
+        selected_filter=selected_filter
     )
 
-assignment_store = render_assignment_form(route_summary, drivers, assignment_store)
-st.session_state["assignment_store"] = assignment_store
+    st.write(f"캐시 주소 수: {len(cache)}")
+    st.write(f"현재 필터: {selected_filter}")
+    st.caption("캠프는 고정핀(검정색), 배송지는 라우트/기사 상태에 따라 표시됩니다.")
 
-assignment_df = build_assignment_df(route_summary, assignment_store)
+    with st.spinner("지도 생성 중..."):
+        m = render_map(
+            valid_result=valid_result,
+            valid_grouped=valid_grouped,
+            route_prefix_map=route_prefix_map,
+            truck_request_map=truck_request_map,
+            route_line_label=route_line_label,
+            route_driver_map=route_driver_map,
+            route_camp_map=route_camp_map,
+            camp_coords=camp_coords,
+        )
 
-group_route_map = {}
-if len(latest_group_assignment_df) > 0 and "route" in latest_group_assignment_df.columns and "추천그룹" in latest_group_assignment_df.columns:
-    group_route_map = dict(zip(latest_group_assignment_df["route"], latest_group_assignment_df["추천그룹"]))
+    marker_count = len(valid_grouped)
+    st.write(f"지도에 찍힌 배송 핀 수: {marker_count}")
 
-st.subheader("기사별 필터")
-driver_filter_options = ["전체", "미배정"] + drivers
-selected_filter_index = driver_filter_options.index(restored_selected_filter) if restored_selected_filter in driver_filter_options else 0
-selected_filter = st.selectbox("지도 표시 대상", driver_filter_options, index=selected_filter_index)
+    st_folium(m, width=None, height=900)
 
-valid_result, valid_grouped, route_driver_map = build_map_data(
-    result_delivery=result_delivery,
-    grouped_delivery=grouped_delivery,
-    assignment_df=assignment_df,
-    selected_filter=selected_filter
-)
+    map_html = m.get_root().render()
 
-st.write(f"캐시 주소 수: {len(cache)}")
-st.write(f"현재 필터: {selected_filter}")
-st.caption("캠프는 고정핀(검정색), 배송지는 라우트/기사 상태에 따라 표시됩니다.")
+    map_path = os.path.join(MAP_DIR, html_filename)
+    with open(map_path, "w", encoding="utf-8") as f:
+        f.write(map_html)
 
-with st.spinner("지도 생성 중..."):
-    m = render_map(
-        valid_result=valid_result,
-        valid_grouped=valid_grouped,
+    st.download_button(
+        label=f"지도 다운로드 (HTML) - {html_filename}",
+        data=map_html,
+        file_name=html_filename,
+        mime="text/html"
+    )
+
+with tab_stats:
+    st.subheader("기사 할당표")
+    view_assignment_df = assignment_df.copy()
+    if group_route_map:
+        view_assignment_df["추천그룹"] = view_assignment_df["route"].map(group_route_map).fillna("")
+    if "총걸린분" in view_assignment_df.columns:
+        view_assignment_df = view_assignment_df.drop(columns=["총걸린분"])
+    st.dataframe(view_assignment_df, use_container_width=True)
+
+    assigned_summary = build_assigned_summary(assignment_df)
+
+    if len(assigned_summary) == 0:
+        st.info("아직 기사 배정이 없습니다.")
+        view_assigned_summary = pd.DataFrame()
+    else:
+        st.subheader("기사별 요약")
+        view_assigned_summary = assigned_summary.copy()
+        if "총걸린분" in view_assigned_summary.columns:
+            view_assigned_summary = view_assigned_summary.drop(columns=["총걸린분"])
+        st.dataframe(view_assigned_summary, use_container_width=True)
+
+    st.caption(f"배정 이력 저장 기준일: {base_date_str} (동일 날짜 재저장 시 덮어쓰기)")
+    if st.button("배정 이력 저장"):
+        saved_count = save_assignment_history_for_date(assignment_df, base_date_str)
+        if saved_count > 0:
+            st.session_state["send_assignment_completion_push"] = True
+            st.success(f"배정 이력을 저장했습니다. 기준일 {base_date_str}, {saved_count}건 저장 완료")
+        else:
+            st.warning(f"저장할 배정 데이터가 없어 {base_date_str} 이력은 0건으로 덮어쓰기되었습니다.")
+
+    history_df = load_assignment_history()
+    stats_df, recent_work_date_str = build_driver_assignment_stats_df(
+        assignment_df=assignment_df,
+        history_df=history_df,
+        driver_candidates=drivers,
+        base_date=base_date_str,
+    )
+    with st.expander("기사별 배정 통계 (최근 7일/30일)", expanded=False):
+        st.caption("오늘물량/최근근무일(1일) 물량/7일·30일 근무일평균은 assignment_history.csv 저장 이력 기준입니다.")
+        if recent_work_date_str:
+            st.caption(f"최근근무일(1일) 기준일: {recent_work_date_str}")
+        else:
+            st.caption("최근근무일(1일) 기준일: 없음")
+        if len(stats_df) == 0:
+            st.info("표시할 기사 통계가 없습니다.")
+        else:
+            st.dataframe(stats_df, use_container_width=True)
+
+    shared_result_delivery = result_delivery.copy()
+    shared_grouped_delivery = grouped_delivery.copy()
+    shared_result_delivery["assigned_driver"] = shared_result_delivery["route"].map(route_driver_map).fillna("")
+    shared_grouped_delivery["assigned_driver"] = shared_grouped_delivery["route"].map(route_driver_map).fillna("")
+    shared_result_delivery["추천그룹"] = shared_result_delivery["route"].map(group_route_map).fillna("")
+    shared_grouped_delivery["추천그룹"] = shared_grouped_delivery["route"].map(group_route_map).fillna("")
+
+    save_share_payload(
+        share_name,
+        map_html,
+        view_assignment_df,
+        view_assigned_summary,
+        result_delivery_df=shared_result_delivery,
+        grouped_delivery_df=shared_grouped_delivery,
         route_prefix_map=route_prefix_map,
         truck_request_map=truck_request_map,
         route_line_label=route_line_label,
-        route_driver_map=route_driver_map,
         route_camp_map=route_camp_map,
         camp_coords=camp_coords,
+        group_assignment_df=latest_group_assignment_df,
     )
 
-marker_count = len(valid_grouped)
-st.write(f"지도에 찍힌 배송 핀 수: {marker_count}")
+    backend_run_id = safe_int(st.session_state.get("backend_run_id", 0))
+    snapshot_payload = {
+        "map_html": map_html,
+        "assignment_rows": view_assignment_df.fillna("").to_dict(orient="records"),
+        "assigned_summary_rows": view_assigned_summary.fillna("").to_dict(orient="records") if len(view_assigned_summary) > 0 else [],
+        "result_delivery_rows": _df_to_records_for_json(shared_result_delivery),
+        "grouped_delivery_rows": _df_to_records_for_json(shared_grouped_delivery),
+        "route_prefix_map": route_prefix_map,
+        "truck_request_map": truck_request_map,
+        "route_line_label": route_line_label,
+        "route_camp_map": route_camp_map,
+        "camp_coords": camp_coords,
+        "selected_filter": selected_filter,
+        "recommended_group_map": st.session_state.get("recommended_group_map", {}),
+        "recommended_group_count": safe_int(st.session_state.get("recommended_group_count", 0)),
+        "selected_group_filter": st.session_state.get("selected_group_filter", "전체"),
+        "group_assignment_rows": latest_group_assignment_df.fillna("").to_dict(orient="records") if len(latest_group_assignment_df) > 0 else [],
+    }
+    snapshot_save_payload, snapshot_save_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="recent")
+    if snapshot_save_error:
+        st.caption(f"Django snapshot sync failed: {snapshot_save_error}")
+    elif snapshot_save_payload is not None:
+        st.caption(f"Django snapshot synced: {snapshot_save_payload.get('share_key', '')}")
 
-st_folium(m, width=None, height=900)
+    share_snapshot_payload, share_snapshot_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="share")
+    share_key = ""
+    if share_snapshot_payload is not None:
+        share_key = str(share_snapshot_payload.get("share_key", "")).strip()
+    share_url = build_backend_share_url(share_key) if share_key else f"{APP_URL}?map={share_name}"
 
-map_html = m.get_root().render()
-
-map_path = os.path.join(MAP_DIR, html_filename)
-with open(map_path, "w", encoding="utf-8") as f:
-    f.write(map_html)
-
-st.download_button(
-    label=f"지도 다운로드 (HTML) - {html_filename}",
-    data=map_html,
-    file_name=html_filename,
-    mime="text/html"
-)
-
-st.subheader("기사 할당표")
-view_assignment_df = assignment_df.copy()
-if group_route_map:
-    view_assignment_df["추천그룹"] = view_assignment_df["route"].map(group_route_map).fillna("")
-if "총걸린분" in view_assignment_df.columns:
-    view_assignment_df = view_assignment_df.drop(columns=["총걸린분"])
-st.dataframe(view_assignment_df, use_container_width=True)
-
-assigned_summary = build_assigned_summary(assignment_df)
-
-if len(assigned_summary) == 0:
-    st.info("아직 기사 배정이 없습니다.")
-    view_assigned_summary = pd.DataFrame()
-else:
-    st.subheader("기사별 요약")
-    view_assigned_summary = assigned_summary.copy()
-    if "총걸린분" in view_assigned_summary.columns:
-        view_assigned_summary = view_assigned_summary.drop(columns=["총걸린분"])
-    st.dataframe(view_assigned_summary, use_container_width=True)
-
-st.caption(f"배정 이력 저장 기준일: {base_date_str} (동일 날짜 재저장 시 덮어쓰기)")
-if st.button("배정 이력 저장"):
-    saved_count = save_assignment_history_for_date(assignment_df, base_date_str)
-    if saved_count > 0:
-        st.success(f"배정 이력을 저장했습니다. 기준일 {base_date_str}, {saved_count}건 저장 완료")
+    st.subheader("지도 공유 링크")
+    if share_snapshot_error:
+        st.warning(f"Django share page sync failed: {share_snapshot_error}")
     else:
-        st.warning(f"저장할 배정 데이터가 없어 {base_date_str} 이력은 0건으로 덮어쓰기되었습니다.")
+        st.success("아래 링크를 복사해서 바로 공유하시면 됩니다.")
+    st.markdown(f"### [🔗 지도 + 기사할당표 바로 열기]({share_url})")
+    st.text_input("공유 URL", value=share_url, key="share_url_box")
 
-history_df = load_assignment_history()
-stats_df, recent_work_date_str = build_driver_assignment_stats_df(
-    assignment_df=assignment_df,
-    history_df=history_df,
-    driver_candidates=drivers,
-    base_date=base_date_str,
-)
-with st.expander("기사별 배정 통계 (최근 7일/30일)", expanded=False):
-    st.caption("오늘물량/최근근무일(1일) 물량/7일·30일 근무일평균은 assignment_history.csv 저장 이력 기준입니다.")
-    if recent_work_date_str:
-        st.caption(f"최근근무일(1일) 기준일: {recent_work_date_str}")
-    else:
-        st.caption("최근근무일(1일) 기준일: 없음")
-    if len(stats_df) == 0:
-        st.info("표시할 기사 통계가 없습니다.")
-    else:
-        st.dataframe(stats_df, use_container_width=True)
+    total_box_total = 0
+    nasil_box_total = 0
+    external_box_total = 0
+    if len(shared_grouped_delivery) > 0:
+        assigned_box_rows = shared_grouped_delivery[
+            shared_grouped_delivery["assigned_driver"].fillna("").astype(str).str.strip() != ""
+        ].copy()
+        assigned_box_rows["assigned_driver"] = assigned_box_rows["assigned_driver"].fillna("").astype(str).str.strip()
+        assigned_box_rows["box_total"] = (
+            assigned_box_rows.get("ae_sum", pd.Series(dtype=float)).fillna(0)
+            + assigned_box_rows.get("af_sum", pd.Series(dtype=float)).fillna(0)
+            + assigned_box_rows.get("ag_sum", pd.Series(dtype=float)).fillna(0)
+        )
+        total_box_total = safe_int(assigned_box_rows["box_total"].sum())
+        nasil_driver_mask = (
+            assigned_box_rows["assigned_driver"].isin(["김태경", "김태균"])
+            | assigned_box_rows["assigned_driver"].str.contains("나실", na=False)
+        )
+        nasil_box_total = safe_int(assigned_box_rows.loc[nasil_driver_mask, "box_total"].sum())
+        external_box_total = safe_int(assigned_box_rows.loc[~nasil_driver_mask, "box_total"].sum())
 
-shared_result_delivery = result_delivery.copy()
-shared_grouped_delivery = grouped_delivery.copy()
-shared_result_delivery["assigned_driver"] = shared_result_delivery["route"].map(route_driver_map).fillna("")
-shared_grouped_delivery["assigned_driver"] = shared_grouped_delivery["route"].map(route_driver_map).fillna("")
-shared_result_delivery["추천그룹"] = shared_result_delivery["route"].map(group_route_map).fillna("")
-shared_grouped_delivery["추천그룹"] = shared_grouped_delivery["route"].map(group_route_map).fillna("")
+    telegram_summary_text = (
+        f"[배차 저장 완료]\n"
+        f"기준일: {base_date_str}\n"
+        f"총박스: {total_box_total}\n"
+        f"나실 할당: {nasil_box_total}\n"
+        f"기사 할당: {external_box_total}\n"
+        f"오늘 근무기사님 인원수: {safe_int(view_assignment_df['assigned_driver'].fillna('').astype(str).str.strip().replace('', pd.NA).dropna().nunique()) if len(view_assignment_df) > 0 and 'assigned_driver' in view_assignment_df.columns else 0}\n"
+        f"공유지도: {share_url}"
+    )
+    telegram_memo_text = build_driver_memo_report(shared_grouped_delivery)
 
-save_share_payload(
-    share_name,
-    map_html,
-    view_assignment_df,
-    view_assigned_summary,
-    result_delivery_df=shared_result_delivery,
-    grouped_delivery_df=shared_grouped_delivery,
-    route_prefix_map=route_prefix_map,
-    truck_request_map=truck_request_map,
-    route_line_label=route_line_label,
-    route_camp_map=route_camp_map,
-    camp_coords=camp_coords,
-    group_assignment_df=latest_group_assignment_df,
-)
-
-backend_run_id = safe_int(st.session_state.get("backend_run_id", 0))
-snapshot_payload = {
-    "map_html": map_html,
-    "assignment_rows": view_assignment_df.fillna("").to_dict(orient="records"),
-    "assigned_summary_rows": view_assigned_summary.fillna("").to_dict(orient="records") if len(view_assigned_summary) > 0 else [],
-    "result_delivery_rows": _df_to_records_for_json(shared_result_delivery),
-    "grouped_delivery_rows": _df_to_records_for_json(shared_grouped_delivery),
-    "route_prefix_map": route_prefix_map,
-    "truck_request_map": truck_request_map,
-    "route_line_label": route_line_label,
-    "route_camp_map": route_camp_map,
-    "camp_coords": camp_coords,
-    "selected_filter": selected_filter,
-    "recommended_group_map": st.session_state.get("recommended_group_map", {}),
-    "recommended_group_count": safe_int(st.session_state.get("recommended_group_count", 0)),
-    "selected_group_filter": st.session_state.get("selected_group_filter", "전체"),
-    "group_assignment_rows": latest_group_assignment_df.fillna("").to_dict(orient="records") if len(latest_group_assignment_df) > 0 else [],
-}
-snapshot_save_payload, snapshot_save_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="recent")
-if snapshot_save_error:
-    st.caption(f"Django snapshot sync failed: {snapshot_save_error}")
-elif snapshot_save_payload is not None:
-    st.caption(f"Django snapshot synced: {snapshot_save_payload.get('share_key', '')}")
-
-share_snapshot_payload, share_snapshot_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="share")
-share_key = ""
-if share_snapshot_payload is not None:
-    share_key = str(share_snapshot_payload.get("share_key", "")).strip()
-share_url = build_backend_share_url(share_key) if share_key else f"{APP_URL}?map={share_name}"
-
-st.subheader("지도 공유 링크")
-if share_snapshot_error:
-    st.warning(f"Django share page sync failed: {share_snapshot_error}")
-else:
-    st.success("아래 링크를 복사해서 바로 공유하시면 됩니다.")
-st.markdown(f"### [🔗 지도 + 기사할당표 바로 열기]({share_url})")
-st.text_input("공유 URL", value=share_url, key="share_url_box")
-
-telegram_summary_text = (
-    f"[배차 저장 완료]\n"
-    f"기준일: {base_date_str}\n"
-    f"전체 개수: {safe_int(len(view_assignment_df))}\n"
-    f"오늘 근무기사님 인원수: {safe_int(view_assignment_df['assigned_driver'].fillna('').astype(str).str.strip().replace('', pd.NA).dropna().nunique()) if len(view_assignment_df) > 0 and 'assigned_driver' in view_assignment_df.columns else 0}\n"
-    f"공유지도: {share_url}"
-)
-telegram_memo_text = build_driver_memo_report(shared_grouped_delivery)
-
-with st.expander("텔레그램 단체방 전송", expanded=False):
-    st.caption("대표님/배차 담당 확인용 단체방에 전체 요약과 기사별 업체 메모를 전송합니다.")
-    st.text_area("전송 메시지 1", value=telegram_summary_text, height=140, key="telegram_summary_preview")
-    st.text_area("전송 메시지 2", value=telegram_memo_text, height=260, key="telegram_memo_preview")
-    if not str(TELEGRAM_BOT_TOKEN).strip() or not str(TELEGRAM_CHAT_ID).strip():
-        st.warning("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 환경변수가 비어 있습니다.")
-    if st.button("텔레그램 단체방 전송", key="telegram_send_button"):
-        tg_resp_1, tg_err_1 = send_telegram_message(telegram_summary_text)
-        tg_resp_2, tg_err_2 = send_telegram_message(telegram_memo_text)
-        if tg_err_1 or tg_err_2:
-            st.warning(f"텔레그램 전송 실패: {tg_err_1 or tg_err_2}")
+    if st.session_state.get("send_assignment_completion_push"):
+        st.session_state.pop("send_assignment_completion_push", None)
+        sent_ok, sent_result = send_assignment_completion_notifications(telegram_summary_text, telegram_memo_text)
+        if sent_ok:
+            st.success("배정 이력 저장과 함께 텔레그램 푸시를 전송했습니다.")
         else:
-            st.success("텔레그램 단체방으로 전송했습니다.")
+            st.warning(f"배정 이력 저장은 완료됐지만 텔레그램 전송은 실패했습니다: {sent_result}")
 
-export_df = assignment_df.copy()
-if "truck_request_id" not in export_df.columns:
-    export_df["truck_request_id"] = ""
-if "assigned_driver" not in export_df.columns:
-    export_df["assigned_driver"] = ""
-export_df["truck_request_id"] = export_df["truck_request_id"].fillna("").astype(str).str.strip()
-export_df["assigned_driver"] = export_df["assigned_driver"].fillna("").astype(str).str.strip()
-export_df = export_df[["truck_request_id", "assigned_driver"]].copy()
-export_df = export_df.sort_values(
-    by="truck_request_id",
-    key=lambda s: s.map(_natural_desc_sort_key),
-    ascending=False,
-)
-export_df = export_df.rename(columns={"truck_request_id": "트럭요청ID", "assigned_driver": "이름"})
-csv_data = export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-st.download_button(
-    "기사 배정표 CSV 다운로드",
-    data=csv_data,
-    file_name="route_assignment.csv",
-    mime="text/csv"
-)
+    with st.expander("텔레그램 단체방 전송", expanded=False):
+        st.caption("대표님/배차 담당 확인용 단체방에 전체 요약과 기사별 업체 메모를 전송합니다.")
+        st.text_area("전송 메시지 1", value=telegram_summary_text, height=140, key="telegram_summary_preview")
+        st.text_area("전송 메시지 2", value=telegram_memo_text, height=260, key="telegram_memo_preview")
+        if not str(TELEGRAM_BOT_TOKEN).strip() or not str(TELEGRAM_CHAT_ID).strip():
+            st.warning("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 환경변수가 비어 있습니다.")
+        if st.button("텔레그램 단체방 전송", key="telegram_send_button"):
+            sent_ok, sent_result = send_assignment_completion_notifications(telegram_summary_text, telegram_memo_text)
+            if not sent_ok:
+                st.warning(f"텔레그램 전송 실패: {sent_result}")
+            else:
+                st.success("텔레그램 단체방으로 전송했습니다.")
+
+    export_df = assignment_df.copy()
+    if "truck_request_id" not in export_df.columns:
+        export_df["truck_request_id"] = ""
+    if "assigned_driver" not in export_df.columns:
+        export_df["assigned_driver"] = ""
+    export_df["truck_request_id"] = export_df["truck_request_id"].fillna("").astype(str).str.strip()
+    export_df["assigned_driver"] = export_df["assigned_driver"].fillna("").astype(str).str.strip()
+    export_df = export_df[["truck_request_id", "assigned_driver"]].copy()
+    export_df = export_df.sort_values(
+        by="truck_request_id",
+        key=lambda s: s.map(_natural_desc_sort_key),
+        ascending=False,
+    )
+    export_df = export_df.rename(columns={"truck_request_id": "트럭요청ID", "assigned_driver": "이름"})
+    csv_data = export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        "기사 배정표 CSV 다운로드",
+        data=csv_data,
+        file_name="route_assignment.csv",
+        mime="text/csv"
+    )
+
+with tab_report:
+    st.divider()
+    st.subheader("취소건 관리")
+    cancel_store = st.session_state.get("cancel_store", {})
+    cancel_df = build_cancel_management_df(
+        grouped_delivery=grouped_delivery,
+        route_driver_map=route_driver_map,
+        base_date=base_date_str,
+        cancel_store=cancel_store,
+    )
+
+    if len(cancel_df) == 0:
+        st.info("관리할 취소 대상이 없습니다.")
+    else:
+        cancel_only = st.checkbox("취소 입력된 행만 보기", value=False, key="cancel_only_filter")
+        visible_cancel_df = cancel_df.copy()
+        if cancel_only:
+            visible_cancel_df = visible_cancel_df[
+                (visible_cancel_df["취소건수"] > 0)
+                | (visible_cancel_df["취소수량"] > 0)
+                | (visible_cancel_df["취소사유"].astype(str).str.strip() != "")
+            ].copy()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("취소건수 합계", safe_int(visible_cancel_df["취소건수"].sum()) if len(visible_cancel_df) > 0 else 0)
+        c2.metric("취소수량 합계", safe_int(visible_cancel_df["취소수량"].sum()) if len(visible_cancel_df) > 0 else 0)
+        c3.metric(
+            "취소 route 수",
+            safe_int(visible_cancel_df.loc[visible_cancel_df["취소건수"] > 0, "route"].nunique()) if len(visible_cancel_df) > 0 else 0,
+        )
+
+        editor_df = visible_cancel_df[
+            [
+                c for c in [
+                    "assigned_driver", "origin_center", "milkrun_no", "route_prefix", "route", "truck_request_id",
+                    "house_order", "company_name", "address", "stop_count", "총수량", "취소건수", "취소수량",
+                    "정산제외", "취소사유",
+                ] if c in visible_cancel_df.columns
+            ]
+        ].copy()
+
+        with st.form(f"cancel_management_form_{base_date_str}", clear_on_submit=False):
+            edited_cancel_df = st.data_editor(
+                editor_df,
+                hide_index=True,
+                num_rows="fixed",
+                use_container_width=True,
+                disabled=[
+                    c for c in editor_df.columns
+                    if c not in {"취소건수", "취소수량", "정산제외", "취소사유"}
+                ],
+                key=f"cancel_editor_{base_date_str}",
+            )
+            save_cancel_clicked = st.form_submit_button("취소건 관리 저장")
+
+        if save_cancel_clicked:
+            updated_store = cancel_store.copy()
+            source_df = visible_cancel_df.reset_index(drop=True)
+            edited_df = edited_cancel_df.reset_index(drop=True)
+            for idx, row in edited_df.iterrows():
+                source_row = source_df.iloc[idx]
+                cancel_key = source_row.get("cancel_key", "")
+                cancel_count = max(0, safe_int(row.get("취소건수", 0)))
+                cancel_qty = max(0, safe_int(row.get("취소수량", 0)))
+                cancel_reason = str(row.get("취소사유", "")).strip()
+                settlement_excluded = bool(row.get("정산제외", False))
+                if cancel_count == 0 and settlement_excluded:
+                    cancel_count = max(1, safe_int(source_row.get("stop_count", 0)))
+                if cancel_key:
+                    if cancel_count > 0 or cancel_qty > 0 or cancel_reason:
+                        updated_store[cancel_key] = {
+                            "cancel_count": cancel_count,
+                            "cancel_qty": cancel_qty,
+                            "reason": cancel_reason,
+                        }
+                    else:
+                        updated_store.pop(cancel_key, None)
+            save_cancel_store(updated_store)
+            st.session_state["cancel_store"] = updated_store
+            st.success("취소건 관리 내용을 저장했습니다.")
+
+        with st.expander("취소 입력 요약", expanded=False):
+            saved_cancel_df = build_cancel_management_df(
+                grouped_delivery=grouped_delivery,
+                route_driver_map=route_driver_map,
+                base_date=base_date_str,
+                cancel_store=st.session_state.get("cancel_store", {}),
+            )
+            saved_cancel_df = saved_cancel_df[
+                (saved_cancel_df["취소건수"] > 0)
+                | (saved_cancel_df["취소수량"] > 0)
+                | (saved_cancel_df["취소사유"].astype(str).str.strip() != "")
+            ].copy()
+            if len(saved_cancel_df) == 0:
+                st.info("저장된 취소건이 없습니다.")
+            else:
+                summary_cols = [
+                    "assigned_driver", "origin_center", "milkrun_no", "route_prefix", "route", "company_name",
+                    "취소건수", "취소수량", "취소사유",
+                ]
+                st.dataframe(saved_cancel_df[[c for c in summary_cols if c in saved_cancel_df.columns]], use_container_width=True)

@@ -1,5 +1,12 @@
 __pycache__/
 *.py[cod]
+.venv/
+.streamlit/credentials.toml
+.streamlit/config.toml.bak
+.pycache_tmp/
+*.log
+public_streamlit*.log
+streamlit*.log
 
 .venv_django/
 .local_django/db.sqlite3
