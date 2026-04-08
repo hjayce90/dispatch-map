@@ -9,8 +9,9 @@ public_streamlit*.log
 streamlit*.log
 
 .venv_django/
-.local_django/db.sqlite3
-.local_django/**/__pycache__/
+BACKUP_local_django_8000/db.sqlite3
+BACKUP_local_django_8000/**/__pycache__/
+BACKUP_local_django_8000/**/.pytest_cache/
 
 PERSONAL.XLSB
 assignment_history.csv
