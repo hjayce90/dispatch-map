@@ -846,7 +846,12 @@ def build_driver_assignment_stats_df(
         })
 
     recent_date_str = common_recent_date.strftime("%Y-%m-%d") if not pd.isna(common_recent_date) else None
-    return pd.DataFrame(rows).sort_values(["기사명"]).reset_index(drop=True), recent_date_str
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["오늘물량", "기사명"], ascending=[False, True])
+        .reset_index(drop=True),
+        recent_date_str,
+    )
 
 
 def load_geocode_cache():
@@ -2957,6 +2962,16 @@ with tab_recommend:
         latest_assignment_df = build_group_assignment_df(route_feature_df, final_group_map)
         st.session_state["latest_group_assignment_df"] = latest_assignment_df.copy()
         group_detail_df = build_group_detail_stats_df(latest_assignment_df)
+        assignment_store = st.session_state.get("assignment_store", {})
+        assignment_store = render_group_driver_assignment_form(
+            route_summary=route_summary,
+            drivers=drivers,
+            assignment_store=assignment_store,
+            group_assignment_df=latest_assignment_df,
+            uploaded_filename=uploaded_filename,
+            base_date_str=base_date_str,
+        )
+        st.session_state["assignment_store"] = assignment_store
 
         st.subheader("추천그룹 지도")
         selectable_groups = ["전체"] + group_detail_df["추천그룹"].astype(str).tolist()
@@ -3013,27 +3028,20 @@ with tab_recommend:
             )
 
 with tab_basic:
-    st.subheader("지도")
+    summary_container = st.container()
+    map_container = st.container()
+    form_container = st.container()
 
     assignment_store = st.session_state["assignment_store"]
     latest_group_assignment_df = st.session_state.get("latest_group_assignment_df", pd.DataFrame())
-    if len(latest_group_assignment_df) > 0:
-        assignment_store = render_group_driver_assignment_form(
-            route_summary=route_summary,
-            drivers=drivers,
-            assignment_store=assignment_store,
-            group_assignment_df=latest_group_assignment_df,
-            uploaded_filename=uploaded_filename,
-            base_date_str=base_date_str,
+    with form_container:
+        assignment_store = render_assignment_form(
+            route_summary,
+            drivers,
+            assignment_store,
+            uploaded_filename,
+            base_date_str,
         )
-
-    assignment_store = render_assignment_form(
-        route_summary,
-        drivers,
-        assignment_store,
-        uploaded_filename,
-        base_date_str,
-    )
     st.session_state["assignment_store"] = assignment_store
 
     assignment_df = build_assignment_df(route_summary, assignment_store)
@@ -3042,81 +3050,75 @@ with tab_basic:
     if len(latest_group_assignment_df) > 0 and "route" in latest_group_assignment_df.columns and "추천그룹" in latest_group_assignment_df.columns:
         group_route_map = dict(zip(latest_group_assignment_df["route"], latest_group_assignment_df["추천그룹"]))
 
-    st.subheader("기사별 필터")
-    driver_filter_options = ["전체", "미배정"] + drivers
-    selected_filter_index = driver_filter_options.index(restored_selected_filter) if restored_selected_filter in driver_filter_options else 0
-    selected_filter = st.selectbox("지도 표시 대상", driver_filter_options, index=selected_filter_index)
+    assigned_summary = build_assigned_summary(assignment_df)
+    if len(assigned_summary) == 0:
+        view_assigned_summary = pd.DataFrame()
+    else:
+        view_assigned_summary = assigned_summary.copy()
+        if "총걸린분" in view_assigned_summary.columns:
+            view_assigned_summary = view_assigned_summary.drop(columns=["총걸린분"])
 
-    valid_result, valid_grouped, route_driver_map = build_map_data(
-        result_delivery=result_delivery,
-        grouped_delivery=grouped_delivery,
-        assignment_df=assignment_df,
-        selected_filter=selected_filter
-    )
+    with summary_container:
+        st.subheader("기사별 요약")
+        if len(view_assigned_summary) == 0:
+            st.info("아직 기사 배정이 없습니다.")
+        else:
+            st.dataframe(view_assigned_summary, use_container_width=True)
 
-    st.write(f"캐시 주소 수: {len(cache)}")
-    st.write(f"현재 필터: {selected_filter}")
-    st.caption("캠프는 고정핀(검정색), 배송지는 라우트/기사 상태에 따라 표시됩니다.")
+    with map_container:
+        st.subheader("지도")
+        st.subheader("기사별 필터")
+        driver_filter_options = ["전체", "미배정"] + drivers
+        selected_filter_index = driver_filter_options.index(restored_selected_filter) if restored_selected_filter in driver_filter_options else 0
+        selected_filter = st.selectbox("지도 표시 대상", driver_filter_options, index=selected_filter_index)
 
-    with st.spinner("지도 생성 중..."):
-        m = render_map(
-            valid_result=valid_result,
-            valid_grouped=valid_grouped,
-            route_prefix_map=route_prefix_map,
-            truck_request_map=truck_request_map,
-            route_line_label=route_line_label,
-            route_driver_map=route_driver_map,
-            route_camp_map=route_camp_map,
-            camp_coords=camp_coords,
+        valid_result, valid_grouped, route_driver_map = build_map_data(
+            result_delivery=result_delivery,
+            grouped_delivery=grouped_delivery,
+            assignment_df=assignment_df,
+            selected_filter=selected_filter
         )
 
-    marker_count = len(valid_grouped)
-    st.write(f"지도에 찍힌 배송 핀 수: {marker_count}")
+        st.write(f"캐시 주소 수: {len(cache)}")
+        st.write(f"현재 필터: {selected_filter}")
+        st.caption("캠프는 고정핀(검정색), 배송지는 라우트/기사 상태에 따라 표시됩니다.")
 
-    st_folium(m, width=None, height=900)
+        with st.spinner("지도 생성 중..."):
+            m = render_map(
+                valid_result=valid_result,
+                valid_grouped=valid_grouped,
+                route_prefix_map=route_prefix_map,
+                truck_request_map=truck_request_map,
+                route_line_label=route_line_label,
+                route_driver_map=route_driver_map,
+                route_camp_map=route_camp_map,
+                camp_coords=camp_coords,
+            )
 
-    map_html = m.get_root().render()
+        marker_count = len(valid_grouped)
+        st.write(f"지도에 찍힌 배송 핀 수: {marker_count}")
 
-    map_path = os.path.join(MAP_DIR, html_filename)
-    with open(map_path, "w", encoding="utf-8") as f:
-        f.write(map_html)
+        st_folium(m, width=None, height=900)
 
-    st.download_button(
-        label=f"지도 다운로드 (HTML) - {html_filename}",
-        data=map_html,
-        file_name=html_filename,
-        mime="text/html"
-    )
+        map_html = m.get_root().render()
+
+        map_path = os.path.join(MAP_DIR, html_filename)
+        with open(map_path, "w", encoding="utf-8") as f:
+            f.write(map_html)
+
+        st.download_button(
+            label=f"지도 다운로드 (HTML) - {html_filename}",
+            data=map_html,
+            file_name=html_filename,
+            mime="text/html"
+        )
 
 with tab_stats:
-    st.subheader("기사 할당표")
     view_assignment_df = assignment_df.copy()
     if group_route_map:
         view_assignment_df["추천그룹"] = view_assignment_df["route"].map(group_route_map).fillna("")
     if "총걸린분" in view_assignment_df.columns:
         view_assignment_df = view_assignment_df.drop(columns=["총걸린분"])
-    st.dataframe(view_assignment_df, use_container_width=True)
-
-    assigned_summary = build_assigned_summary(assignment_df)
-
-    if len(assigned_summary) == 0:
-        st.info("아직 기사 배정이 없습니다.")
-        view_assigned_summary = pd.DataFrame()
-    else:
-        st.subheader("기사별 요약")
-        view_assigned_summary = assigned_summary.copy()
-        if "총걸린분" in view_assigned_summary.columns:
-            view_assigned_summary = view_assigned_summary.drop(columns=["총걸린분"])
-        st.dataframe(view_assigned_summary, use_container_width=True)
-
-    st.caption(f"배정 이력 저장 기준일: {base_date_str} (동일 날짜 재저장 시 덮어쓰기)")
-    if st.button("배정 이력 저장"):
-        saved_count = save_assignment_history_for_date(assignment_df, base_date_str)
-        if saved_count > 0:
-            st.session_state["send_assignment_completion_push"] = True
-            st.success(f"배정 이력을 저장했습니다. 기준일 {base_date_str}, {saved_count}건 저장 완료")
-        else:
-            st.warning(f"저장할 배정 데이터가 없어 {base_date_str} 이력은 0건으로 덮어쓰기되었습니다.")
 
     history_df = load_assignment_history()
     stats_df, recent_work_date_str = build_driver_assignment_stats_df(
@@ -3125,7 +3127,9 @@ with tab_stats:
         driver_candidates=drivers,
         base_date=base_date_str,
     )
-    with st.expander("기사별 배정 통계 (최근 7일/30일)", expanded=False):
+
+    st.subheader("기사별 배정 통계")
+    with st.expander("기사별 배정 통계 (최근 7일/30일)", expanded=True):
         st.caption("오늘물량/최근근무일(1일) 물량/7일·30일 근무일평균은 assignment_history.csv 저장 이력 기준입니다.")
         if recent_work_date_str:
             st.caption(f"최근근무일(1일) 기준일: {recent_work_date_str}")
@@ -3135,6 +3139,15 @@ with tab_stats:
             st.info("표시할 기사 통계가 없습니다.")
         else:
             st.dataframe(stats_df, use_container_width=True)
+
+    st.caption(f"배정 이력 저장 기준일: {base_date_str} (동일 날짜 재저장 시 덮어쓰기)")
+    if st.button("배정 이력 저장"):
+        saved_count = save_assignment_history_for_date(assignment_df, base_date_str)
+        if saved_count > 0:
+            st.session_state["send_assignment_completion_push"] = True
+            st.success(f"배정 이력을 저장했습니다. 기준일 {base_date_str}, {saved_count}건 저장 완료")
+        else:
+            st.warning(f"저장할 배정 데이터가 없어 {base_date_str} 이력은 0건으로 덮어쓰기되었습니다.")
 
     shared_result_delivery = result_delivery.copy()
     shared_grouped_delivery = grouped_delivery.copy()
@@ -3183,14 +3196,17 @@ with tab_stats:
         st.caption(f"Django snapshot synced: {snapshot_save_payload.get('share_key', '')}")
 
     share_snapshot_payload, share_snapshot_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="share")
-    share_key = ""
+    share_key = f"run-{backend_run_id}-share" if backend_run_id > 0 else ""
     if share_snapshot_payload is not None:
-        share_key = str(share_snapshot_payload.get("share_key", "")).strip()
+        share_key = str(share_snapshot_payload.get("share_key", "")).strip() or share_key
     share_url = build_backend_share_url(share_key) if share_key else f"{APP_URL}?map={share_name}"
 
     st.subheader("지도 공유 링크")
     if share_snapshot_error:
-        st.warning(f"Django share page sync failed: {share_snapshot_error}")
+        if share_key:
+            st.info(f"Django share page sync skipped existing share snapshot: {share_snapshot_error}")
+        else:
+            st.warning(f"Django share page sync failed: {share_snapshot_error}")
     else:
         st.success("아래 링크를 복사해서 바로 공유하시면 됩니다.")
     st.markdown(f"### [🔗 지도 + 기사할당표 바로 열기]({share_url})")
