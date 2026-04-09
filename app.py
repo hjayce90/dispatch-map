@@ -41,6 +41,13 @@ from services.recommendation_helpers import (
     build_recommendation_route_feature_df,
     run_route_group_recommendation,
 )
+from services.report_xlsx import (
+    TEMPLATE_REPORT_XLSX,
+    build_report_export_df,
+    build_report_export_filename,
+    build_report_export_payload,
+    make_report_xlsx_bytes,
+)
 from services.shared_report import (
     build_camp_driver_summary_df,
     build_driver_overview_df,
@@ -2991,6 +2998,29 @@ with tab_report:
             "취소 route 수",
             safe_int(visible_cancel_df.loc[visible_cancel_df["취소건수"] > 0, "route"].nunique()) if len(visible_cancel_df) > 0 else 0,
         )
+
+        report_export_df = build_report_export_df(cancel_df)
+
+        if not TEMPLATE_REPORT_XLSX.exists():
+            st.info("\ud15c\ud50c\ub9bf \ud30c\uc77c\uc774 \ud544\uc694\ud569\ub2c8\ub2e4.")
+        else:
+            try:
+                report_export_payload = build_report_export_payload(
+                    grouped_delivery=grouped_delivery,
+                    report_export_df=report_export_df,
+                    base_date_str=base_date_str,
+                )
+                report_xlsx_bytes = make_report_xlsx_bytes(report_export_payload)
+            except Exception as exc:
+                st.error(f"\uc5d1\uc140 \ubcf4\uace0\uc11c \uc0dd\uc131 \uc911 \uc624\ub958\uac00 \ubc1c\uc0dd\ud588\uc2b5\ub2c8\ub2e4: {exc}")
+            else:
+                st.download_button(
+                    label="\uc5d1\uc140 \ubcf4\uace0\uc11c \ub2e4\uc6b4\ub85c\ub4dc",
+                    data=report_xlsx_bytes,
+                    file_name=build_report_export_filename(base_date_str),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"report_xlsx_download_{base_date_str}",
+                )
 
         editor_df = visible_cancel_df[
             [
