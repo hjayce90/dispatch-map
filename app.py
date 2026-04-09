@@ -27,6 +27,13 @@ from auto_grouping import (
     recommend_route_groups,
     resolve_group_count,
 )
+from services.report_xlsx import (
+    TEMPLATE_REPORT_XLSX,
+    build_report_export_df,
+    build_report_export_filename,
+    build_report_export_payload,
+    make_report_xlsx_bytes,
+)
 
 st.set_page_config(page_title="배차 지도", layout="wide")
 st.title("배차 지도")
@@ -3317,6 +3324,29 @@ with tab_report:
             "취소 route 수",
             safe_int(visible_cancel_df.loc[visible_cancel_df["취소건수"] > 0, "route"].nunique()) if len(visible_cancel_df) > 0 else 0,
         )
+
+        report_export_df = build_report_export_df(cancel_df)
+
+        if not TEMPLATE_REPORT_XLSX.exists():
+            st.info("템플릿 파일이 필요합니다.")
+        else:
+            try:
+                report_export_payload = build_report_export_payload(
+                    grouped_delivery=grouped_delivery,
+                    report_export_df=report_export_df,
+                    base_date_str=base_date_str,
+                )
+                report_xlsx_bytes = make_report_xlsx_bytes(report_export_payload)
+            except Exception as exc:
+                st.error(f"엑셀 보고서 생성 중 오류가 발생했습니다: {exc}")
+            else:
+                st.download_button(
+                    label="엑셀 보고서 다운로드",
+                    data=report_xlsx_bytes,
+                    file_name=build_report_export_filename(base_date_str),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"report_xlsx_download_{base_date_str}",
+                )
 
         editor_df = visible_cancel_df[
             [
