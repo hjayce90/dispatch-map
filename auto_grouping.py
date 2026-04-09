@@ -651,15 +651,36 @@ def _inverse_minmax(series: pd.Series) -> pd.Series:
     return 1.0 - ((s - s_min) / (s_max - s_min))
 
 
+DRIVER_PREFERENCE_COLUMNS = [
+    "추천그룹",
+    "라우트수",
+    "총합",
+    "스톱수",
+    "보정걸린분",
+    "route_spread_km",
+    "선호예상점수",
+    "선호예상순위",
+    "선호이유",
+]
+
+
+def empty_driver_preference_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=DRIVER_PREFERENCE_COLUMNS)
+
+
 def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[str, str]) -> pd.DataFrame:
     if len(route_feature_df) == 0:
-        return pd.DataFrame()
+        return empty_driver_preference_df()
 
     out = route_feature_df.copy()
+    for col in ["총합", "스톱수", "보정걸린분", "route_spread_km"]:
+        if col not in out.columns:
+            out[col] = 0
+
     out["추천그룹"] = out["route"].map(group_map).fillna("")
     out = out[out["추천그룹"].astype(str).str.strip() != ""].copy()
     if len(out) == 0:
-        return pd.DataFrame()
+        return empty_driver_preference_df()
 
     grouped = (
         out.groupby("추천그룹", as_index=False)
@@ -709,15 +730,7 @@ def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[s
     grouped["선호이유"] = reason_rows
 
     return grouped[[
-        "추천그룹",
-        "라우트수",
-        "총합",
-        "스톱수",
-        "보정걸린분",
-        "route_spread_km",
-        "선호예상점수",
-        "선호예상순위",
-        "선호이유",
+        *DRIVER_PREFERENCE_COLUMNS,
     ]].sort_values(["선호예상순위", "추천그룹"]).reset_index(drop=True)
 
 

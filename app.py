@@ -16,16 +16,34 @@ from streamlit_folium import st_folium
 
 from auto_grouping import (
     apply_group_edit_map,
-    build_group_assignment_df,
     build_group_map_data,
-    build_group_summary_df,
     build_group_detail_stats_df,
-    build_driver_preference_df,
-    build_route_feature_df,
-    choose_auto_group_count,
     default_group_edit_map,
-    recommend_route_groups,
-    resolve_group_count,
+)
+from services.assignment_history import (
+    infer_assignment_base_date,
+    load_assignment_history,
+    save_assignment_history_for_date,
+)
+from services.driver_stats import build_driver_assignment_stats_df
+from services.export_helpers import (
+    build_assignment_export_csv_data,
+    build_shared_delivery_frames,
+    build_snapshot_payload,
+    load_share_payload,
+    records_to_df_with_coords,
+    save_share_payload,
+)
+from services.recommendation_helpers import (
+    build_auto_group_count_preview,
+    build_driver_preference_table,
+    build_group_recommendation_tables,
+    build_recommendation_route_feature_df,
+    run_route_group_recommendation,
+)
+from services.shared_report import (
+    build_camp_driver_summary_df,
+    build_driver_overview_df,
 )
 
 st.set_page_config(page_title="배차 지도", layout="wide")
@@ -39,7 +57,6 @@ KAKAO_API_KEY = os.getenv("KAKAO_API_KEY", "080375c5f09bbb8c7db9f368bc752d33")
 TIME_COL_INDEX = 21   # V열
 CACHE_FILE = "geocode_cache.csv"
 DRIVER_FILE = "drivers.csv"
-ASSIGNMENT_HISTORY_FILE = "assignment_history.csv"
 MAP_DIR = "saved_maps"
 SHARE_DIR = "shared_payloads"
 ASSIGNMENT_FILE = "route_assignments.json"
@@ -178,6 +195,48 @@ def _dispatch_api_url(path: str) -> str:
     return f"{base}/{tail}"
 
 
+def _clean_text_value(value) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    text = str(value or "").strip()
+    if text.lower() in {"nan", "none", "null"}:
+        return ""
+    return text
+
+
+def _response_body_preview(response) -> str:
+    if response is None:
+        return ""
+
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            preview_payload = {k: payload.get(k) for k in list(payload.keys())[:10]}
+            return json.dumps(preview_payload, ensure_ascii=False)[:500]
+        return str(payload)[:500]
+    except Exception:
+        return str(getattr(response, "text", "") or "")[:500]
+
+
+def _payload_keys_preview(payload: dict) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    return [str(key) for key in list(payload.keys())[:20]]
+
+
+def _route_row_keys_preview(route_rows) -> list[str]:
+    if not isinstance(route_rows, list) or not route_rows:
+        return []
+    first_row = route_rows[0]
+    if not isinstance(first_row, dict):
+        return []
+    return [str(key) for key in list(first_row.keys())[:20]]
+
+
 def _dispatch_api_get(path: str):
     try:
         response = REQUESTS_SESSION.get(_dispatch_api_url(path), timeout=DJANGO_API_READ_TIMEOUT)
@@ -188,6 +247,7 @@ def _dispatch_api_get(path: str):
 
 
 def _dispatch_api_post(path: str, payload: dict):
+    payload_keys = _payload_keys_preview(payload)
     try:
         response = REQUESTS_SESSION.post(
             _dispatch_api_url(path),
@@ -196,7 +256,19 @@ def _dispatch_api_post(path: str, payload: dict):
         )
         response.raise_for_status()
         return response.json(), None
+    except requests.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        body_preview = _response_body_preview(response)
+        logger.warning(
+            "[dispatch_api_post] path=%s payload_keys=%s status=%s body=%s",
+            path,
+            payload_keys,
+            getattr(response, "status_code", ""),
+            body_preview,
+        )
+        return None, f"{exc} | payload_keys={payload_keys} | body={body_preview}"
     except Exception as exc:
+        logger.warning("[dispatch_api_post] path=%s payload_keys=%s error=%s", path, payload_keys, exc)
         return None, str(exc)
 
 
@@ -289,36 +361,69 @@ def _build_backend_route_rows(route_summary: pd.DataFrame):
     if len(route_summary) == 0:
         return rows
 
+    skipped_rows = []
     for _, row in route_summary.iterrows():
         row_values = row.tolist()
+        route_value = _clean_text_value(row.get("route", row.get("route_code", "")))
+        truck_request_id = _clean_text_value(row.get("truck_request_id", ""))
+
+        if not route_value or is_header_like_route_values(route_value, truck_request_id):
+            skipped_rows.append({
+                "route": route_value,
+                "truck_request_id": truck_request_id,
+            })
+            continue
+
         rows.append({
-            "route": str(row.get("route", "")).strip(),
-            "route_prefix": str(row.get("route_prefix", "")).strip(),
-            "truck_request_id": str(row.get("truck_request_id", "")).strip(),
-            "camp_name": str(row.get("camp_name", "")).strip(),
-            "camp_code": str(row.get("camp_code", "")).strip(),
+            "route": route_value,
+            "route_prefix": _clean_text_value(row.get("route_prefix", "")),
+            "truck_request_id": truck_request_id,
+            "camp_name": _clean_text_value(row.get("camp_name", "")),
+            "camp_code": _clean_text_value(row.get("camp_code", "")),
             "start_min": safe_int(row.get("start_min", 0)),
-            "end_min": safe_int(row.get("end_max", 0)),
-            "stop_count": safe_int(row.get("stop_count", row_values[6] if len(row_values) > 6 else 0)),
-            "small_qty": safe_int(row.get("small_qty", row_values[2] if len(row_values) > 2 else 0)),
-            "medium_qty": safe_int(row.get("medium_qty", row_values[3] if len(row_values) > 3 else 0)),
-            "large_qty": safe_int(row.get("large_qty", row_values[4] if len(row_values) > 4 else 0)),
-            "total_qty": safe_int(row.get("total_qty", row_values[5] if len(row_values) > 5 else 0)),
-            "work_minutes": safe_int(row.get("work_minutes", row_values[14] if len(row_values) > 14 else 0)),
+            "end_min": safe_int(row.get("end_min", row.get("end_max", 0))),
+            "stop_count": safe_int(row.get("stop_count", row.get("스톱수", row_values[6] if len(row_values) > 6 else 0))),
+            "small_qty": safe_int(row.get("small_qty", row.get("소형합", row_values[2] if len(row_values) > 2 else 0))),
+            "medium_qty": safe_int(row.get("medium_qty", row.get("중형합", row_values[3] if len(row_values) > 3 else 0))),
+            "large_qty": safe_int(row.get("large_qty", row.get("대형합", row_values[4] if len(row_values) > 4 else 0))),
+            "total_qty": safe_int(row.get("total_qty", row.get("총합", row_values[5] if len(row_values) > 5 else 0))),
+            "work_minutes": safe_int(row.get("work_minutes", row.get("총걸린분", row_values[14] if len(row_values) > 14 else 0))),
         })
+
+    if skipped_rows:
+        logger.warning(
+            "[sync_assignment_run_to_backend] skipped invalid route rows count=%s sample=%s",
+            len(skipped_rows),
+            skipped_rows[:3],
+        )
     return rows
 
 
 def sync_assignment_run_to_backend(uploaded_filename: str, base_date: str, route_summary: pd.DataFrame):
+    route_rows = _build_backend_route_rows(route_summary)
+    if len(route_rows) == 0:
+        logger.warning(
+            "[sync_assignment_run_to_backend] no valid route rows source_filename=%s input_rows=%s",
+            uploaded_filename,
+            safe_int(len(route_summary)),
+        )
+        return None, "no valid route rows for backend sync"
+
     payload = {
-        "source_date": str(base_date),
-        "source_filename": str(uploaded_filename),
+        "source_date": _clean_text_value(base_date),
+        "source_filename": _clean_text_value(uploaded_filename),
         "run_name": f"{base_date} {extract_base_name(uploaded_filename)}",
         "raw_meta": {
-            "route_count": safe_int(len(route_summary)),
+            "route_count": safe_int(len(route_rows)),
         },
-        "routes": _build_backend_route_rows(route_summary),
+        "routes": route_rows,
     }
+    logger.info(
+        "[sync_assignment_run_to_backend] payload_keys=%s route_count=%s route_row_keys=%s",
+        _payload_keys_preview(payload),
+        safe_int(len(route_rows)),
+        _route_row_keys_preview(route_rows),
+    )
     return _dispatch_api_post("assignment-runs/sync/", payload)
 
 
@@ -329,12 +434,17 @@ def sync_assignments_to_backend(run_id, assignment_df: pd.DataFrame):
     assignments = []
     for _, row in assignment_df.iterrows():
         assignments.append({
-            "route": str(row.get("route", "")).strip(),
-            "truck_request_id": str(row.get("truck_request_id", "")).strip(),
-            "driver_name": str(row.get("assigned_driver", "")).strip(),
+            "route": _clean_text_value(row.get("route", "")),
+            "truck_request_id": _clean_text_value(row.get("truck_request_id", "")),
+            "driver_name": _clean_text_value(row.get("assigned_driver", "")),
             "assignment_source": "manual",
         })
 
+    logger.info(
+        "[sync_assignments_to_backend] payload_keys=%s assignment_count=%s",
+        ["assignments"],
+        safe_int(len(assignments)),
+    )
     return _dispatch_api_post(
         f"assignment-runs/{safe_int(run_id)}/assignments/sync/",
         {"assignments": assignments},
@@ -424,6 +534,11 @@ def sync_run_snapshot_to_backend(run_id, payload: dict, snapshot_kind: str = "re
     if safe_int(run_id) <= 0:
         return None, "missing backend run id"
 
+    logger.info(
+        "[sync_run_snapshot_to_backend] snapshot_kind=%s payload_keys=%s",
+        snapshot_kind,
+        _payload_keys_preview(payload),
+    )
     return _dispatch_api_post(
         f"assignment-runs/{safe_int(run_id)}/snapshot/",
         {
@@ -651,209 +766,6 @@ def apply_assignment_rows_to_store(assignment_rows, assignment_store: dict):
     return updated_store
 
 
-def ensure_assignment_history_file():
-    # 이력 파일이 없거나 비어있으면 기본 헤더로 생성
-    required_cols = [
-        "date", "driver", "route", "truck_request_id",
-        "small", "medium", "large", "total_qty",
-        "route_count", "saved_at",
-    ]
-    if not os.path.exists(ASSIGNMENT_HISTORY_FILE):
-        pd.DataFrame(columns=required_cols).to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
-        return
-
-    try:
-        df = pd.read_csv(ASSIGNMENT_HISTORY_FILE)
-        if len(df.columns) == 0:
-            pd.DataFrame(columns=required_cols).to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
-    except Exception:
-        pd.DataFrame(columns=required_cols).to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
-
-
-def infer_assignment_base_date(uploaded_filename: str, route_summary: pd.DataFrame) -> str:
-    # 1순위: route_summary에 날짜성 컬럼이 있으면 사용
-    try:
-        date_like_cols = [c for c in route_summary.columns if "date" in str(c).lower() or "날짜" in str(c)]
-        for col in date_like_cols:
-            parsed = pd.to_datetime(route_summary[col], errors="coerce")
-            parsed = parsed.dropna()
-            if len(parsed) > 0:
-                return parsed.iloc[0].strftime("%Y-%m-%d")
-    except Exception:
-        pass
-
-    # 2순위: 업로드 파일명에서 YYYY-MM-DD / YYYYMMDD 추출
-    file_text = str(uploaded_filename or "")
-    m1 = re.search(r"(20\d{2})[-_./]?(0[1-9]|1[0-2])[-_./]?(0[1-9]|[12]\d|3[01])", file_text)
-    if m1:
-        yyyy, mm, dd = m1.group(1), m1.group(2), m1.group(3)
-        return f"{yyyy}-{mm}-{dd}"
-
-    # 3순위: 오늘
-    return pd.Timestamp.now().strftime("%Y-%m-%d")
-
-
-def _empty_assignment_history_df():
-    return pd.DataFrame(columns=[
-        "date", "driver", "route", "truck_request_id",
-        "small", "medium", "large", "total_qty",
-        "route_count", "saved_at",
-    ])
-
-
-def load_assignment_history():
-    ensure_assignment_history_file()
-    required_cols = _empty_assignment_history_df().columns.tolist()
-    try:
-        hist = pd.read_csv(ASSIGNMENT_HISTORY_FILE)
-    except Exception:
-        return _empty_assignment_history_df()
-
-    if len(hist) == 0:
-        return _empty_assignment_history_df()
-
-    for col in required_cols:
-        if col not in hist.columns:
-            hist[col] = 0 if col in {"small", "medium", "large", "total_qty", "route_count"} else ""
-
-    hist["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    hist = hist[hist["date"].notna()].copy()
-    hist["driver"] = hist["driver"].fillna("").astype(str).str.strip()
-    hist = hist[hist["driver"] != ""].copy()
-    return hist[required_cols].copy()
-
-
-def save_assignment_history_for_date(assignment_df: pd.DataFrame, base_date: str):
-    ensure_assignment_history_file()
-    hist = load_assignment_history()
-
-    work_df = assignment_df.copy()
-    for col in ["assigned_driver", "route", "truck_request_id", "소형합", "중형합", "대형합", "총합"]:
-        if col not in work_df.columns:
-            work_df[col] = ""
-
-    work_df["assigned_driver"] = work_df["assigned_driver"].fillna("").astype(str).str.strip()
-    # 미배정/공백 기사 제외
-    work_df = work_df[
-        (work_df["assigned_driver"] != "")
-        & (work_df["assigned_driver"] != "미배정")
-    ].copy()
-
-    # 같은 날짜는 덮어쓰기 저장
-    hist = hist[hist["date"] != base_date].copy()
-
-    if len(work_df) == 0:
-        hist.to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
-        return 0
-
-    now_ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_rows = pd.DataFrame({
-        "date": base_date,
-        "driver": work_df["assigned_driver"].astype(str),
-        "route": work_df["route"].astype(str),
-        "truck_request_id": work_df["truck_request_id"].astype(str),
-        "small": pd.to_numeric(work_df["소형합"], errors="coerce").fillna(0).astype(int),
-        "medium": pd.to_numeric(work_df["중형합"], errors="coerce").fillna(0).astype(int),
-        "large": pd.to_numeric(work_df["대형합"], errors="coerce").fillna(0).astype(int),
-        # 기존 총합 로직 재사용
-        "total_qty": pd.to_numeric(work_df["총합"], errors="coerce").fillna(0).astype(int),
-        "route_count": 1,
-        "saved_at": now_ts,
-    })
-
-    merged = pd.concat([hist, save_rows], ignore_index=True)
-    merged.to_csv(ASSIGNMENT_HISTORY_FILE, index=False, encoding="utf-8-sig")
-    return len(save_rows)
-
-
-def build_driver_assignment_stats_df(
-    assignment_df: pd.DataFrame,
-    history_df: pd.DataFrame,
-    driver_candidates,
-    base_date: str,
-):
-    driver_set = {str(d).strip() for d in (driver_candidates or []) if str(d).strip()}
-
-    if len(assignment_df) > 0 and "assigned_driver" in assignment_df.columns:
-        current_drivers = assignment_df["assigned_driver"].fillna("").astype(str).str.strip().tolist()
-        driver_set.update([d for d in current_drivers if d and d != "미배정"])
-
-    if len(history_df) > 0 and "driver" in history_df.columns:
-        hist_drivers = history_df["driver"].fillna("").astype(str).str.strip().tolist()
-        driver_set.update([d for d in hist_drivers if d])
-
-    drivers = sorted(driver_set)
-    if len(drivers) == 0:
-        return pd.DataFrame(columns=[
-            "기사명", "오늘물량", "최근근무일(1일) 물량", "7일 근무일평균", "30일 근무일평균",
-        ]), None
-
-    hist = history_df.copy()
-    if len(hist) == 0:
-        hist = _empty_assignment_history_df()
-
-    hist["date_dt"] = pd.to_datetime(hist["date"], errors="coerce").dt.normalize()
-    hist = hist[hist["date_dt"].notna()].copy()
-    hist["driver"] = hist["driver"].fillna("").astype(str).str.strip()
-    hist = hist[hist["driver"] != ""].copy()
-    hist["total_qty"] = pd.to_numeric(hist["total_qty"], errors="coerce").fillna(0)
-
-    base_dt = pd.to_datetime(base_date, errors="coerce")
-    if pd.isna(base_dt):
-        base_dt = pd.Timestamp.now().normalize()
-    else:
-        base_dt = base_dt.normalize()
-
-    today_hist = hist[hist["date_dt"] == base_dt].copy()
-    today_qty_map = today_hist.groupby("driver")["total_qty"].sum().to_dict() if len(today_hist) > 0 else {}
-
-    hist_before_today = hist[hist["date_dt"] < base_dt].copy()
-    common_recent_date = hist_before_today["date_dt"].max() if len(hist_before_today) > 0 else pd.NaT
-    recent_qty_map = {}
-    if not pd.isna(common_recent_date):
-        recent_day_hist = hist_before_today[hist_before_today["date_dt"] == common_recent_date].copy()
-        recent_qty_map = recent_day_hist.groupby("driver")["total_qty"].sum().to_dict()
-
-    def workday_avg_qty(df, start_dt, end_dt):
-        period = df[(df["date_dt"] >= start_dt) & (df["date_dt"] <= end_dt)].copy()
-        if len(period) == 0:
-            return {}, {}
-        qty_sum = period.groupby("driver")["total_qty"].sum().to_dict()
-        work_days = period.groupby("driver")["date_dt"].nunique().to_dict()
-        return qty_sum, work_days
-
-    w7_start = base_dt - pd.Timedelta(days=6)
-    w30_start = base_dt - pd.Timedelta(days=29)
-    q7, d7 = workday_avg_qty(hist, w7_start, base_dt)
-    q30, d30 = workday_avg_qty(hist, w30_start, base_dt)
-
-    rows = []
-    for d in drivers:
-        v_today = safe_int(today_qty_map.get(d, 0))
-        v_recent = safe_int(recent_qty_map.get(d, 0))
-        v_q7 = safe_int(q7.get(d, 0))
-        v_d7 = safe_int(d7.get(d, 0))
-        v_q30 = safe_int(q30.get(d, 0))
-        v_d30 = safe_int(d30.get(d, 0))
-        avg_q7 = (v_q7 / v_d7) if v_d7 > 0 else 0
-        avg_q30 = (v_q30 / v_d30) if v_d30 > 0 else 0
-        rows.append({
-            "기사명": d,
-            "오늘물량": v_today,
-            "최근근무일(1일) 물량": v_recent,
-            "7일 근무일평균": round(avg_q7, 1),
-            "30일 근무일평균": round(avg_q30, 1),
-        })
-
-    recent_date_str = common_recent_date.strftime("%Y-%m-%d") if not pd.isna(common_recent_date) else None
-    return (
-        pd.DataFrame(rows)
-        .sort_values(["오늘물량", "기사명"], ascending=[False, True])
-        .reset_index(drop=True),
-        recent_date_str,
-    )
-
-
 def load_geocode_cache():
     if os.path.exists(CACHE_FILE):
         try:
@@ -1076,230 +988,6 @@ def is_header_like_route_values(route_value, truck_request_id_value) -> bool:
     header_routes = {"루트 번호", "루트번호", "route", "route no", "route_no"}
     header_trucks = {"트럭 요청 id", "트럭요청id", "truck request id", "truck_request_id"}
     return route_text in header_routes or truck_text in header_trucks
-
-
-def _df_to_records_for_json(df: pd.DataFrame):
-    if df is None or len(df) == 0:
-        return []
-
-    out = []
-    for row in df.fillna("").to_dict(orient="records"):
-        r = row.copy()
-        if "coords" in r:
-            r["coords"] = _coords_to_jsonable(r.get("coords"))
-        out.append(r)
-    return out
-
-
-def _records_to_df_with_coords(records):
-    df = pd.DataFrame(records or [])
-    if len(df) == 0:
-        return df
-
-    if "coords" in df.columns:
-        df["coords"] = df["coords"].apply(_normalize_coords)
-    return df
-
-
-def save_share_payload(
-    share_name: str,
-    map_html: str,
-    assignment_df: pd.DataFrame,
-    assigned_summary: pd.DataFrame,
-    result_delivery_df: pd.DataFrame = None,
-    grouped_delivery_df: pd.DataFrame = None,
-    route_prefix_map: dict = None,
-    truck_request_map: dict = None,
-    route_line_label: dict = None,
-    route_camp_map: dict = None,
-    camp_coords: dict = None,
-    group_assignment_df: pd.DataFrame = None,
-):
-    payload_path = os.path.join(SHARE_DIR, f"{share_name}.json")
-    payload = {
-        "map_html": map_html,
-        "assignment_rows": assignment_df.fillna("").to_dict(orient="records"),
-        "assigned_summary_rows": assigned_summary.fillna("").to_dict(orient="records"),
-        "result_delivery_rows": _df_to_records_for_json(result_delivery_df) if result_delivery_df is not None else [],
-        "grouped_delivery_rows": _df_to_records_for_json(grouped_delivery_df) if grouped_delivery_df is not None else [],
-        "route_prefix_map": route_prefix_map or {},
-        "truck_request_map": truck_request_map or {},
-        "route_line_label": route_line_label or {},
-        "route_camp_map": route_camp_map or {},
-        "camp_coords": camp_coords or {},
-        "group_assignment_rows": group_assignment_df.fillna("").to_dict(orient="records") if group_assignment_df is not None else [],
-    }
-    with open(payload_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-
-
-def load_share_payload(share_name: str):
-    payload_path = os.path.join(SHARE_DIR, f"{share_name}.json")
-    if not os.path.exists(payload_path):
-        return None
-    try:
-        with open(payload_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _filter_shared_view(result_df: pd.DataFrame, grouped_df: pd.DataFrame, mode: str, selected_driver: str, selected_group: str):
-    result2 = result_df.copy()
-    grouped2 = grouped_df.copy()
-
-    if mode == "기사별 보기" and str(selected_driver).strip() != "":
-        result2 = result2[result2["assigned_driver"].fillna("").astype(str) == str(selected_driver)].copy()
-        grouped2 = grouped2[grouped2["assigned_driver"].fillna("").astype(str) == str(selected_driver)].copy()
-    elif mode == "추천그룹별 보기" and str(selected_group).strip() != "":
-        result2 = result2[result2["추천그룹"].fillna("").astype(str) == str(selected_group)].copy()
-        grouped2 = grouped2[grouped2["추천그룹"].fillna("").astype(str) == str(selected_group)].copy()
-
-    result2, _ = _sanitize_coords_column(result2, log_label="shared_result_filter")
-    grouped2, _ = _sanitize_coords_column(grouped2, log_label="shared_grouped_filter")
-
-    result2 = result2[result2["coords"].notna()].copy() if "coords" in result2.columns else pd.DataFrame()
-    grouped2 = grouped2[grouped2["coords"].notna()].copy() if "coords" in grouped2.columns else pd.DataFrame()
-    return result2, grouped2
-
-
-def _build_shared_summary(result_df: pd.DataFrame, grouped_df: pd.DataFrame):
-    route_count = safe_int(result_df["route"].nunique()) if len(result_df) > 0 and "route" in result_df.columns else 0
-    driver_count = safe_int(result_df["assigned_driver"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()) if len(result_df) > 0 and "assigned_driver" in result_df.columns else 0
-    group_count = safe_int(result_df["추천그룹"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()) if len(result_df) > 0 and "추천그룹" in result_df.columns else 0
-    small_box_total = 0
-    medium_box_total = 0
-    large_box_total = 0
-    box_total = 0
-    if len(grouped_df) > 0:
-        small_box_total = safe_int(grouped_df.get("ae_sum", pd.Series(dtype=float)).sum())
-        medium_box_total = safe_int(grouped_df.get("af_sum", pd.Series(dtype=float)).sum())
-        large_box_total = safe_int(grouped_df.get("ag_sum", pd.Series(dtype=float)).sum())
-        box_total = small_box_total + medium_box_total + large_box_total
-
-    overlap_count = 0
-    if len(grouped_df) > 0 and "coords" in grouped_df.columns:
-        key_series = grouped_df["coords"].apply(lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else "")
-        overlap_count = safe_int((key_series.value_counts() > 1).sum())
-
-    return route_count, driver_count, group_count, small_box_total, medium_box_total, large_box_total, box_total, overlap_count
-
-
-def _natural_desc_sort_key(value):
-    text = str(value).strip()
-    return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", text)]
-
-
-
-
-def _build_driver_overview_df(result_df: pd.DataFrame, grouped_df: pd.DataFrame):
-    if len(result_df) == 0:
-        return pd.DataFrame()
-
-    assigned = result_df.copy()
-    assigned["assigned_driver"] = assigned.get("assigned_driver", "").fillna("").astype(str).str.strip()
-    assigned = assigned[assigned["assigned_driver"] != ""].copy()
-    if len(assigned) == 0:
-        return pd.DataFrame()
-
-    route_driver_df = (
-        assigned[["route", "assigned_driver"]]
-        .dropna(subset=["route"])
-        .drop_duplicates(subset=["route"])
-    )
-
-    grouped2 = grouped_df.copy()
-    if len(grouped2) == 0:
-        grouped2 = pd.DataFrame(columns=["route", "assigned_driver", "ae_sum", "af_sum", "ag_sum"])
-    elif "assigned_driver" not in grouped2.columns:
-        grouped2 = grouped2.merge(route_driver_df, on="route", how="left")
-
-    grouped2["assigned_driver"] = grouped2.get("assigned_driver", "").fillna("").astype(str).str.strip()
-    grouped2 = grouped2[grouped2["assigned_driver"] != ""].copy()
-
-    box_summary = (
-        grouped2.groupby("assigned_driver", as_index=False)
-        .agg(
-            소형합=("ae_sum", "sum"),
-            중형합=("af_sum", "sum"),
-            대형합=("ag_sum", "sum"),
-        )
-    ) if len(grouped2) > 0 else pd.DataFrame(columns=["assigned_driver", "소형합", "중형합", "대형합"])
-
-    time_summary = (
-        assigned.groupby("assigned_driver", as_index=False)
-        .agg(
-            총걸린분=("time_minutes", "max"),
-            route_count=("route", "nunique"),
-        )
-    )
-
-    out = time_summary.merge(box_summary, on="assigned_driver", how="left")
-    for col in ["소형합", "중형합", "대형합", "총걸린분", "route_count"]:
-        out[col] = pd.to_numeric(out.get(col, 0), errors="coerce").fillna(0).astype(int)
-
-    out["총박스"] = out["소형합"] + out["중형합"] + out["대형합"]
-    out = out.sort_values(["총박스", "총걸린분", "assigned_driver"], ascending=[False, False, True]).reset_index(drop=True)
-    return out
-
-
-def _build_camp_driver_summary_df(result_df: pd.DataFrame, grouped_df: pd.DataFrame, route_camp_map: dict):
-    if len(result_df) == 0:
-        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
-
-    assigned = result_df.copy()
-    assigned["assigned_driver"] = assigned.get("assigned_driver", "").fillna("").astype(str).str.strip()
-    assigned = assigned[assigned["assigned_driver"] != ""].copy()
-    if len(assigned) == 0:
-        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
-
-    route_driver_df = (
-        assigned[["route", "assigned_driver"]]
-        .dropna(subset=["route"])
-        .drop_duplicates(subset=["route"])
-    )
-
-    grouped2 = grouped_df.copy()
-    if len(grouped2) == 0:
-        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
-
-    grouped2 = grouped2.merge(route_driver_df, on="route", how="left", suffixes=("", "_route"))
-    if "assigned_driver_route" in grouped2.columns:
-        grouped2["assigned_driver"] = grouped2.get("assigned_driver_route", "").fillna(grouped2.get("assigned_driver", ""))
-        grouped2 = grouped2.drop(columns=["assigned_driver_route"])
-
-    grouped2["assigned_driver"] = grouped2.get("assigned_driver", "").fillna("").astype(str).str.strip()
-    grouped2 = grouped2[grouped2["assigned_driver"] != ""].copy()
-    if len(grouped2) == 0:
-        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
-
-    grouped2["camp_code"] = grouped2["route"].map(route_camp_map).fillna(grouped2.get("camp_code", ""))
-    grouped2["camp_name"] = grouped2["camp_code"].map(lambda x: CAMP_INFO.get(x, {}).get("camp_name", ""))
-    grouped2["camp_name"] = grouped2["camp_name"].fillna(grouped2.get("camp_name", "")).astype(str).str.strip()
-    grouped2 = grouped2[grouped2["camp_name"] != ""].copy()
-    if len(grouped2) == 0:
-        return pd.DataFrame(columns=["camp_name", "assigned_driver", "회전수", "총박스"])
-
-    summary_df = (
-        grouped2.groupby(["camp_name", "assigned_driver"], as_index=False)
-        .agg(
-            회전수=("route", "nunique"),
-            소형합=("ae_sum", "sum"),
-            중형합=("af_sum", "sum"),
-            대형합=("ag_sum", "sum"),
-        )
-    )
-    for col in ["회전수", "소형합", "중형합", "대형합"]:
-        summary_df[col] = pd.to_numeric(summary_df[col], errors="coerce").fillna(0).astype(int)
-    summary_df["총박스"] = summary_df["소형합"] + summary_df["중형합"] + summary_df["대형합"]
-
-    camp_order = [v["camp_name"] for v in CAMP_INFO.values()]
-    summary_df["camp_order"] = summary_df["camp_name"].apply(lambda x: camp_order.index(x) if x in camp_order else len(camp_order))
-    summary_df = summary_df.sort_values(
-        ["camp_order", "camp_name", "총박스", "회전수", "assigned_driver"],
-        ascending=[True, True, False, False, True],
-    ).reset_index(drop=True)
-    return summary_df[["camp_name", "assigned_driver", "회전수", "총박스"]]
 
 
 def make_stop_div_icon(route_color: str, stop_text: str, size_scale: float = 1.0, border_color: str = "#ffffff"):
@@ -1991,17 +1679,6 @@ def render_assignment_form(
     return assignment_store
 
 
-def resolve_group_count(route_feature_df: pd.DataFrame, manual_group_count=None) -> int:
-    if len(route_feature_df) == 0:
-        return 1
-
-    k = safe_int(manual_group_count)
-    if k <= 0:
-        k = choose_auto_group_count(route_feature_df)
-
-    return max(1, min(k, len(route_feature_df)))
-
-
 def build_map_data(result_delivery: pd.DataFrame, grouped_delivery: pd.DataFrame, assignment_df: pd.DataFrame, selected_filter: str):
     route_driver_map = {}
     if len(assignment_df) > 0:
@@ -2448,8 +2125,8 @@ if shared_map:
         grouped_rows = payload.get("grouped_delivery_rows", [])
 
         if result_rows and grouped_rows:
-            shared_result_df = _records_to_df_with_coords(result_rows)
-            shared_grouped_df = _records_to_df_with_coords(grouped_rows)
+            shared_result_df = records_to_df_with_coords(result_rows)
+            shared_grouped_df = records_to_df_with_coords(grouped_rows)
             shared_result_df, _ = _sanitize_coords_column(shared_result_df, log_label="shared_payload_result")
             shared_grouped_df, _ = _sanitize_coords_column(shared_grouped_df, log_label="shared_payload_grouped")
 
@@ -2468,11 +2145,12 @@ if shared_map:
 
             filtered_result = shared_result_df.copy()
             filtered_grouped = shared_grouped_df.copy()
-            driver_overview_df = _build_driver_overview_df(shared_result_df, shared_grouped_df)
-            camp_driver_summary_df = _build_camp_driver_summary_df(
+            driver_overview_df = build_driver_overview_df(shared_result_df, shared_grouped_df)
+            camp_driver_summary_df = build_camp_driver_summary_df(
                 shared_result_df,
                 shared_grouped_df,
                 route_camp_map_payload,
+                CAMP_INFO,
             )
 
             route_list_shared = sorted(
@@ -2707,9 +2385,9 @@ if not uploaded_file:
             share_name = base_name
             html_filename = f"{share_name}.html"
             base_date_str = str(chosen_run_summary.get("source_date", "")) or pd.Timestamp.now().strftime("%Y-%m-%d")
-            result_all = _records_to_df_with_coords(latest_result_delivery_rows)
-            result_delivery = _records_to_df_with_coords(latest_result_delivery_rows)
-            grouped_delivery = _records_to_df_with_coords(latest_grouped_delivery_rows)
+            result_all = records_to_df_with_coords(latest_result_delivery_rows)
+            result_delivery = records_to_df_with_coords(latest_result_delivery_rows)
+            grouped_delivery = records_to_df_with_coords(latest_grouped_delivery_rows)
             route_summary = build_route_summary_from_backend_routes(latest_run_detail.get("routes", []))
             route_prefix_map = latest_route_prefix_map
             truck_request_map = latest_truck_request_map
@@ -2900,23 +2578,24 @@ with tab_recommend:
     if group_count_mode == "직접입력":
         manual_group_count = st.number_input("추천그룹 수", min_value=1, max_value=max(1, len(route_summary)), value=2, step=1)
     else:
-        route_feature_df_for_count = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
-        auto_group_count = choose_auto_group_count(route_feature_df_for_count)
+        _, auto_group_count = build_auto_group_count_preview(route_summary, grouped_delivery, camp_coords=camp_coords)
         st.caption(f"자동 추천그룹 수: {auto_group_count}")
 
     if st.button("추천그룹 자동 추천 실행"):
-        route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
-        recommended_group_count = resolve_group_count(route_feature_df, manual_group_count=manual_group_count)
-        recommended_group_map = recommend_route_groups(route_feature_df, manual_group_count=manual_group_count)
+        route_feature_df, recommended_group_count, recommended_group_map = run_route_group_recommendation(
+            route_summary,
+            grouped_delivery,
+            manual_group_count=manual_group_count,
+            camp_coords=camp_coords,
+        )
         st.session_state["recommended_group_map"] = recommended_group_map
         st.session_state["recommended_group_count"] = recommended_group_count
         st.success("추천그룹 생성을 완료했습니다.")
 
     if "recommended_group_map" in st.session_state:
-        route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
+        route_feature_df = build_recommendation_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
         recommended_group_map = st.session_state["recommended_group_map"]
-        group_assignment_df = build_group_assignment_df(route_feature_df, recommended_group_map)
-        group_summary_df = build_group_summary_df(group_assignment_df)
+        group_assignment_df, group_summary_df = build_group_recommendation_tables(route_feature_df, recommended_group_map)
 
         st.subheader("추천그룹 요약")
         st.dataframe(group_summary_df, use_container_width=True)
@@ -2959,7 +2638,7 @@ with tab_recommend:
         final_group_map = st.session_state["recommended_group_map"]
         group_map_result, group_map_grouped = build_group_map_data(result_delivery, grouped_delivery, final_group_map)
 
-        latest_assignment_df = build_group_assignment_df(route_feature_df, final_group_map)
+        latest_assignment_df, _ = build_group_recommendation_tables(route_feature_df, final_group_map)
         st.session_state["latest_group_assignment_df"] = latest_assignment_df.copy()
         group_detail_df = build_group_detail_stats_df(latest_assignment_df)
         assignment_store = st.session_state.get("assignment_store", {})
@@ -3018,14 +2697,23 @@ with tab_recommend:
 
         with st.expander("기사 선호 예상 순위 (참고용)", expanded=False):
             st.caption("추천그룹별 물량·스톱·예상시간·퍼짐 기준의 휴리스틱 참고 순위입니다.")
-            preference_df = build_driver_preference_df(route_feature_df, final_group_map)
-            st.dataframe(
-                preference_df.assign(
-                    선호예상점수=lambda df: df["선호예상점수"].round(1),
-                    route_spread_km=lambda df: df["route_spread_km"].round(1),
-                ).rename(columns={"route_spread_km": "그룹평균퍼짐km"}),
-                use_container_width=True,
-            )
+            preference_df = build_driver_preference_table(route_feature_df, final_group_map)
+            if len(preference_df) == 0:
+                st.info("추천그룹 선호 예상 데이터가 없습니다.")
+            else:
+                preference_view_df = preference_df.copy()
+                if "선호예상점수" in preference_view_df.columns:
+                    preference_view_df["선호예상점수"] = pd.to_numeric(
+                        preference_view_df["선호예상점수"], errors="coerce"
+                    ).fillna(0).round(1)
+                if "route_spread_km" in preference_view_df.columns:
+                    preference_view_df["route_spread_km"] = pd.to_numeric(
+                        preference_view_df["route_spread_km"], errors="coerce"
+                    ).fillna(0).round(1)
+                st.dataframe(
+                    preference_view_df.rename(columns={"route_spread_km": "그룹평균퍼짐km"}),
+                    use_container_width=True,
+                )
 
 with tab_basic:
     summary_container = st.container()
@@ -3149,12 +2837,12 @@ with tab_stats:
         else:
             st.warning(f"저장할 배정 데이터가 없어 {base_date_str} 이력은 0건으로 덮어쓰기되었습니다.")
 
-    shared_result_delivery = result_delivery.copy()
-    shared_grouped_delivery = grouped_delivery.copy()
-    shared_result_delivery["assigned_driver"] = shared_result_delivery["route"].map(route_driver_map).fillna("")
-    shared_grouped_delivery["assigned_driver"] = shared_grouped_delivery["route"].map(route_driver_map).fillna("")
-    shared_result_delivery["추천그룹"] = shared_result_delivery["route"].map(group_route_map).fillna("")
-    shared_grouped_delivery["추천그룹"] = shared_grouped_delivery["route"].map(group_route_map).fillna("")
+    shared_result_delivery, shared_grouped_delivery = build_shared_delivery_frames(
+        result_delivery,
+        grouped_delivery,
+        route_driver_map=route_driver_map,
+        group_route_map=group_route_map,
+    )
 
     save_share_payload(
         share_name,
@@ -3172,23 +2860,23 @@ with tab_stats:
     )
 
     backend_run_id = safe_int(st.session_state.get("backend_run_id", 0))
-    snapshot_payload = {
-        "map_html": map_html,
-        "assignment_rows": view_assignment_df.fillna("").to_dict(orient="records"),
-        "assigned_summary_rows": view_assigned_summary.fillna("").to_dict(orient="records") if len(view_assigned_summary) > 0 else [],
-        "result_delivery_rows": _df_to_records_for_json(shared_result_delivery),
-        "grouped_delivery_rows": _df_to_records_for_json(shared_grouped_delivery),
-        "route_prefix_map": route_prefix_map,
-        "truck_request_map": truck_request_map,
-        "route_line_label": route_line_label,
-        "route_camp_map": route_camp_map,
-        "camp_coords": camp_coords,
-        "selected_filter": selected_filter,
-        "recommended_group_map": st.session_state.get("recommended_group_map", {}),
-        "recommended_group_count": safe_int(st.session_state.get("recommended_group_count", 0)),
-        "selected_group_filter": st.session_state.get("selected_group_filter", "전체"),
-        "group_assignment_rows": latest_group_assignment_df.fillna("").to_dict(orient="records") if len(latest_group_assignment_df) > 0 else [],
-    }
+    snapshot_payload = build_snapshot_payload(
+        map_html=map_html,
+        assignment_df=view_assignment_df,
+        assigned_summary=view_assigned_summary,
+        result_delivery_df=shared_result_delivery,
+        grouped_delivery_df=shared_grouped_delivery,
+        route_prefix_map=route_prefix_map,
+        truck_request_map=truck_request_map,
+        route_line_label=route_line_label,
+        route_camp_map=route_camp_map,
+        camp_coords=camp_coords,
+        group_assignment_df=latest_group_assignment_df,
+        selected_filter=selected_filter,
+        recommended_group_map=st.session_state.get("recommended_group_map", {}),
+        recommended_group_count=safe_int(st.session_state.get("recommended_group_count", 0)),
+        selected_group_filter=st.session_state.get("selected_group_filter", "전체"),
+    )
     snapshot_save_payload, snapshot_save_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="recent")
     if snapshot_save_error:
         st.caption(f"Django snapshot sync failed: {snapshot_save_error}")
@@ -3265,21 +2953,7 @@ with tab_stats:
             else:
                 st.success("텔레그램 단체방으로 전송했습니다.")
 
-    export_df = assignment_df.copy()
-    if "truck_request_id" not in export_df.columns:
-        export_df["truck_request_id"] = ""
-    if "assigned_driver" not in export_df.columns:
-        export_df["assigned_driver"] = ""
-    export_df["truck_request_id"] = export_df["truck_request_id"].fillna("").astype(str).str.strip()
-    export_df["assigned_driver"] = export_df["assigned_driver"].fillna("").astype(str).str.strip()
-    export_df = export_df[["truck_request_id", "assigned_driver"]].copy()
-    export_df = export_df.sort_values(
-        by="truck_request_id",
-        key=lambda s: s.map(_natural_desc_sort_key),
-        ascending=False,
-    )
-    export_df = export_df.rename(columns={"truck_request_id": "트럭요청ID", "assigned_driver": "이름"})
-    csv_data = export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    csv_data = build_assignment_export_csv_data(assignment_df)
     st.download_button(
         "기사 배정표 CSV 다운로드",
         data=csv_data,
