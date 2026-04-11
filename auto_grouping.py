@@ -7,6 +7,65 @@ import pandas as pd
 
 AVERAGE_TRAVEL_SPEED_KMPH = 30.0
 MAX_ROUTE_MINUTES = 240
+DRIVER_PREFERENCE_COLUMNS = [
+    "추천그룹",
+    "라우트수",
+    "총합",
+    "스톱수",
+    "보정걸린분",
+    "route_spread_km",
+    "선호예상점수",
+    "선호예상순위",
+    "선호이유",
+]
+
+
+def empty_driver_preference_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=DRIVER_PREFERENCE_COLUMNS)
+
+
+def _route_values(route_feature_df: pd.DataFrame) -> List[str]:
+    if len(route_feature_df) == 0 or "route" not in route_feature_df.columns:
+        return []
+
+    return [
+        route
+        for route in route_feature_df["route"].dropna().astype(str).map(str.strip).tolist()
+        if route
+    ]
+
+
+def normalize_group_map(group_map: Dict[str, str]) -> Dict[str, str]:
+    if not isinstance(group_map, dict):
+        return {}
+
+    normalized = {}
+    for raw_route, raw_group in group_map.items():
+        route = str(raw_route).strip()
+        group = str(raw_group).strip()
+        if route and group:
+            normalized[route] = group
+    return normalized
+
+
+def filter_group_map_for_routes(route_feature_df: pd.DataFrame, group_map: Dict[str, str]) -> Dict[str, str]:
+    valid_routes = set(_route_values(route_feature_df))
+    if not valid_routes:
+        return {}
+
+    normalized_group_map = normalize_group_map(group_map)
+    return {
+        route: group_name
+        for route, group_name in normalized_group_map.items()
+        if route in valid_routes
+    }
+
+
+def has_complete_group_map(route_feature_df: pd.DataFrame, group_map: Dict[str, str]) -> bool:
+    valid_routes = set(_route_values(route_feature_df))
+    if not valid_routes:
+        return False
+    return len(filter_group_map_for_routes(route_feature_df, group_map)) == len(valid_routes)
 
 
 def compute_box_balance_metrics(boxes_by_group: List[int]) -> Dict[str, float]:
@@ -533,9 +592,10 @@ def build_group_assignment_df(route_feature_df: pd.DataFrame, group_map: Dict[st
         return pd.DataFrame()
 
     out = route_feature_df.copy()
-    out["추천그룹"] = out["route"].map(group_map).fillna("추천그룹 1")
+    valid_group_map = filter_group_map_for_routes(route_feature_df, group_map)
+    out["추천그룹"] = out["route"].map(valid_group_map).fillna("")
     out["추천이유"] = ""
-    return out
+    return out[out["추천그룹"].astype(str).str.strip() != ""].reset_index(drop=True)
 
 
 def build_group_summary_df(group_assignment_df: pd.DataFrame) -> pd.DataFrame:
@@ -653,13 +713,21 @@ def _inverse_minmax(series: pd.Series) -> pd.Series:
 
 def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[str, str]) -> pd.DataFrame:
     if len(route_feature_df) == 0:
-        return pd.DataFrame()
+        return empty_driver_preference_df()
+
+    required_columns = {"route", "총합", "스톱수", "보정걸린분", "route_spread_km"}
+    if not required_columns.issubset(route_feature_df.columns):
+        return empty_driver_preference_df()
 
     out = route_feature_df.copy()
-    out["추천그룹"] = out["route"].map(group_map).fillna("")
+    valid_group_map = filter_group_map_for_routes(route_feature_df, group_map)
+    if not valid_group_map:
+        return empty_driver_preference_df()
+
+    out["추천그룹"] = out["route"].map(valid_group_map).fillna("")
     out = out[out["추천그룹"].astype(str).str.strip() != ""].copy()
     if len(out) == 0:
-        return pd.DataFrame()
+        return empty_driver_preference_df()
 
     grouped = (
         out.groupby("추천그룹", as_index=False)
@@ -708,28 +776,27 @@ def build_driver_preference_df(route_feature_df: pd.DataFrame, group_map: Dict[s
 
     grouped["선호이유"] = reason_rows
 
-    return grouped[[
-        "추천그룹",
-        "라우트수",
-        "총합",
-        "스톱수",
-        "보정걸린분",
-        "route_spread_km",
-        "선호예상점수",
-        "선호예상순위",
-        "선호이유",
-    ]].sort_values(["선호예상순위", "추천그룹"]).reset_index(drop=True)
+    return (
+        grouped.reindex(columns=DRIVER_PREFERENCE_COLUMNS)
+        .sort_values(["선호예상순위", "추천그룹"])
+        .reset_index(drop=True)
+    )
 
 
 def default_group_edit_map(group_assignment_df: pd.DataFrame) -> Dict[str, str]:
     if len(group_assignment_df) == 0:
         return {}
-    return {row["route"]: row["추천그룹"] for _, row in group_assignment_df.iterrows()}
+    return {
+        str(row["route"]).strip(): str(row["추천그룹"]).strip()
+        for _, row in group_assignment_df.iterrows()
+        if str(row.get("route", "")).strip() and str(row.get("추천그룹", "")).strip()
+    }
 
 
 def apply_group_edit_map(route_feature_df: pd.DataFrame, group_edit_map: Dict[str, str]) -> pd.DataFrame:
     out = route_feature_df.copy()
-    out["추천그룹"] = out["route"].map(group_edit_map).fillna("추천그룹 1")
+    valid_group_map = filter_group_map_for_routes(route_feature_df, group_edit_map)
+    out["추천그룹"] = out["route"].map(valid_group_map).fillna("")
     return out
 
 

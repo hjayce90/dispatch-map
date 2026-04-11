@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.env
 .venv/
 .streamlit/credentials.toml
 .streamlit/config.toml.bak

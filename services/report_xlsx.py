@@ -162,12 +162,10 @@ def build_report_export_df(cancel_df: pd.DataFrame) -> pd.DataFrame:
         return cancel_df.copy()
 
     work_df = cancel_df.copy()
-    mask = (
-        (_safe_numeric_series(work_df, COL_CANCEL_COUNT) > 0)
-        | (_safe_numeric_series(work_df, COL_CANCEL_QTY) > 0)
-        | _safe_bool_series(work_df, COL_SETTLEMENT_EXCLUDED)
-        | _safe_text_series(work_df, COL_CANCEL_REASON).ne("")
-    )
+    qty_mask = _safe_numeric_series(work_df, COL_CANCEL_QTY) > 0
+    settlement_mask = _safe_bool_series(work_df, COL_SETTLEMENT_EXCLUDED)
+    reason_mask = _safe_text_series(work_df, COL_CANCEL_REASON).ne("")
+    mask = qty_mask | settlement_mask | reason_mask
     return work_df[mask].copy().reset_index(drop=True)
 
 
@@ -175,6 +173,8 @@ def build_report_export_payload(
     grouped_delivery: pd.DataFrame,
     report_export_df: pd.DataFrame,
     base_date_str: str,
+    user_note: str = "",
+    **_: Any,
 ) -> dict[str, Any]:
     grouped_df = grouped_delivery.copy() if isinstance(grouped_delivery, pd.DataFrame) else pd.DataFrame()
     export_df = report_export_df.copy() if isinstance(report_export_df, pd.DataFrame) else pd.DataFrame()
@@ -203,10 +203,12 @@ def build_report_export_payload(
 
         if cancel_qty > 0:
             decrease_display = f"{total_qty} > {adjusted_qty}"
-        elif cancel_count > 0:
-            decrease_display = f"취소 {cancel_count}건"
         elif settlement_excluded:
             decrease_display = TEXT_SETTLEMENT_EXCLUDED
+        elif cancel_reason:
+            decrease_display = "사유 확인"
+        elif cancel_count > 0:
+            decrease_display = f"취소 {cancel_count}건"
         else:
             decrease_display = ""
 
@@ -233,7 +235,26 @@ def build_report_export_payload(
             else:
                 note_lines.append(" / ".join(note_parts))
 
-    note_text = "\n".join(note_lines) if note_lines else TEXT_NO_DETAILS
+    if not detail_rows:
+        detail_rows = [
+            {
+                "route": "",
+                "milkrun_no": "",
+                "company_name": "",
+                "origin_center": "",
+                "decrease_display": TEXT_NO_DETAILS,
+                "route_prefix": "",
+                "house_order": "",
+            }
+        ]
+
+    user_note_text = _safe_text(user_note)
+    if user_note_text:
+        note_text = user_note_text
+    elif note_lines:
+        note_text = "\n".join(note_lines)
+    else:
+        note_text = ""
 
     return {
         "report_date": _parse_report_date(base_date_str),
@@ -391,7 +412,7 @@ def fill_report_template(workbook, payload: dict[str, Any]):
 
     note_columns = dict(ROW_LAYOUT["note_columns"])
     ws[f"{note_columns['label']}{note_row}"] = note_label or TEXT_NOTE
-    ws[f"{note_columns['value']}{note_row}"] = _safe_text(payload.get("note_text"), TEXT_NO_DETAILS)
+    ws[f"{note_columns['value']}{note_row}"] = _safe_text(payload.get("note_text"), "")
 
     ws.merge_cells(f"A{note_row}:B{note_end_row}")
     ws.merge_cells(f"C{note_row}:H{note_end_row}")
