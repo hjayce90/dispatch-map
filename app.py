@@ -441,6 +441,8 @@ def is_fresh_local_assignment_state(route_summary: pd.DataFrame, assignment_stor
 
 
 def should_merge_backend_assignments(dataset_key: str, route_summary: pd.DataFrame, assignment_store: dict) -> bool:
+    if st.session_state.get("disable_backend_merge"):
+        return False
     if st.session_state.get("assignment_local_source_dataset_key") == dataset_key:
         return False
     if st.session_state.get("backend_assignment_merge_dataset_key") == dataset_key:
@@ -449,6 +451,40 @@ def should_merge_backend_assignments(dataset_key: str, route_summary: pd.DataFra
         st.session_state["assignment_local_source_dataset_key"] = dataset_key
         return False
     return True
+
+
+def prepare_backend_run_state_for_dataset(dataset_key: str):
+    if st.session_state.get("backend_dataset_key") == dataset_key:
+        return
+
+    for key in [
+        "backend_run_id",
+        "backend_run_summary",
+        "backend_sync_done",
+        "backend_sync_error",
+        "backend_assignment_merge_dataset_key",
+        "disable_backend_merge",
+    ]:
+        st.session_state.pop(key, None)
+    st.session_state["backend_dataset_key"] = dataset_key
+
+
+def should_sync_backend_run_for_dataset(dataset_key: str) -> bool:
+    if st.session_state.get("backend_sync_done") == dataset_key:
+        return False
+    if safe_int(st.session_state.get("backend_run_id", 0)) > 0 and st.session_state.get("backend_dataset_key") == dataset_key:
+        st.session_state["backend_sync_done"] = dataset_key
+        return False
+    return True
+
+
+def mark_backend_run_sync_done(dataset_key: str, sync_error: str = None):
+    st.session_state["backend_dataset_key"] = dataset_key
+    st.session_state["backend_sync_done"] = dataset_key
+    if sync_error:
+        st.session_state["backend_sync_error"] = str(sync_error)
+    else:
+        st.session_state.pop("backend_sync_error", None)
 
 
 def build_driver_preference_display_df(preference_df: pd.DataFrame) -> pd.DataFrame:
@@ -651,11 +687,17 @@ def ensure_backend_run_for_session(
     route_summary: pd.DataFrame,
     merge_backend_assignments: bool = True,
 ):
+    dataset_key = build_route_dataset_key(uploaded_filename, base_date, route_summary)
     existing_run_id = safe_int(st.session_state.get("backend_run_id", 0))
-    if existing_run_id > 0:
+    existing_dataset_key = st.session_state.get("backend_dataset_key")
+    if existing_run_id > 0 and (existing_dataset_key in (None, "", dataset_key)):
+        st.session_state["backend_dataset_key"] = dataset_key
+        st.session_state["backend_sync_done"] = dataset_key
         return existing_run_id, None
     if not str(uploaded_filename or "").strip():
         return 0, "missing uploaded filename"
+    if st.session_state.get("backend_sync_done") == dataset_key:
+        return 0, st.session_state.get("backend_sync_error") or "backend run sync already attempted for this dataset"
 
     sync_payload, sync_error = sync_assignment_run_to_backend(uploaded_filename, base_date, route_summary)
     if sync_error:
@@ -668,9 +710,11 @@ def ensure_backend_run_for_session(
         return 0, "backend run sync returned no run id"
 
     st.session_state["backend_run_id"] = backend_run_id
+    st.session_state["backend_dataset_key"] = dataset_key
+    st.session_state["backend_sync_done"] = dataset_key
     if backend_run_summary:
         st.session_state["backend_run_summary"] = backend_run_summary
-    if backend_run_detail and merge_backend_assignments:
+    if backend_run_detail and merge_backend_assignments and not st.session_state.get("disable_backend_merge"):
         st.session_state["assignment_store"] = apply_backend_assignments_to_store(
             backend_run_detail,
             st.session_state.get("assignment_store", {}),
@@ -691,6 +735,8 @@ def persist_assignment_store(
     local_save_error = save_assignment_store(assignment_store)
     st.session_state["assignment_store"] = assignment_store
     st.session_state["assignment_local_source_dataset_key"] = dataset_key
+    st.session_state["disable_backend_merge"] = True
+    st.session_state["map_force_refresh"] = True
     if local_save_error:
         return {
             "ok": False,
@@ -3196,7 +3242,8 @@ if not uploaded_file:
             result_delivery = _records_to_df_with_coords(latest_result_delivery_rows)
             grouped_delivery = _records_to_df_with_coords(latest_grouped_delivery_rows)
             route_summary = build_route_summary_from_backend_routes(latest_run_detail.get("routes", []))
-            sync_recommendation_state_with_dataset(uploaded_filename, base_date_str, route_summary)
+            restored_dataset_key = sync_recommendation_state_with_dataset(uploaded_filename, base_date_str, route_summary)
+            prepare_backend_run_state_for_dataset(restored_dataset_key)
             route_prefix_map = latest_route_prefix_map
             truck_request_map = latest_truck_request_map
             route_line_label = latest_route_line_label
@@ -3206,6 +3253,8 @@ if not uploaded_file:
             restored_selected_filter = latest_selected_filter
             restored_selected_group_filter = latest_selected_group_filter
             st.session_state["backend_run_id"] = safe_int(chosen_run_summary.get("id"))
+            st.session_state["backend_dataset_key"] = restored_dataset_key
+            st.session_state["backend_sync_done"] = restored_dataset_key
             st.session_state["backend_run_summary"] = chosen_run_summary
             st.session_state["assignment_store"] = apply_assignment_rows_to_store(
                 latest_assignment_rows,
@@ -3260,30 +3309,34 @@ if not restored_mode:
     route_camp_map = built["route_camp_map"]
     base_date_str = infer_assignment_base_date(uploaded_filename, route_summary)
     upload_dataset_key = sync_recommendation_state_with_dataset(uploaded_filename, base_date_str, route_summary)
+    prepare_backend_run_state_for_dataset(upload_dataset_key)
 
     backend_run_summary = None
     backend_run_detail = None
     backend_sync_error = None
-    backend_sync_payload, backend_sync_error = sync_assignment_run_to_backend(uploaded_filename, base_date_str, route_summary)
-    if backend_sync_payload and isinstance(backend_sync_payload, dict):
-        backend_run_summary = backend_sync_payload.get("run")
-        backend_run_detail = backend_sync_payload.get("detail")
-        if backend_run_summary:
-            st.session_state["backend_run_id"] = safe_int(backend_run_summary.get("id"))
-            st.session_state["backend_run_summary"] = backend_run_summary
-            if backend_run_detail and should_merge_backend_assignments(
-                upload_dataset_key,
-                route_summary,
-                st.session_state.get("assignment_store", {}),
-            ):
-                st.session_state["assignment_store"] = apply_backend_assignments_to_store(
-                    backend_run_detail,
+    backend_sync_payload = None
+    if should_sync_backend_run_for_dataset(upload_dataset_key):
+        backend_sync_payload, backend_sync_error = sync_assignment_run_to_backend(uploaded_filename, base_date_str, route_summary)
+        mark_backend_run_sync_done(upload_dataset_key, backend_sync_error)
+        if backend_sync_payload and isinstance(backend_sync_payload, dict):
+            backend_run_summary = backend_sync_payload.get("run")
+            backend_run_detail = backend_sync_payload.get("detail")
+            if backend_run_summary:
+                st.session_state["backend_run_id"] = safe_int(backend_run_summary.get("id"))
+                st.session_state["backend_run_summary"] = backend_run_summary
+                if backend_run_detail and should_merge_backend_assignments(
+                    upload_dataset_key,
+                    route_summary,
                     st.session_state.get("assignment_store", {}),
-                )
-                st.session_state["backend_assignment_merge_dataset_key"] = upload_dataset_key
-            st.caption(f"Django run synced: #{safe_int(backend_run_summary.get('id'))}")
-    elif backend_sync_error:
-        st.warning(f"Django run sync failed: {backend_sync_error}")
+                ):
+                    st.session_state["assignment_store"] = apply_backend_assignments_to_store(
+                        backend_run_detail,
+                        st.session_state.get("assignment_store", {}),
+                    )
+                    st.session_state["backend_assignment_merge_dataset_key"] = upload_dataset_key
+                st.caption(f"Django run synced: #{safe_int(backend_run_summary.get('id'))}")
+        elif backend_sync_error:
+            st.warning(f"Django run sync failed: {backend_sync_error}")
 
 if len(result_all) == 0:
     st.warning("유효한 주소 데이터가 없습니다.")
@@ -3307,7 +3360,7 @@ if customer_memo_error:
 result_delivery = attach_customer_memos(result_delivery, customer_memo_map)
 grouped_delivery = attach_customer_memos(grouped_delivery, customer_memo_map)
 base_dataset_key = build_route_dataset_key(uploaded_filename, base_date_str, route_summary)
-active_dataset_key = f"{base_dataset_key}:run:{safe_int(st.session_state.get('backend_run_id', 0))}"
+active_dataset_key = base_dataset_key
 if st.session_state.get("share_payload_dataset_key") != active_dataset_key:
     for share_state_key in ["share_payload_cache_key", "share_key", "share_url", "share_snapshot_error"]:
         st.session_state.pop(share_state_key, None)
@@ -3585,7 +3638,7 @@ with tab_basic:
     st.session_state["assignment_store"] = assignment_store
 
     assignment_store = st.session_state["assignment_store"]
-    assignment_df = build_assignment_df(route_summary, assignment_store)
+    assignment_df = build_assignment_df(route_summary, st.session_state["assignment_store"])
 
     group_route_map = {}
     if len(latest_group_assignment_df) > 0 and "route" in latest_group_assignment_df.columns and "추천그룹" in latest_group_assignment_df.columns:
@@ -3646,9 +3699,13 @@ with tab_basic:
             dataset_state_key="map_dataset_key",
             default_center=map_default_center,
         )
+        if st.session_state.pop("map_force_refresh", False):
+            st.session_state["main_map_key_nonce"] = safe_int(st.session_state.get("main_map_key_nonce", 0)) + 1
+        main_map_key_nonce = safe_int(st.session_state.get("main_map_key_nonce", 0))
+        main_map_key = "dispatch_main_map" if main_map_key_nonce <= 0 else f"dispatch_main_map_{main_map_key_nonce}"
         render_stable_folium_map(
             overlay_layers=map_overlay_layers,
-            key="dispatch_main_map",
+            key=main_map_key,
             center_key="map_center",
             zoom_key="map_zoom",
             height=900,
