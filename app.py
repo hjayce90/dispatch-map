@@ -418,6 +418,39 @@ def sync_recommendation_state_with_dataset(uploaded_filename: str, base_date: st
     return dataset_key
 
 
+def current_assignment_keys(route_summary: pd.DataFrame) -> set:
+    if not isinstance(route_summary, pd.DataFrame) or len(route_summary) == 0:
+        return set()
+
+    keys = set()
+    for _, row in route_summary.iterrows():
+        route = str(row.get("route", "")).strip()
+        if not route:
+            continue
+        truck_request_id = str(row.get("truck_request_id", "")).strip()
+        keys.add(make_assignment_key(route, truck_request_id))
+    return keys
+
+
+def is_fresh_local_assignment_state(route_summary: pd.DataFrame, assignment_store: dict) -> bool:
+    if not isinstance(assignment_store, dict) or not assignment_store:
+        return False
+
+    current_keys = current_assignment_keys(route_summary)
+    return any(key in assignment_store for key in current_keys)
+
+
+def should_merge_backend_assignments(dataset_key: str, route_summary: pd.DataFrame, assignment_store: dict) -> bool:
+    if st.session_state.get("assignment_local_source_dataset_key") == dataset_key:
+        return False
+    if st.session_state.get("backend_assignment_merge_dataset_key") == dataset_key:
+        return False
+    if is_fresh_local_assignment_state(route_summary, assignment_store):
+        st.session_state["assignment_local_source_dataset_key"] = dataset_key
+        return False
+    return True
+
+
 def build_driver_preference_display_df(preference_df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(preference_df, pd.DataFrame):
         preference_df = pd.DataFrame()
@@ -654,8 +687,18 @@ def persist_assignment_store(
     uploaded_filename: str,
     base_date: str,
 ):
-    save_assignment_store(assignment_store)
+    dataset_key = build_route_dataset_key(uploaded_filename, base_date, route_summary)
+    local_save_error = save_assignment_store(assignment_store)
     st.session_state["assignment_store"] = assignment_store
+    st.session_state["assignment_local_source_dataset_key"] = dataset_key
+    if local_save_error:
+        return {
+            "ok": False,
+            "local_ok": False,
+            "backend_ok": False,
+            "saved_count": 0,
+            "message": f"Local assignment save failed: {local_save_error}",
+        }
 
     backend_run_id, backend_run_error = ensure_backend_run_for_session(
         uploaded_filename=uploaded_filename,
@@ -1307,8 +1350,10 @@ def save_assignment_store(store):
     try:
         with open(ASSIGNMENT_FILE, "w", encoding="utf-8") as f:
             json.dump(store, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        return None
+    except Exception as exc:
+        logger.warning("Failed to save assignment store: %s", exc)
+        return str(exc)
 
 
 def load_cancel_store():
@@ -2167,6 +2212,11 @@ def render_group_driver_assignment_form(
                 "success",
                 f"추천그룹 배정을 적용했습니다. ({updated_count}개 route 로컬 반영, 서버 저장 {persist_result['saved_count']}건)",
             )
+        elif not persist_result.get("local_ok", True):
+            queue_assignment_feedback(
+                "error",
+                f"추천그룹 배정은 현재 화면에는 반영했지만 로컬 파일 저장에 실패했습니다. 새로고침하면 유지되지 않을 수 있습니다. {persist_result['message']}",
+            )
         else:
             queue_assignment_feedback(
                 "warning",
@@ -2296,6 +2346,11 @@ def render_assignment_form(
             queue_assignment_feedback(
                 "success",
                 f"기사 배정을 저장했습니다. (로컬 반영 완료, 서버 저장 {persist_result['saved_count']}건)",
+            )
+        elif not persist_result.get("local_ok", True):
+            queue_assignment_feedback(
+                "error",
+                f"기사 배정은 현재 화면에는 반영했지만 로컬 파일 저장에 실패했습니다. 새로고침하면 유지되지 않을 수 있습니다. {persist_result['message']}",
             )
         else:
             queue_assignment_feedback(
@@ -2771,6 +2826,73 @@ def render_group_map(
     return m
 
 
+def build_static_map_cache_key(active_dataset_key: str, selected_filter: str, assignment_df: pd.DataFrame) -> str:
+    assignment_rows = []
+    if isinstance(assignment_df, pd.DataFrame) and len(assignment_df) > 0:
+        cols = [c for c in ["route", "truck_request_id", "assigned_driver"] if c in assignment_df.columns]
+        if cols:
+            assignment_rows = (
+                assignment_df[cols]
+                .fillna("")
+                .astype(str)
+                .sort_values(cols)
+                .to_dict(orient="records")
+            )
+    payload = json.dumps(
+        {
+            "dataset_key": str(active_dataset_key or ""),
+            "selected_filter": str(selected_filter or ""),
+            "assignment_rows": assignment_rows,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def get_cached_static_map_html(cache_key: str):
+    if st.session_state.get("static_map_html_cache_key") == cache_key:
+        return st.session_state.get("static_map_html", "")
+    return ""
+
+
+def get_static_map_html(
+    cache_key: str,
+    html_filename: str,
+    valid_result: pd.DataFrame,
+    valid_grouped: pd.DataFrame,
+    route_prefix_map: dict,
+    truck_request_map: dict,
+    route_line_label: dict,
+    route_driver_map: dict,
+    route_camp_map: dict,
+    camp_coords: dict,
+):
+    cached_html = get_cached_static_map_html(cache_key)
+    if cached_html:
+        return cached_html
+
+    static_map = render_map(
+        valid_result=valid_result,
+        valid_grouped=valid_grouped,
+        route_prefix_map=route_prefix_map,
+        truck_request_map=truck_request_map,
+        route_line_label=route_line_label,
+        route_driver_map=route_driver_map,
+        route_camp_map=route_camp_map,
+        camp_coords=camp_coords,
+    )
+    map_html = static_map.get_root().render()
+    map_path = os.path.join(MAP_DIR, html_filename)
+    with open(map_path, "w", encoding="utf-8") as f:
+        f.write(map_html)
+
+    st.session_state["static_map_html_cache_key"] = cache_key
+    st.session_state["static_map_html"] = map_html
+    st.session_state["static_map_html_filename"] = html_filename
+    return map_html
+
+
 # =========================
 # 공유 링크로 직접 열기
 # =========================
@@ -3137,7 +3259,7 @@ if not restored_mode:
     route_line_label = built["route_line_label"]
     route_camp_map = built["route_camp_map"]
     base_date_str = infer_assignment_base_date(uploaded_filename, route_summary)
-    sync_recommendation_state_with_dataset(uploaded_filename, base_date_str, route_summary)
+    upload_dataset_key = sync_recommendation_state_with_dataset(uploaded_filename, base_date_str, route_summary)
 
     backend_run_summary = None
     backend_run_detail = None
@@ -3149,10 +3271,16 @@ if not restored_mode:
         if backend_run_summary:
             st.session_state["backend_run_id"] = safe_int(backend_run_summary.get("id"))
             st.session_state["backend_run_summary"] = backend_run_summary
-            st.session_state["assignment_store"] = apply_backend_assignments_to_store(
-                backend_run_detail,
+            if backend_run_detail and should_merge_backend_assignments(
+                upload_dataset_key,
+                route_summary,
                 st.session_state.get("assignment_store", {}),
-            )
+            ):
+                st.session_state["assignment_store"] = apply_backend_assignments_to_store(
+                    backend_run_detail,
+                    st.session_state.get("assignment_store", {}),
+                )
+                st.session_state["backend_assignment_merge_dataset_key"] = upload_dataset_key
             st.caption(f"Django run synced: #{safe_int(backend_run_summary.get('id'))}")
     elif backend_sync_error:
         st.warning(f"Django run sync failed: {backend_sync_error}")
@@ -3180,6 +3308,10 @@ result_delivery = attach_customer_memos(result_delivery, customer_memo_map)
 grouped_delivery = attach_customer_memos(grouped_delivery, customer_memo_map)
 base_dataset_key = build_route_dataset_key(uploaded_filename, base_date_str, route_summary)
 active_dataset_key = f"{base_dataset_key}:run:{safe_int(st.session_state.get('backend_run_id', 0))}"
+if st.session_state.get("share_payload_dataset_key") != active_dataset_key:
+    for share_state_key in ["share_payload_cache_key", "share_key", "share_url", "share_snapshot_error"]:
+        st.session_state.pop(share_state_key, None)
+    st.session_state["share_payload_dataset_key"] = active_dataset_key
 
 tab_basic, tab_recommend, tab_memo, tab_stats, tab_report = st.tabs(
     ["\uae30\ubcf8", "\ucd94\ucc9c", "\uba54\ubaa8", "\ud1b5\uacc4", "\ubcf4\uace0"]
@@ -3503,16 +3635,6 @@ with tab_basic:
                 route_camp_map=route_camp_map,
                 camp_coords=camp_coords,
             )
-            static_map = render_map(
-                valid_result=valid_result,
-                valid_grouped=valid_grouped,
-                route_prefix_map=route_prefix_map,
-                truck_request_map=truck_request_map,
-                route_line_label=route_line_label,
-                route_driver_map=route_driver_map,
-                route_camp_map=route_camp_map,
-                camp_coords=camp_coords,
-            )
 
         marker_count = len(valid_grouped)
         st.write(f"지도에 찍힌 배송 핀 수: {marker_count}")
@@ -3533,18 +3655,32 @@ with tab_basic:
             fallback_flag_key="main_map_dynamic_fallback",
         )
 
-        map_html = static_map.get_root().render()
+        static_map_cache_key = build_static_map_cache_key(active_dataset_key, selected_filter, assignment_df)
+        if st.button("다운로드용 HTML 지도 생성/갱신", key="build_download_map_html"):
+            with st.spinner("다운로드용 HTML 지도 생성 중..."):
+                get_static_map_html(
+                    cache_key=static_map_cache_key,
+                    html_filename=html_filename,
+                    valid_result=valid_result,
+                    valid_grouped=valid_grouped,
+                    route_prefix_map=route_prefix_map,
+                    truck_request_map=truck_request_map,
+                    route_line_label=route_line_label,
+                    route_driver_map=route_driver_map,
+                    route_camp_map=route_camp_map,
+                    camp_coords=camp_coords,
+                )
 
-        map_path = os.path.join(MAP_DIR, html_filename)
-        with open(map_path, "w", encoding="utf-8") as f:
-            f.write(map_html)
-
-        st.download_button(
-            label=f"지도 다운로드 (HTML) - {html_filename}",
-            data=map_html,
-            file_name=html_filename,
-            mime="text/html"
-        )
+        download_map_html = get_cached_static_map_html(static_map_cache_key)
+        if download_map_html:
+            st.download_button(
+                label=f"지도 다운로드 (HTML) - {html_filename}",
+                data=download_map_html,
+                file_name=html_filename,
+                mime="text/html"
+            )
+        else:
+            st.caption("HTML 지도 다운로드가 필요할 때만 생성 버튼을 눌러 주세요.")
 
 with tab_stats:
     view_assignment_df = assignment_df.copy()
@@ -3578,6 +3714,7 @@ with tab_stats:
         saved_count = save_assignment_history_for_date(assignment_df, base_date_str)
         if saved_count > 0:
             st.session_state["send_assignment_completion_push"] = True
+            st.session_state["refresh_share_payload_once"] = True
             st.success(f"배정 이력을 저장했습니다. 기준일 {base_date_str}, {saved_count}건 저장 완료")
         else:
             st.warning(f"저장할 배정 데이터가 없어 {base_date_str} 이력은 0건으로 덮어쓰기되었습니다.")
@@ -3589,50 +3726,97 @@ with tab_stats:
     shared_result_delivery["추천그룹"] = shared_result_delivery["route"].map(group_route_map).fillna("")
     shared_grouped_delivery["추천그룹"] = shared_grouped_delivery["route"].map(group_route_map).fillna("")
 
-    save_share_payload(
-        share_name,
-        map_html,
-        view_assignment_df,
-        view_assigned_summary,
-        result_delivery_df=shared_result_delivery,
-        grouped_delivery_df=shared_grouped_delivery,
-        route_prefix_map=route_prefix_map,
-        truck_request_map=truck_request_map,
-        route_line_label=route_line_label,
-        route_camp_map=route_camp_map,
-        camp_coords=camp_coords,
-        group_assignment_df=latest_group_assignment_df,
-    )
-
     backend_run_id = safe_int(st.session_state.get("backend_run_id", 0))
-    snapshot_payload = {
-        "map_html": map_html,
-        "assignment_rows": view_assignment_df.fillna("").to_dict(orient="records"),
-        "assigned_summary_rows": view_assigned_summary.fillna("").to_dict(orient="records") if len(view_assigned_summary) > 0 else [],
-        "result_delivery_rows": _df_to_records_for_json(shared_result_delivery),
-        "grouped_delivery_rows": _df_to_records_for_json(shared_grouped_delivery),
-        "route_prefix_map": route_prefix_map,
-        "truck_request_map": truck_request_map,
-        "route_line_label": route_line_label,
-        "route_camp_map": route_camp_map,
-        "camp_coords": camp_coords,
-        "selected_filter": selected_filter,
-        "recommended_group_map": st.session_state.get("recommended_group_map", {}),
-        "recommended_group_count": safe_int(st.session_state.get("recommended_group_count", 0)),
-        "selected_group_filter": st.session_state.get("selected_group_filter", "전체"),
-        "group_assignment_rows": latest_group_assignment_df.fillna("").to_dict(orient="records") if len(latest_group_assignment_df) > 0 else [],
-    }
-    snapshot_save_payload, snapshot_save_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="recent")
-    if snapshot_save_error:
-        st.caption(f"Django snapshot sync failed: {snapshot_save_error}")
-    elif snapshot_save_payload is not None:
-        st.caption(f"Django snapshot synced: {snapshot_save_payload.get('share_key', '')}")
+    share_group_key = hashlib.sha1(
+        json.dumps(
+            {
+                "recommended_group_map": st.session_state.get("recommended_group_map", {}),
+                "recommended_group_count": safe_int(st.session_state.get("recommended_group_count", 0)),
+                "selected_group_filter": st.session_state.get("selected_group_filter", "전체"),
+                "group_assignment_rows": latest_group_assignment_df.fillna("").astype(str).to_dict(orient="records") if len(latest_group_assignment_df) > 0 else [],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    share_payload_cache_key = f"{static_map_cache_key}:share:{backend_run_id}:{share_group_key}"
+    share_url = st.session_state.get("share_url", f"{APP_URL}?map={share_name}")
+    share_key = st.session_state.get("share_key", "")
+    share_snapshot_error = st.session_state.get("share_snapshot_error", "")
+    share_payload_ready = st.session_state.get("share_payload_cache_key") == share_payload_cache_key
+    refresh_share_payload = st.session_state.pop("refresh_share_payload_once", False)
+    if st.button("공유 지도/스냅샷 생성 또는 갱신", key="refresh_share_payload_button"):
+        refresh_share_payload = True
+    if not st.session_state.get("share_url"):
+        refresh_share_payload = True
 
-    share_snapshot_payload, share_snapshot_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="share")
-    share_key = f"run-{backend_run_id}-share" if backend_run_id > 0 else ""
-    if share_snapshot_payload is not None:
-        share_key = str(share_snapshot_payload.get("share_key", "")).strip() or share_key
-    share_url = build_backend_share_url(share_key) if share_key else f"{APP_URL}?map={share_name}"
+    if refresh_share_payload:
+        with st.spinner("공유/보고용 HTML 지도 갱신 중..."):
+            map_html = get_static_map_html(
+                cache_key=static_map_cache_key,
+                html_filename=html_filename,
+                valid_result=valid_result,
+                valid_grouped=valid_grouped,
+                route_prefix_map=route_prefix_map,
+                truck_request_map=truck_request_map,
+                route_line_label=route_line_label,
+                route_driver_map=route_driver_map,
+                route_camp_map=route_camp_map,
+                camp_coords=camp_coords,
+            )
+
+            save_share_payload(
+                share_name,
+                map_html,
+                view_assignment_df,
+                view_assigned_summary,
+                result_delivery_df=shared_result_delivery,
+                grouped_delivery_df=shared_grouped_delivery,
+                route_prefix_map=route_prefix_map,
+                truck_request_map=truck_request_map,
+                route_line_label=route_line_label,
+                route_camp_map=route_camp_map,
+                camp_coords=camp_coords,
+                group_assignment_df=latest_group_assignment_df,
+            )
+
+            snapshot_payload = {
+                "map_html": map_html,
+                "assignment_rows": view_assignment_df.fillna("").to_dict(orient="records"),
+                "assigned_summary_rows": view_assigned_summary.fillna("").to_dict(orient="records") if len(view_assigned_summary) > 0 else [],
+                "result_delivery_rows": _df_to_records_for_json(shared_result_delivery),
+                "grouped_delivery_rows": _df_to_records_for_json(shared_grouped_delivery),
+                "route_prefix_map": route_prefix_map,
+                "truck_request_map": truck_request_map,
+                "route_line_label": route_line_label,
+                "route_camp_map": route_camp_map,
+                "camp_coords": camp_coords,
+                "selected_filter": selected_filter,
+                "recommended_group_map": st.session_state.get("recommended_group_map", {}),
+                "recommended_group_count": safe_int(st.session_state.get("recommended_group_count", 0)),
+                "selected_group_filter": st.session_state.get("selected_group_filter", "전체"),
+                "group_assignment_rows": latest_group_assignment_df.fillna("").to_dict(orient="records") if len(latest_group_assignment_df) > 0 else [],
+            }
+            snapshot_save_payload, snapshot_save_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="recent")
+            if snapshot_save_error:
+                st.caption(f"Django snapshot sync failed: {snapshot_save_error}")
+            elif snapshot_save_payload is not None:
+                st.caption(f"Django snapshot synced: {snapshot_save_payload.get('share_key', '')}")
+
+            share_snapshot_payload, share_snapshot_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="share")
+            share_key = f"run-{backend_run_id}-share" if backend_run_id > 0 else ""
+            if share_snapshot_payload is not None:
+                share_key = str(share_snapshot_payload.get("share_key", "")).strip() or share_key
+            share_url = build_backend_share_url(share_key) if share_key else f"{APP_URL}?map={share_name}"
+
+            st.session_state["share_payload_cache_key"] = share_payload_cache_key
+            st.session_state["share_key"] = share_key
+            st.session_state["share_url"] = share_url
+            st.session_state["share_snapshot_error"] = share_snapshot_error
+            share_payload_ready = True
+    elif not share_payload_ready:
+        st.caption("공유 지도는 이전 생성본입니다. 최신 배정으로 공유하려면 '공유 지도/스냅샷 생성 또는 갱신'을 눌러 주세요.")
 
     st.subheader("지도 공유 링크")
     if share_snapshot_error:
