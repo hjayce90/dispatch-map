@@ -367,6 +367,35 @@ def render_stable_folium_map(
     return map_state
 
 
+def render_full_folium_map(
+    overlay_layers,
+    key: str,
+    center_key: str,
+    zoom_key: str,
+    height: int,
+    use_spiderfier: bool = False,
+):
+    center = coerce_map_center(st.session_state.get(center_key)) or DEFAULT_MAP_CENTER.copy()
+    zoom = safe_int(st.session_state.get(zoom_key, DEFAULT_MAP_ZOOM)) or DEFAULT_MAP_ZOOM
+    layers = overlay_layers or []
+
+    full_map = build_base_map(center=center, zoom=zoom, use_spiderfier=use_spiderfier)
+    for layer in layers:
+        layer.add_to(full_map)
+
+    map_state = st_folium(
+        full_map,
+        key=key,
+        width=None,
+        height=height,
+        center=center,
+        zoom=zoom,
+        returned_objects=["center", "zoom"],
+    )
+    sync_map_view_state_from_return(map_state, center_key, zoom_key)
+    return map_state
+
+
 def normalize_address(addr: str) -> str:
     if pd.isna(addr):
         return ""
@@ -3703,13 +3732,12 @@ with tab_basic:
             st.session_state["main_map_key_nonce"] = safe_int(st.session_state.get("main_map_key_nonce", 0)) + 1
         main_map_key_nonce = safe_int(st.session_state.get("main_map_key_nonce", 0))
         main_map_key = "dispatch_main_map" if main_map_key_nonce <= 0 else f"dispatch_main_map_{main_map_key_nonce}"
-        render_stable_folium_map(
+        render_full_folium_map(
             overlay_layers=map_overlay_layers,
             key=main_map_key,
             center_key="map_center",
             zoom_key="map_zoom",
             height=900,
-            fallback_flag_key="main_map_dynamic_fallback",
         )
 
         static_map_cache_key = build_static_map_cache_key(active_dataset_key, selected_filter, assignment_df)
