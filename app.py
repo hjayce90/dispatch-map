@@ -396,6 +396,51 @@ def render_full_folium_map(
     return map_state
 
 
+def build_main_overlay_cache_key(active_dataset_key: str, selected_filter: str, route_summary: pd.DataFrame, assignment_store: dict) -> str:
+    assignment_store = assignment_store if isinstance(assignment_store, dict) else {}
+    assignment_rows = []
+    for _, row in route_summary.iterrows():
+        route = str(row.get("route", "")).strip()
+        truck_request_id = str(row.get("truck_request_id", "")).strip()
+        if not route:
+            continue
+        assignment_key = make_assignment_key(route, truck_request_id)
+        assignment_rows.append({
+            "route": route,
+            "truck_request_id": truck_request_id,
+            "assigned_driver": str(assignment_store.get(assignment_key, "")).strip(),
+        })
+    payload = json.dumps(
+        {
+            "cache_version": "main_overlay_v2",
+            "dataset": str(active_dataset_key or ""),
+            "filter": str(selected_filter or ""),
+            "assignment": sorted(assignment_rows, key=lambda r: (r["route"], r["truck_request_id"])),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def get_cached_main_map_data(cache_key: str):
+    if st.session_state.get("main_map_data_cache_key") != cache_key:
+        return None
+    return {
+        "valid_result": st.session_state.get("main_overlay_valid_result", pd.DataFrame()),
+        "valid_grouped": st.session_state.get("main_overlay_valid_grouped", pd.DataFrame()),
+        "route_driver_map": st.session_state.get("main_overlay_route_driver_map", {}),
+    }
+
+
+def set_cached_main_map_data(cache_key: str, valid_result, valid_grouped, route_driver_map):
+    st.session_state["main_map_data_cache_key"] = cache_key
+    st.session_state["main_overlay_valid_result"] = valid_result
+    st.session_state["main_overlay_valid_grouped"] = valid_grouped
+    st.session_state["main_overlay_route_driver_map"] = route_driver_map
+
+
 def normalize_address(addr: str) -> str:
     if pd.isna(addr):
         return ""
@@ -1220,6 +1265,63 @@ def save_assignment_history_for_date(assignment_df: pd.DataFrame, base_date: str
     return len(save_rows)
 
 
+def resolve_assignment_total_qty_col(df: pd.DataFrame):
+    if not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return None
+    for column in ["총합", "珥앺빀", "total_qty"]:
+        if column in df.columns:
+            return column
+    return None
+
+
+def build_live_assignment_today_qty_map(assignment_df: pd.DataFrame):
+    if not isinstance(assignment_df, pd.DataFrame) or len(assignment_df) == 0 or "assigned_driver" not in assignment_df.columns:
+        return {}
+
+    live_df = assignment_df.copy()
+    live_df["assigned_driver"] = live_df["assigned_driver"].fillna("").astype(str).str.strip()
+    live_df = live_df[live_df["assigned_driver"] != ""].copy()
+    if len(live_df) == 0:
+        return {}
+
+    total_qty_col = resolve_assignment_total_qty_col(live_df)
+    if total_qty_col:
+        live_df["_today_qty"] = pd.to_numeric(live_df[total_qty_col], errors="coerce").fillna(0)
+    else:
+        qty_cols = [c for c in ["소형", "중형", "대형", "小型", "中型", "大型", "小", "中", "大", "ae_sum", "af_sum", "ag_sum", "?뚰삎??", "以묓삎??", "??뺥빀"] if c in live_df.columns]
+        if not qty_cols:
+            return {}
+        live_df["_today_qty"] = 0
+        for col in qty_cols:
+            live_df["_today_qty"] += pd.to_numeric(live_df[col], errors="coerce").fillna(0)
+
+    return live_df.groupby("assigned_driver")["_today_qty"].sum().to_dict()
+
+
+def check_live_today_stats_consistency(assignment_df: pd.DataFrame, stats_df: pd.DataFrame):
+    if not isinstance(stats_df, pd.DataFrame) or len(stats_df) == 0:
+        return
+
+    driver_col = next((c for c in ["기사명", "湲곗궗紐?"] if c in stats_df.columns), None)
+    today_col = next((c for c in ["오늘물량", "?ㅻ뒛臾쇰웾"] if c in stats_df.columns), None)
+    if not driver_col or not today_col:
+        return
+
+    live_map = {str(k).strip(): safe_int(v) for k, v in build_live_assignment_today_qty_map(assignment_df).items()}
+    stats_map = {
+        str(row.get(driver_col, "")).strip(): safe_int(row.get(today_col, 0))
+        for _, row in stats_df.iterrows()
+        if str(row.get(driver_col, "")).strip()
+    }
+    mismatch = {
+        driver: {"live": live_map.get(driver, 0), "stats": stats_map.get(driver, 0)}
+        for driver in set(live_map) | set(stats_map)
+        if safe_int(live_map.get(driver, 0)) != safe_int(stats_map.get(driver, 0))
+    }
+    if mismatch:
+        logger.warning("Live assignment today qty differs from stats today qty: %s", mismatch)
+
+
 def build_driver_assignment_stats_df(
     assignment_df: pd.DataFrame,
     history_df: pd.DataFrame,
@@ -1258,8 +1360,7 @@ def build_driver_assignment_stats_df(
     else:
         base_dt = base_dt.normalize()
 
-    today_hist = hist[hist["date_dt"] == base_dt].copy()
-    today_qty_map = today_hist.groupby("driver")["total_qty"].sum().to_dict() if len(today_hist) > 0 else {}
+    today_qty_map = build_live_assignment_today_qty_map(assignment_df)
 
     hist_before_today = hist[hist["date_dt"] < base_dt].copy()
     common_recent_date = hist_before_today["date_dt"].max() if len(hist_before_today) > 0 else pd.NaT
@@ -1593,7 +1694,7 @@ def render_debug_status_panel(
     valid_result: pd.DataFrame,
     valid_grouped: pd.DataFrame,
 ):
-    if not st.checkbox("디버그 표시", value=True, key="debug_status_visible"):
+    if not st.checkbox("디버그 표시", value=False, key="debug_status_visible"):
         return
 
     last_changes = st.session_state.get("last_assignment_changes", [])
@@ -1624,6 +1725,8 @@ def render_debug_status_panel(
         st.write("메인 지도 렌더 직전 상태")
         st.json({
             "main_map_key": str(main_map_key or ""),
+            "overlay_cache_key": str(st.session_state.get("main_map_data_cache_key", "")),
+            "overlay_cache_status": str(st.session_state.get("main_overlay_cache_status", "")),
             "marker_count": safe_int(marker_count),
             "selected_filter": str(selected_filter or ""),
             "assignment_df_rows": safe_int(len(assignment_df)) if isinstance(assignment_df, pd.DataFrame) else 0,
@@ -2721,11 +2824,19 @@ def build_dispatch_overlay_layers(
     route_camp_map: dict,
     camp_coords: dict,
     highlighted_driver: str = "",
+    coords_already_sanitized: bool = False,
+    lightweight: bool = False,
 ):
-    valid_result_safe, invalid_result_count = _sanitize_coords_column(valid_result, log_label="render_map_result")
-    valid_grouped_safe, invalid_grouped_count = _sanitize_coords_column(valid_grouped, log_label="render_map_grouped")
-    valid_result_safe = valid_result_safe[valid_result_safe["coords"].notna()].copy() if "coords" in valid_result_safe.columns else pd.DataFrame()
-    valid_grouped_safe = valid_grouped_safe[valid_grouped_safe["coords"].notna()].copy() if "coords" in valid_grouped_safe.columns else pd.DataFrame()
+    if coords_already_sanitized:
+        valid_result_safe = valid_result.copy() if isinstance(valid_result, pd.DataFrame) else pd.DataFrame()
+        valid_grouped_safe = valid_grouped.copy() if isinstance(valid_grouped, pd.DataFrame) else pd.DataFrame()
+        invalid_result_count = 0
+        invalid_grouped_count = 0
+    else:
+        valid_result_safe, invalid_result_count = _sanitize_coords_column(valid_result, log_label="render_map_result")
+        valid_grouped_safe, invalid_grouped_count = _sanitize_coords_column(valid_grouped, log_label="render_map_grouped")
+        valid_result_safe = valid_result_safe[valid_result_safe["coords"].notna()].copy() if "coords" in valid_result_safe.columns else pd.DataFrame()
+        valid_grouped_safe = valid_grouped_safe[valid_grouped_safe["coords"].notna()].copy() if "coords" in valid_grouped_safe.columns else pd.DataFrame()
 
     if invalid_result_count > 0 or invalid_grouped_count > 0:
         logger.debug(
@@ -2787,19 +2898,106 @@ def build_dispatch_overlay_layers(
 
     overlap_info_map = build_overlap_info_map(valid_grouped_safe)
 
-    for key, part in valid_grouped_safe.assign(
-        coord_key=valid_grouped_safe["coords"].apply(
-            lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else ""
-        )
-    ).groupby("coord_key"):
-        if key == "":
-            continue
-        route_names = sorted(part["route"].dropna().astype(str).unique().tolist())
-        driver_names = sorted([d for d in part["assigned_driver"].fillna("").astype(str).unique().tolist() if d.strip() != ""])
-        overlap_info_map[key]["routes"] = route_names
-        overlap_info_map[key]["drivers"] = driver_names
+    if not lightweight:
+        for key, part in valid_grouped_safe.assign(
+            coord_key=valid_grouped_safe["coords"].apply(
+                lambda c: f"{round(float(c[0]), 6)}_{round(float(c[1]), 6)}" if isinstance(c, (tuple, list)) and len(c) == 2 else ""
+            )
+        ).groupby("coord_key"):
+            if key == "":
+                continue
+            route_names = sorted(part["route"].dropna().astype(str).unique().tolist())
+            driver_names = sorted([d for d in part["assigned_driver"].fillna("").astype(str).unique().tolist() if d.strip() != ""])
+            overlap_info_map[key]["routes"] = route_names
+            overlap_info_map[key]["drivers"] = driver_names
 
     active_driver = str(highlighted_driver or "").strip()
+
+    if lightweight:
+        line_group = folium.FeatureGroup(name="routes", show=True)
+        marker_group = folium.FeatureGroup(name="stops", show=True)
+
+        for route in route_list:
+            truck_request_id = truck_request_map.get(route, "")
+            camp_code = route_camp_map.get(route, "")
+            camp_name = CAMP_INFO.get(camp_code, {}).get("camp_name", "")
+            route_driver = route_driver_map.get(route, "")
+            is_assigned_route = str(route_driver).strip() != ""
+
+            route_df_line = valid_result_safe[
+                (valid_result_safe["route"] == route)
+            ].sort_values("house_order")
+            line_points = []
+            route_df_line_house = route_df_line.drop_duplicates(subset=["address_norm"], keep="first")
+            for _, row in route_df_line_house.iterrows():
+                coords = _normalize_coords(row.get("coords"))
+                if coords is None:
+                    continue
+                line_points.append([coords[0], coords[1]])
+
+            if is_assigned_route:
+                line_color = driver_color_map.get(route_driver, "#1e88e5")
+                dash_value = "8, 6"
+            else:
+                line_color = route_color_map.get(route, "#1e88e5")
+                dash_value = None
+
+            if len(line_points) >= 2:
+                folium.PolyLine(
+                    line_points,
+                    color=line_color,
+                    weight=3,
+                    opacity=0.8,
+                    tooltip=str(route_prefix_map.get(route, "") or truck_request_id or route),
+                    dash_array=dash_value,
+                ).add_to(line_group)
+
+            route_grouped = valid_grouped_safe[valid_grouped_safe["route"] == route].copy()
+            for _, row in route_grouped.iterrows():
+                coords = _normalize_coords(row.get("coords"))
+                if coords is None:
+                    continue
+                lat, lon = coords
+                coord_key = f"{round(float(lat), 6)}_{round(float(lon), 6)}"
+                overlap_info = overlap_info_map.get(coord_key, {})
+                lat, lon, overlap_count = spread_overlapping_marker(lat, lon, overlap_info, row)
+
+                driver_name = str(row.get("assigned_driver", "")).strip()
+                is_assigned_pin = driver_name != ""
+                pin_color = driver_color_map.get(driver_name, "#1e88e5") if is_assigned_pin else route_color_map.get(route, "#1e88e5")
+                memo = str(row.get("customer_memo", "")).strip()
+                memo_html = f"<br>메모: {memo}" if memo else ""
+                overlap_html = f"<br>동일위치 {overlap_count}건" if overlap_count > 1 else ""
+                popup_html = (
+                    f"<b>{row.get('route', '')}</b> / {driver_name or '미배정'}<br>"
+                    f"{row.get('company_name', '')}<br>"
+                    f"{row.get('address', '')}<br>"
+                    f"물량 {safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}"
+                    f"{memo_html}{overlap_html}"
+                )
+                tooltip_text = (
+                    f"{row.get('pin_label', '')} / {row.get('first_time', '')} / "
+                    f"{safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}"
+                )
+                house_order = safe_int(row.get("house_order", 0))
+                route_total = safe_int(row.get("route_total", 0))
+                radius = 5 if route_total > 0 and house_order in {1, route_total} else 4
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=radius,
+                    color=pin_color,
+                    weight=2 if is_assigned_pin else 1,
+                    fill=True,
+                    fill_color=pin_color,
+                    fill_opacity=0.85,
+                    opacity=0.45 if (active_driver != "" and driver_name != active_driver) else 1.0,
+                    popup=folium.Popup(popup_html, max_width=260),
+                    tooltip=tooltip_text,
+                ).add_to(marker_group)
+
+        overlay_layers.append(line_group)
+        overlay_layers.append(marker_group)
+        return overlay_layers, map_center
 
     for route in route_list:
         truck_request_id = truck_request_map.get(route, "")
@@ -3931,15 +4129,34 @@ with tab_basic:
         st.subheader("지도")
         st.subheader("기사별 필터")
         driver_filter_options = ["전체", "미배정"] + drivers
-        selected_filter_index = driver_filter_options.index(restored_selected_filter) if restored_selected_filter in driver_filter_options else 0
-        selected_filter = st.selectbox("지도 표시 대상", driver_filter_options, index=selected_filter_index)
+        if st.session_state.get("selected_filter_dataset_key") != active_dataset_key:
+            st.session_state["selected_filter_value"] = "전체"
+            st.session_state["selected_filter_dataset_key"] = active_dataset_key
+        if st.session_state.get("selected_filter_value") not in driver_filter_options:
+            st.session_state["selected_filter_value"] = "전체"
+        selected_filter = st.selectbox("지도 표시 대상", driver_filter_options, key="selected_filter_value")
 
-        valid_result, valid_grouped, route_driver_map = build_map_data(
-            result_delivery=result_delivery,
-            grouped_delivery=grouped_delivery,
-            assignment_df=assignment_df,
-            selected_filter=selected_filter
+        main_overlay_cache_key = build_main_overlay_cache_key(
+            active_dataset_key,
+            selected_filter,
+            route_summary,
+            st.session_state["assignment_store"],
         )
+        cached_main_map_data = get_cached_main_map_data(main_overlay_cache_key)
+        if cached_main_map_data:
+            valid_result = cached_main_map_data["valid_result"]
+            valid_grouped = cached_main_map_data["valid_grouped"]
+            route_driver_map = cached_main_map_data["route_driver_map"]
+            st.session_state["main_overlay_cache_status"] = "data_hit"
+        else:
+            valid_result, valid_grouped, route_driver_map = build_map_data(
+                result_delivery=result_delivery,
+                grouped_delivery=grouped_delivery,
+                assignment_df=assignment_df,
+                selected_filter=selected_filter
+            )
+            set_cached_main_map_data(main_overlay_cache_key, valid_result, valid_grouped, route_driver_map)
+            st.session_state["main_overlay_cache_status"] = "data_miss"
 
         st.write(f"캐시 주소 수: {len(cache)}")
         st.write(f"현재 필터: {selected_filter}")
@@ -3955,6 +4172,8 @@ with tab_basic:
                 route_driver_map=route_driver_map,
                 route_camp_map=route_camp_map,
                 camp_coords=camp_coords,
+                coords_already_sanitized=True,
+                lightweight=True,
             )
 
         marker_count = len(valid_grouped)
@@ -4031,10 +4250,11 @@ with tab_stats:
         driver_candidates=drivers,
         base_date=base_date_str,
     )
+    check_live_today_stats_consistency(assignment_df, stats_df)
 
     st.subheader("기사별 배정 통계")
     with st.expander("기사별 배정 통계 (최근 7일/30일)", expanded=True):
-        st.caption("오늘물량/최근근무일(1일) 물량/7일·30일 근무일평균은 assignment_history.csv 저장 이력 기준입니다.")
+        st.caption("오늘물량은 현재 화면의 최신 배정 기준이고, 최근근무일/7일/30일 평균은 assignment_history.csv 이력 기준입니다.")
         if recent_work_date_str:
             st.caption(f"최근근무일(1일) 기준일: {recent_work_date_str}")
         else:
