@@ -469,16 +469,37 @@ def is_fresh_local_assignment_state(route_summary: pd.DataFrame, assignment_stor
     return any(key in assignment_store for key in current_keys)
 
 
+def record_backend_merge_debug(dataset_key: str, route_summary: pd.DataFrame, assignment_store: dict, should_merge: bool, reason: str):
+    current_keys = current_assignment_keys(route_summary)
+    st.session_state["backend_merge_debug"] = {
+        "dataset_key": str(dataset_key or ""),
+        "should_merge_backend_assignments": bool(should_merge),
+        "reason": str(reason or ""),
+        "disable_backend_merge": bool(st.session_state.get("disable_backend_merge", False)),
+        "backend_dataset_key": str(st.session_state.get("backend_dataset_key", "")),
+        "backend_sync_done": str(st.session_state.get("backend_sync_done", "")),
+        "assignment_local_source_dataset_key": str(st.session_state.get("assignment_local_source_dataset_key", "")),
+        "backend_assignment_merge_dataset_key": str(st.session_state.get("backend_assignment_merge_dataset_key", "")),
+        "current_route_key_count": len(current_keys),
+        "assignment_store_current_key_count": sum(1 for key in current_keys if isinstance(assignment_store, dict) and key in assignment_store),
+    }
+
+
 def should_merge_backend_assignments(dataset_key: str, route_summary: pd.DataFrame, assignment_store: dict) -> bool:
     if st.session_state.get("disable_backend_merge"):
+        record_backend_merge_debug(dataset_key, route_summary, assignment_store, False, "disable_backend_merge")
         return False
     if st.session_state.get("assignment_local_source_dataset_key") == dataset_key:
+        record_backend_merge_debug(dataset_key, route_summary, assignment_store, False, "local_source_dataset_key match")
         return False
     if st.session_state.get("backend_assignment_merge_dataset_key") == dataset_key:
+        record_backend_merge_debug(dataset_key, route_summary, assignment_store, False, "backend_assignment_merge_dataset_key match")
         return False
     if is_fresh_local_assignment_state(route_summary, assignment_store):
         st.session_state["assignment_local_source_dataset_key"] = dataset_key
+        record_backend_merge_debug(dataset_key, route_summary, assignment_store, False, "fresh_local_assignment_state")
         return False
+    record_backend_merge_debug(dataset_key, route_summary, assignment_store, True, "no local assignment state for current dataset")
     return True
 
 
@@ -1431,6 +1452,164 @@ def save_assignment_store(store):
         return str(exc)
 
 
+def build_assignment_change_rows(route_summary: pd.DataFrame, old_store: dict, new_store: dict):
+    changes = []
+    if not isinstance(route_summary, pd.DataFrame) or len(route_summary) == 0:
+        return changes
+
+    old_store = old_store if isinstance(old_store, dict) else {}
+    new_store = new_store if isinstance(new_store, dict) else {}
+    sort_cols = [c for c in ["route_prefix", "route", "truck_request_id"] if c in route_summary.columns]
+    work_df = route_summary.sort_values(sort_cols).reset_index(drop=True) if sort_cols else route_summary.reset_index(drop=True)
+    for _, row in work_df.iterrows():
+        route = str(row.get("route", "")).strip()
+        truck_request_id = str(row.get("truck_request_id", "")).strip()
+        if not route:
+            continue
+        assignment_key = make_assignment_key(route, truck_request_id)
+        old_driver = str(old_store.get(assignment_key, "")).strip()
+        new_driver = str(new_store.get(assignment_key, "")).strip()
+        if old_driver == new_driver:
+            continue
+        changes.append({
+            "route": route,
+            "truck_request_id": truck_request_id,
+            "assignment_key": assignment_key,
+            "old_driver": old_driver,
+            "new_driver": new_driver,
+        })
+    return changes
+
+
+def build_debug_assignment_sample_df(route_summary: pd.DataFrame, assignment_store: dict, assignment_df: pd.DataFrame, limit: int = 10):
+    if not isinstance(route_summary, pd.DataFrame) or len(route_summary) == 0:
+        return pd.DataFrame(columns=["route", "truck_request_id", "assignment_key", "session_store_driver", "assignment_df_driver"])
+
+    assignment_store = assignment_store if isinstance(assignment_store, dict) else {}
+    assignment_df_driver_map = {}
+    if isinstance(assignment_df, pd.DataFrame) and len(assignment_df) > 0:
+        for _, row in assignment_df.iterrows():
+            route = str(row.get("route", "")).strip()
+            truck_request_id = str(row.get("truck_request_id", "")).strip()
+            if route:
+                assignment_df_driver_map[make_assignment_key(route, truck_request_id)] = str(row.get("assigned_driver", "")).strip()
+
+    sort_cols = [c for c in ["route_prefix", "route", "truck_request_id"] if c in route_summary.columns]
+    sample_df = route_summary.sort_values(sort_cols).head(limit).reset_index(drop=True) if sort_cols else route_summary.head(limit).reset_index(drop=True)
+    rows = []
+    for _, row in sample_df.iterrows():
+        route = str(row.get("route", "")).strip()
+        truck_request_id = str(row.get("truck_request_id", "")).strip()
+        assignment_key = make_assignment_key(route, truck_request_id)
+        rows.append({
+            "route": route,
+            "truck_request_id": truck_request_id,
+            "assignment_key": assignment_key,
+            "session_store_driver": str(assignment_store.get(assignment_key, "")).strip(),
+            "assignment_df_driver": assignment_df_driver_map.get(assignment_key, ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_assignment_file_debug(route_summary: pd.DataFrame, last_changes):
+    assignment_path = Path(ASSIGNMENT_FILE).resolve()
+    exists = assignment_path.exists()
+    file_store = load_assignment_store() if exists else {}
+    file_store = file_store if isinstance(file_store, dict) else {}
+    current_keys = current_assignment_keys(route_summary)
+
+    file_info = {
+        "exists": exists,
+        "path": str(assignment_path),
+        "size_bytes": assignment_path.stat().st_size if exists else 0,
+        "modified_at": pd.Timestamp.fromtimestamp(assignment_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S") if exists else "",
+        "json_total_key_count": len(file_store),
+        "current_dataset_route_key_count": len(current_keys),
+        "json_current_dataset_key_count": sum(1 for key in current_keys if key in file_store),
+    }
+
+    rows = []
+    for change in last_changes or []:
+        assignment_key = str(change.get("assignment_key", "")).strip()
+        if not assignment_key:
+            assignment_key = make_assignment_key(change.get("route", ""), change.get("truck_request_id", ""))
+        rows.append({
+            "route": str(change.get("route", "")).strip(),
+            "truck_request_id": str(change.get("truck_request_id", "")).strip(),
+            "assignment_key": assignment_key,
+            "new_driver": str(change.get("new_driver", "")).strip(),
+            "file_contains_key": assignment_key in file_store,
+            "file_driver": str(file_store.get(assignment_key, "")).strip(),
+        })
+    return file_info, pd.DataFrame(rows)
+
+
+def render_debug_status_panel(
+    route_summary: pd.DataFrame,
+    assignment_store: dict,
+    assignment_df: pd.DataFrame,
+    selected_filter: str,
+    main_map_key: str,
+    marker_count: int,
+    valid_result: pd.DataFrame,
+    valid_grouped: pd.DataFrame,
+):
+    if not st.checkbox("디버그 표시", value=True, key="debug_status_visible"):
+        return
+
+    last_changes = st.session_state.get("last_assignment_changes", [])
+    file_info, last_file_df = build_assignment_file_debug(route_summary, last_changes)
+
+    with st.expander("디버그 상태", expanded=True):
+        st.write("실행 경로 / backend 상태")
+        st.json({
+            "current_file": str(Path(__file__).resolve()),
+            "cwd": str(Path.cwd()),
+            "assignment_file": str(Path(ASSIGNMENT_FILE).resolve()),
+            "backend_run_id": safe_int(st.session_state.get("backend_run_id", 0)),
+            "backend_dataset_key": str(st.session_state.get("backend_dataset_key", "")),
+            "backend_sync_done": str(st.session_state.get("backend_sync_done", "")),
+            "disable_backend_merge": bool(st.session_state.get("disable_backend_merge", False)),
+            "assignment_local_source_dataset_key": str(st.session_state.get("assignment_local_source_dataset_key", "")),
+            "main_map_key_nonce": safe_int(st.session_state.get("main_map_key_nonce", 0)),
+            "main_map_key": str(main_map_key or ""),
+        })
+
+        st.write("backend merge 판단")
+        st.json(st.session_state.get("backend_merge_debug", {}))
+
+        st.write("메인 지도 렌더 직전 상태")
+        st.json({
+            "main_map_key": str(main_map_key or ""),
+            "marker_count": safe_int(marker_count),
+            "selected_filter": str(selected_filter or ""),
+            "assignment_df_rows": safe_int(len(assignment_df)) if isinstance(assignment_df, pd.DataFrame) else 0,
+            "valid_result_rows": safe_int(len(valid_result)) if isinstance(valid_result, pd.DataFrame) else 0,
+            "valid_grouped_rows": safe_int(len(valid_grouped)) if isinstance(valid_grouped, pd.DataFrame) else 0,
+        })
+
+        st.write("route_assignments.json 상태")
+        st.json(file_info)
+        if len(last_file_df) > 0:
+            st.write("마지막 변경 route가 JSON에 저장됐는지")
+            st.dataframe(last_file_df, use_container_width=True)
+        else:
+            st.caption("마지막 변경 route 기록이 아직 없습니다.")
+
+        st.write("마지막 저장 변경 route")
+        last_changes_df = pd.DataFrame(last_changes or [])
+        if len(last_changes_df) > 0:
+            st.dataframe(last_changes_df, use_container_width=True)
+        else:
+            st.caption("이번 세션에서 추적된 저장 변경 route가 없습니다.")
+
+        st.write("현재 route assignment 샘플")
+        st.dataframe(
+            build_debug_assignment_sample_df(route_summary, assignment_store, assignment_df, limit=10),
+            use_container_width=True,
+        )
+
+
 def load_cancel_store():
     if os.path.exists(CANCEL_FILE):
         try:
@@ -2275,6 +2454,11 @@ def render_group_driver_assignment_form(
             st.warning("추천그룹 배정으로 실제 변경된 route가 없습니다.")
             return assignment_store
 
+        st.session_state["last_assignment_changes"] = build_assignment_change_rows(
+            route_summary,
+            assignment_store,
+            updated_store,
+        )
         st.session_state["assignment_store"] = updated_store
         persist_result = persist_assignment_store(
             route_summary=route_summary,
@@ -2410,6 +2594,11 @@ def render_assignment_form(
         submitted = st.form_submit_button("기사 배정 적용")
 
     if submitted:
+        st.session_state["last_assignment_changes"] = build_assignment_change_rows(
+            route_summary,
+            assignment_store,
+            new_assignment_store,
+        )
         st.session_state["assignment_store"] = new_assignment_store
         persist_result = persist_assignment_store(
             route_summary=route_summary,
@@ -3732,6 +3921,17 @@ with tab_basic:
             st.session_state["main_map_key_nonce"] = safe_int(st.session_state.get("main_map_key_nonce", 0)) + 1
         main_map_key_nonce = safe_int(st.session_state.get("main_map_key_nonce", 0))
         main_map_key = "dispatch_main_map" if main_map_key_nonce <= 0 else f"dispatch_main_map_{main_map_key_nonce}"
+        st.session_state["last_main_map_key"] = main_map_key
+        render_debug_status_panel(
+            route_summary=route_summary,
+            assignment_store=st.session_state["assignment_store"],
+            assignment_df=assignment_df,
+            selected_filter=selected_filter,
+            main_map_key=main_map_key,
+            marker_count=marker_count,
+            valid_result=valid_result,
+            valid_grouped=valid_grouped,
+        )
         render_full_folium_map(
             overlay_layers=map_overlay_layers,
             key=main_map_key,
