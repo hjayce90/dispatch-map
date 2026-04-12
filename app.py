@@ -1061,15 +1061,59 @@ def build_driver_memo_report(grouped_delivery: pd.DataFrame) -> str:
         return "[기사별 업체 메모]\n표시할 메모가 없습니다."
 
     work_df = grouped_delivery.copy()
-    work_df["assigned_driver"] = work_df.get("assigned_driver", "").fillna("").astype(str).str.strip()
-    work_df["customer_memo"] = work_df.get("customer_memo", "").fillna("").astype(str).str.strip()
+    for col in ["assigned_driver", "customer_memo", "company_id", "company_name", "address_norm", "first_time"]:
+        if col not in work_df.columns:
+            work_df[col] = ""
+
+    work_df["assigned_driver"] = work_df["assigned_driver"].fillna("").astype(str).str.strip()
+    work_df["customer_memo"] = work_df["customer_memo"].fillna("").astype(str).str.strip()
+    work_df["company_id"] = work_df["company_id"].fillna("").astype(str).str.strip()
+    work_df["company_name"] = work_df["company_name"].fillna("").astype(str).str.strip()
+    work_df["address_norm"] = work_df["address_norm"].fillna("").astype(str).str.strip()
+    work_df["first_time"] = work_df["first_time"].fillna("").astype(str).str.strip()
     work_df = work_df[(work_df["assigned_driver"] != "") & (work_df["customer_memo"] != "")].copy()
     if len(work_df) == 0:
         return "[기사별 업체 메모]\n표시할 메모가 없습니다."
 
-    sort_cols = [c for c in ["assigned_driver", "first_time", "route", "house_order"] if c in work_df.columns]
+    def _memo_company_key(row):
+        company_id = str(row["company_id"]).strip()
+        if company_id:
+            return f"id:{company_id}"
+        company_name = str(row["company_name"]).strip()
+        address_norm = str(row["address_norm"]).strip()
+        if company_name or address_norm:
+            return f"name:{company_name}|addr:{address_norm}"
+        return f"row:{row.name}"
+
+    def _memo_time_sort_value(value):
+        text = str(value or "").strip()
+        match = re.search(r"(\d{1,2}):(\d{1,2})", text)
+        if match:
+            hour = safe_int(match.group(1))
+            minute = safe_int(match.group(2))
+            return f"{hour:02d}:{minute:02d}"
+        return text if text else "99:99"
+
+    before_dedupe_count = len(work_df)
+    work_df["_memo_company_key"] = work_df.apply(_memo_company_key, axis=1)
+    work_df["_first_time_sort"] = work_df["first_time"].apply(_memo_time_sort_value)
+
+    sort_cols = [c for c in ["assigned_driver", "_first_time_sort", "route", "house_order"] if c in work_df.columns]
     if sort_cols:
         work_df = work_df.sort_values(sort_cols)
+
+    work_df = (
+        work_df.groupby(["assigned_driver", "_memo_company_key"], as_index=False, sort=False)
+        .agg(
+            first_time=("first_time", "first"),
+            company_name=("company_name", "first"),
+            customer_memo=("customer_memo", "first"),
+            _first_time_sort=("_first_time_sort", "first"),
+        )
+        .sort_values(["assigned_driver", "_first_time_sort", "company_name"], kind="stable")
+        .reset_index(drop=True)
+    )
+    logger.info("Driver memo report deduped from %s rows to %s rows.", before_dedupe_count, len(work_df))
 
     lines = ["[기사별 업체 메모]"]
     for driver_name, part in work_df.groupby("assigned_driver", sort=True):
@@ -2103,6 +2147,21 @@ def make_assigned_square_icon(route_color: str, stop_text: str, size_scale: floa
     return DivIcon(html=html, icon_size=(icon_size, icon_size), icon_anchor=(anchor, anchor))
 
 
+def make_lightweight_stop_label_icon(route_color: str, stop_text: str, assigned: bool = False):
+    label = re.sub(r"[<>'\"\s]", "", str(stop_text or "").strip())[:4] or "?"
+    width = 26 if len(label) <= 2 else 34
+    radius = 5 if assigned else 13
+    font_size = "10px" if len(label) <= 3 else "9px"
+    html = (
+        f"<div style=\"width:{width}px;height:22px;border-radius:{radius}px;"
+        f"background:{route_color};border:1px solid #fff;color:#fff;"
+        f"text-align:center;line-height:20px;font-size:{font_size};"
+        "font-weight:700;box-shadow:0 1px 3px rgba(0,0,0,.35);\">"
+        f"{label}</div>"
+    )
+    return DivIcon(html=html, icon_size=(width, 22), icon_anchor=(width // 2, 11))
+
+
 def make_diamond_div_icon(bg_color: str, text_value: str):
     html = f"""
     <div style="
@@ -2688,6 +2747,98 @@ def spread_overlapping_marker(lat: float, lon: float, overlap_info: dict, row: p
     return lat, lon, overlap_count
 
 
+def build_lightweight_stop_rows(valid_grouped: pd.DataFrame, route_prefix_map: dict) -> pd.DataFrame:
+    if not isinstance(valid_grouped, pd.DataFrame) or len(valid_grouped) == 0:
+        return pd.DataFrame()
+
+    work = valid_grouped.copy()
+    if "route" not in work.columns:
+        return work
+
+    if "address_norm" not in work.columns:
+        work["address_norm"] = ""
+
+    work["_lightweight_row_order"] = range(len(work))
+    work["_lightweight_address_norm"] = work["address_norm"].fillna("").astype(str).str.strip()
+    if "house_order" in work.columns:
+        work["_lightweight_house_order"] = pd.to_numeric(work["house_order"], errors="coerce").fillna(0)
+    else:
+        work["_lightweight_house_order"] = 0
+
+    work = work.sort_values(
+        ["route", "_lightweight_house_order", "_lightweight_row_order"],
+        kind="stable",
+    )
+
+    merged_rows = []
+    for route, route_part in work.groupby("route", sort=False):
+        route_part = route_part.copy()
+        route_part["_lightweight_stop_key"] = route_part.apply(
+            lambda r: r["_lightweight_address_norm"] or f"__row_{safe_int(r['_lightweight_row_order'])}",
+            axis=1,
+        )
+
+        route_rows = []
+        for _, part in route_part.groupby("_lightweight_stop_key", sort=False):
+            part = part.sort_values(["_lightweight_house_order", "_lightweight_row_order"], kind="stable")
+            row = part.iloc[0].to_dict()
+
+            for qty_col in ["ae_sum", "af_sum", "ag_sum"]:
+                if qty_col in part.columns:
+                    row[qty_col] = safe_int(pd.to_numeric(part[qty_col], errors="coerce").fillna(0).sum())
+
+            company_names = [
+                str(v).strip()
+                for v in part.get("company_name", pd.Series(dtype=object)).fillna("").tolist()
+                if str(v).strip()
+            ]
+            unique_company_names = list(dict.fromkeys(company_names))
+            if len(unique_company_names) > 1:
+                row["company_name"] = f"{unique_company_names[0]} 외 {len(unique_company_names) - 1}곳"
+            elif len(unique_company_names) == 1:
+                row["company_name"] = unique_company_names[0]
+
+            for text_col in ["address", "customer_memo", "first_time"]:
+                if text_col in part.columns:
+                    values = [str(v).strip() for v in part[text_col].fillna("").tolist() if str(v).strip()]
+                    if values:
+                        row[text_col] = values[0]
+
+            merged_count = safe_int(len(part))
+            row["lightweight_merged_count"] = merged_count
+            row["stop_count"] = 1
+            if not str(row.get("address_norm", "")).strip():
+                row["address_norm"] = row["_lightweight_stop_key"]
+            route_rows.append(row)
+
+        route_rows = sorted(
+            route_rows,
+            key=lambda r: (safe_int(r.get("_lightweight_house_order", r.get("house_order", 0))), safe_int(r.get("_lightweight_row_order", 0))),
+        )
+        route_total = len(route_rows)
+        route_prefix = str(route_prefix_map.get(route, "") or "").strip()
+        for stop_index, row in enumerate(route_rows, start=1):
+            stop_label = f"{route_prefix}{stop_index}" if route_prefix else str(stop_index)
+            row["house_order"] = stop_index
+            row["route_total"] = route_total
+            row["pin_label"] = stop_label
+            row["lightweight_stop_label"] = stop_label
+            merged_rows.append(row)
+
+    if not merged_rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(merged_rows).drop(
+        columns=[
+            "_lightweight_row_order",
+            "_lightweight_address_norm",
+            "_lightweight_house_order",
+            "_lightweight_stop_key",
+        ],
+        errors="ignore",
+    )
+
+
 def render_assignment_form(
     route_summary: pd.DataFrame,
     drivers,
@@ -2896,7 +3047,9 @@ def build_dispatch_overlay_layers(
         for i, driver in enumerate(driver_list)
     }
 
-    overlap_info_map = build_overlap_info_map(valid_grouped_safe)
+    lightweight_stop_rows = build_lightweight_stop_rows(valid_grouped_safe, route_prefix_map) if lightweight else pd.DataFrame()
+    overlap_info_source = lightweight_stop_rows if lightweight else valid_grouped_safe
+    overlap_info_map = build_overlap_info_map(overlap_info_source)
 
     if not lightweight:
         for key, part in valid_grouped_safe.assign(
@@ -2952,7 +3105,11 @@ def build_dispatch_overlay_layers(
                     dash_array=dash_value,
                 ).add_to(line_group)
 
-            route_grouped = valid_grouped_safe[valid_grouped_safe["route"] == route].copy()
+            route_grouped = (
+                lightweight_stop_rows[lightweight_stop_rows["route"] == route].copy()
+                if "route" in lightweight_stop_rows.columns
+                else pd.DataFrame()
+            )
             for _, row in route_grouped.iterrows():
                 coords = _normalize_coords(row.get("coords"))
                 if coords is None:
@@ -2965,34 +3122,31 @@ def build_dispatch_overlay_layers(
                 driver_name = str(row.get("assigned_driver", "")).strip()
                 is_assigned_pin = driver_name != ""
                 pin_color = driver_color_map.get(driver_name, "#1e88e5") if is_assigned_pin else route_color_map.get(route, "#1e88e5")
+                stop_label = str(row.get("lightweight_stop_label", row.get("pin_label", ""))).strip()
+                marker_label = f"{short_driver_name(driver_name)}{safe_int(row.get('house_order', 0))}" if is_assigned_pin else stop_label
+                marker_label = marker_label or stop_label
                 memo = str(row.get("customer_memo", "")).strip()
                 memo_html = f"<br>메모: {memo}" if memo else ""
+                bundle_count = safe_int(row.get("lightweight_merged_count", 1))
+                bundle_html = f"<br>동일 route 동일 주소 {bundle_count}건 묶음" if bundle_count > 1 else ""
                 overlap_html = f"<br>동일위치 {overlap_count}건" if overlap_count > 1 else ""
                 popup_html = (
                     f"<b>{row.get('route', '')}</b> / {driver_name or '미배정'}<br>"
                     f"{row.get('company_name', '')}<br>"
                     f"{row.get('address', '')}<br>"
                     f"물량 {safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}"
-                    f"{memo_html}{overlap_html}"
+                    f"{memo_html}{bundle_html}{overlap_html}"
                 )
                 tooltip_text = (
-                    f"{row.get('pin_label', '')} / {row.get('first_time', '')} / "
+                    f"{stop_label} / {row.get('first_time', '')} / "
                     f"{safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}"
                 )
-                house_order = safe_int(row.get("house_order", 0))
-                route_total = safe_int(row.get("route_total", 0))
-                radius = 5 if route_total > 0 and house_order in {1, route_total} else 4
-                folium.CircleMarker(
+                folium.Marker(
                     location=[lat, lon],
-                    radius=radius,
-                    color=pin_color,
-                    weight=2 if is_assigned_pin else 1,
-                    fill=True,
-                    fill_color=pin_color,
-                    fill_opacity=0.85,
                     opacity=0.45 if (active_driver != "" and driver_name != active_driver) else 1.0,
                     popup=folium.Popup(popup_html, max_width=260),
                     tooltip=tooltip_text,
+                    icon=make_lightweight_stop_label_icon(pin_color, marker_label, assigned=is_assigned_pin),
                 ).add_to(marker_group)
 
         overlay_layers.append(line_group)
@@ -4162,34 +4316,18 @@ with tab_basic:
         st.write(f"현재 필터: {selected_filter}")
         st.caption("캠프는 고정핀(검정색), 배송지는 라우트/기사 상태에 따라 표시됩니다.")
 
-        with st.spinner("지도 레이어 준비 중..."):
-            map_overlay_layers, map_default_center = build_dispatch_overlay_layers(
-                valid_result=valid_result,
-                valid_grouped=valid_grouped,
-                route_prefix_map=route_prefix_map,
-                truck_request_map=truck_request_map,
-                route_line_label=route_line_label,
-                route_driver_map=route_driver_map,
-                route_camp_map=route_camp_map,
-                camp_coords=camp_coords,
-                coords_already_sanitized=True,
-                lightweight=True,
-            )
-
         marker_count = len(valid_grouped)
         st.write(f"지도에 찍힌 배송 핀 수: {marker_count}")
 
-        ensure_map_view_state(
-            dataset_key=active_dataset_key,
-            center_key="map_center",
-            zoom_key="map_zoom",
-            dataset_state_key="map_dataset_key",
-            default_center=map_default_center,
-        )
+        static_map_cache_key = build_static_map_cache_key(active_dataset_key, selected_filter, assignment_df)
         if st.session_state.pop("map_force_refresh", False):
             st.session_state["main_map_key_nonce"] = safe_int(st.session_state.get("main_map_key_nonce", 0)) + 1
+            if st.session_state.get("static_map_html_cache_key") == static_map_cache_key:
+                st.session_state.pop("static_map_html_cache_key", None)
+                st.session_state.pop("static_map_html", None)
+                st.session_state.pop("static_map_html_filename", None)
         main_map_key_nonce = safe_int(st.session_state.get("main_map_key_nonce", 0))
-        main_map_key = "dispatch_main_map" if main_map_key_nonce <= 0 else f"dispatch_main_map_{main_map_key_nonce}"
+        main_map_key = "dispatch_main_static_map" if main_map_key_nonce <= 0 else f"dispatch_main_static_map_{main_map_key_nonce}"
         st.session_state["last_main_map_key"] = main_map_key
         render_debug_status_panel(
             route_summary=route_summary,
@@ -4201,15 +4339,27 @@ with tab_basic:
             valid_result=valid_result,
             valid_grouped=valid_grouped,
         )
-        render_full_folium_map(
-            overlay_layers=map_overlay_layers,
-            key=main_map_key,
-            center_key="map_center",
-            zoom_key="map_zoom",
-            height=900,
-        )
 
-        static_map_cache_key = build_static_map_cache_key(active_dataset_key, selected_filter, assignment_df)
+        main_map_html = get_cached_static_map_html(static_map_cache_key)
+        if main_map_html:
+            st.session_state["main_static_map_cache_status"] = "html_hit"
+        else:
+            st.session_state["main_static_map_cache_status"] = "html_miss"
+            with st.spinner("지도 HTML 준비 중..."):
+                main_map_html = get_static_map_html(
+                    cache_key=static_map_cache_key,
+                    html_filename=html_filename,
+                    valid_result=valid_result,
+                    valid_grouped=valid_grouped,
+                    route_prefix_map=route_prefix_map,
+                    truck_request_map=truck_request_map,
+                    route_line_label=route_line_label,
+                    route_driver_map=route_driver_map,
+                    route_camp_map=route_camp_map,
+                    camp_coords=camp_coords,
+                )
+        components.html(main_map_html, height=900, scrolling=True)
+
         if st.button("다운로드용 HTML 지도 생성/갱신", key="build_download_map_html"):
             with st.spinner("다운로드용 HTML 지도 생성 중..."):
                 get_static_map_html(
