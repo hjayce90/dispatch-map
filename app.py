@@ -783,11 +783,12 @@ def persist_assignment_store(
 ):
     dataset_key = build_route_dataset_key(uploaded_filename, base_date, route_summary)
     local_save_error = save_assignment_store(assignment_store)
-    st.session_state["assignment_store"] = assignment_store
-    st.session_state["assignment_local_source_dataset_key"] = dataset_key
-    st.session_state["disable_backend_merge"] = True
-    st.session_state["map_force_refresh"] = True
     if local_save_error:
+        st.session_state["assignment_store"] = assignment_store
+        st.session_state["assignment_store_source"] = "submitted_local_save_failed"
+        st.session_state["assignment_local_source_dataset_key"] = dataset_key
+        st.session_state["disable_backend_merge"] = True
+        st.session_state["map_force_refresh"] = True
         return {
             "ok": False,
             "local_ok": False,
@@ -795,6 +796,15 @@ def persist_assignment_store(
             "saved_count": 0,
             "message": f"Local assignment save failed: {local_save_error}",
         }
+
+    reloaded_store = load_assignment_store()
+    if not isinstance(reloaded_store, dict):
+        reloaded_store = {}
+    st.session_state["assignment_store"] = reloaded_store
+    st.session_state["assignment_store_source"] = "file_reloaded_after_save"
+    st.session_state["assignment_local_source_dataset_key"] = dataset_key
+    st.session_state["disable_backend_merge"] = True
+    st.session_state["map_force_refresh"] = True
 
     backend_run_id, backend_run_error = ensure_backend_run_for_session(
         uploaded_filename=uploaded_filename,
@@ -808,10 +818,10 @@ def persist_assignment_store(
             "local_ok": True,
             "backend_ok": False,
             "saved_count": 0,
-            "message": f"Django assignment sync failed: {backend_run_error}",
+            "message": f"Local assignment file saved/reloaded; Django assignment sync failed: {backend_run_error}",
         }
 
-    assignment_df_for_backend = build_assignment_df(route_summary, assignment_store)
+    assignment_df_for_backend = build_assignment_df(route_summary, reloaded_store)
     backend_save_payload, backend_save_error = sync_assignments_to_backend(backend_run_id, assignment_df_for_backend)
     if backend_save_error:
         return {
@@ -819,7 +829,7 @@ def persist_assignment_store(
             "local_ok": True,
             "backend_ok": False,
             "saved_count": 0,
-            "message": f"Django assignment sync failed: {backend_save_error}",
+            "message": f"Local assignment file saved/reloaded; Django assignment sync failed: {backend_save_error}",
         }
 
     saved_count = safe_int((backend_save_payload or {}).get("saved_count", 0))
@@ -829,7 +839,7 @@ def persist_assignment_store(
             "local_ok": True,
             "backend_ok": False,
             "saved_count": saved_count,
-            "message": "Django assignment sync saved 0 rows.",
+            "message": "Local assignment file saved/reloaded; Django assignment sync saved 0 rows.",
         }
 
     cached_load_latest_assignment_run_summary.clear()
@@ -840,7 +850,7 @@ def persist_assignment_store(
         "local_ok": True,
         "backend_ok": True,
         "saved_count": saved_count,
-        "message": f"Django assignment sync saved {saved_count} rows.",
+        "message": f"Local assignment file saved/reloaded; Django assignment sync saved {saved_count} rows.",
     }
 
 
@@ -1544,6 +1554,35 @@ def build_assignment_file_debug(route_summary: pd.DataFrame, last_changes):
     return file_info, pd.DataFrame(rows)
 
 
+def resync_assignment_store_from_file_if_changed(route_summary: pd.DataFrame, source: str):
+    file_store = load_assignment_store()
+    session_store = st.session_state.get("assignment_store", {})
+    file_store = file_store if isinstance(file_store, dict) else {}
+    session_store = session_store if isinstance(session_store, dict) else {}
+    current_keys = current_assignment_keys(route_summary)
+    file_current_count = sum(1 for key in current_keys if key in file_store)
+    session_current_count = sum(1 for key in current_keys if key in session_store)
+
+    should_resync = bool(file_store and file_current_count > 0 and file_store != session_store)
+    st.session_state["assignment_file_resync_debug"] = {
+        "source": str(source or ""),
+        "file_current_count": file_current_count,
+        "session_current_count": session_current_count,
+        "file_total_key_count": len(file_store),
+        "session_total_key_count": len(session_store),
+        "changed": should_resync,
+    }
+
+    if should_resync:
+        st.session_state["assignment_store"] = file_store
+        st.session_state["assignment_store_source"] = str(source or "file_resynced")
+        return file_store
+
+    if "assignment_store_source" not in st.session_state:
+        st.session_state["assignment_store_source"] = "session_existing"
+    return session_store
+
+
 def render_debug_status_panel(
     route_summary: pd.DataFrame,
     assignment_store: dict,
@@ -1570,10 +1609,14 @@ def render_debug_status_panel(
             "backend_dataset_key": str(st.session_state.get("backend_dataset_key", "")),
             "backend_sync_done": str(st.session_state.get("backend_sync_done", "")),
             "disable_backend_merge": bool(st.session_state.get("disable_backend_merge", False)),
+            "assignment_store_source": str(st.session_state.get("assignment_store_source", "")),
             "assignment_local_source_dataset_key": str(st.session_state.get("assignment_local_source_dataset_key", "")),
             "main_map_key_nonce": safe_int(st.session_state.get("main_map_key_nonce", 0)),
             "main_map_key": str(main_map_key or ""),
         })
+
+        st.write("assignment file/session resync")
+        st.json(st.session_state.get("assignment_file_resync_debug", {}))
 
         st.write("backend merge 판단")
         st.json(st.session_state.get("backend_merge_debug", {}))
@@ -3343,6 +3386,9 @@ with st.sidebar:
 
 if "assignment_store" not in st.session_state:
     st.session_state["assignment_store"] = load_assignment_store()
+    st.session_state["assignment_store_source"] = "initial_load"
+elif "assignment_store_source" not in st.session_state:
+    st.session_state["assignment_store_source"] = "session_existing"
 if "cancel_store" not in st.session_state:
     st.session_state["cancel_store"] = load_cancel_store()
 st.session_state.pop("assignment_pending_rerun", None)
@@ -3855,7 +3901,11 @@ with tab_basic:
         )
     st.session_state["assignment_store"] = assignment_store
 
-    assignment_store = st.session_state["assignment_store"]
+    assignment_store = resync_assignment_store_from_file_if_changed(
+        route_summary,
+        "file_resynced_before_assignment_df",
+    )
+    st.session_state["assignment_store"] = assignment_store
     assignment_df = build_assignment_df(route_summary, st.session_state["assignment_store"])
 
     group_route_map = {}
