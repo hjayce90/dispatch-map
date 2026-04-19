@@ -1561,15 +1561,20 @@ def build_assignment_progress_message(title: str, state: dict) -> str:
 
 
 def send_assignment_progress_notification(title: str, state: dict):
-    if not is_telegram_configured():
-        logger.info("Skipping assignment progress Telegram notification because configuration is missing.")
-        return "skipped", None
+    try:
+        if not is_telegram_configured():
+            reason = "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing"
+            logger.warning("Skipping assignment progress Telegram notification: %s", reason)
+            return "skipped", reason
 
-    _, error = send_telegram_message(build_assignment_progress_message(title, state))
-    if error:
-        logger.warning("Telegram assignment progress notification failed: %s", error)
-        return "failed", error
-    return "sent", None
+        _, error = send_telegram_message(build_assignment_progress_message(title, state))
+        if error:
+            logger.warning("Telegram assignment progress notification failed: %s", error)
+            return "failed", error
+        return "sent", None
+    except Exception as exc:
+        logger.warning("Telegram assignment progress notification failed: %s", exc, exc_info=True)
+        return "failed", str(exc)
 
 
 def render_assignment_progress_state(state: dict = None, placeholder=None):
@@ -1622,7 +1627,19 @@ def make_assignment_progress_callback(
                 logger.debug("Failed to update assignment progress bar.", exc_info=True)
 
     def _notify(title: str):
-        send_assignment_progress_notification(title, state.copy())
+        try:
+            status, error = send_assignment_progress_notification(title, state.copy())
+            state["telegram_status"] = status
+            state["telegram_error"] = str(error or "")
+            state["telegram_notified_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_assignment_progress_state(state)
+            logger.info("Assignment progress Telegram notification status: %s", status)
+        except Exception as exc:
+            state["telegram_status"] = "failed"
+            state["telegram_error"] = str(exc)
+            state["telegram_notified_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_assignment_progress_state(state)
+            logger.warning("Telegram assignment progress notification failed: %s", exc, exc_info=True)
 
     def callback(event_payload: dict):
         payload = event_payload if isinstance(event_payload, dict) else {}
@@ -5900,7 +5917,10 @@ with tab_stats:
                 return
 
             try:
-                from assign_bot import run_assignments_df
+                import importlib
+                import assign_bot as assign_bot_module
+                assign_bot_module = importlib.reload(assign_bot_module)
+                run_assignments_df = assign_bot_module.run_assignments_df
             except Exception as exc:
                 st.error(f"Failed to load assign_bot: {exc}")
                 return

@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import time
@@ -17,8 +18,20 @@ from selenium.webdriver.support import expected_conditions as EC
 
 LOGIN_URL = "https://ls.coupang.com/#/welcomePage"
 TRUCK_DISPATCH_URL = "https://ls.coupang.com/#/orderManagement/truckDispatch"
+TRUCK_DISPATCH_URL_KEY = "ordermanagement/truckdispatch"
+TRUCK_DISPATCH_READY_SELECTORS = [
+    (By.XPATH, "//label[contains(., 'Request ID')]/following::input[1]"),
+    (By.XPATH, "//input[contains(@placeholder, 'Request ID')]"),
+    (By.XPATH, "//button[contains(., 'Search')]"),
+    (By.XPATH, "//span[contains(., 'Search')]/ancestor::button[1]"),
+]
+SEARCH_CLICK_STATE_TIMEOUT_SECONDS = 1
+SEARCH_RESULT_STABILIZE_SECONDS = 3
+POST_CONFIRM_DELAY_SECONDS = 0.4
+ACTION_CLICK_STATE_TIMEOUT_SECONDS = 2
 
 SCREENSHOT_DIR = "bot_screenshots"
+DEBUG_SOURCE_CHARS = 20000
 RESULT_FILE = "assign_results.csv"
 RESULT_COLUMNS = [
     "request_id",
@@ -72,6 +85,64 @@ def log(msg):
     print(f"[LOG] {msg}")
 
 
+def safe_name(value):
+    text = str(value or "").strip().replace("\\", "_").replace("/", "_")
+    return "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in text)[:80] or "snapshot"
+
+
+def driver_current_url(driver):
+    try:
+        return str(getattr(driver, "current_url", "") or "")
+    except Exception as exc:
+        return f"<current_url error: {exc}>"
+
+
+def driver_title(driver):
+    try:
+        return str(getattr(driver, "title", "") or "")
+    except Exception as exc:
+        return f"<title error: {exc}>"
+
+
+def driver_body_head(driver, limit=800):
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text
+    except Exception as exc:
+        return f"<body error: {exc}>"
+    return str(body or "").replace("\r", " ").replace("\n", " | ")[:limit]
+
+
+def selector_text(selectors):
+    return [f"{by} => {selector}" for by, selector in selectors]
+
+
+def save_page_source(driver, name, limit=DEBUG_SOURCE_CHARS):
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(SCREENSHOT_DIR, f"{ts}_{safe_name(name)}.html")
+    try:
+        source = str(getattr(driver, "page_source", "") or "")
+        if limit and len(source) > limit:
+            source = source[:limit] + "\n<!-- truncated -->\n"
+        Path(path).write_text(source, encoding="utf-8", errors="replace")
+        log(f"page_source saved: {path}")
+        return path
+    except Exception as exc:
+        log(f"page_source save failed: {name}: {exc}")
+        return ""
+
+
+def debug_snapshot(driver, label, *, include_source=False, selectors=None):
+    log(f"[stage] {label}")
+    log(f"[stage] current_url={driver_current_url(driver)}")
+    log(f"[stage] title={driver_title(driver)}")
+    log(f"[stage] body_head={driver_body_head(driver)}")
+    if selectors:
+        log("[stage] selectors=" + " || ".join(selector_text(selectors)))
+    shot_path = save_shot(driver, f"debug_{safe_name(label)}")
+    source_path = save_page_source(driver, f"debug_{safe_name(label)}") if include_source else ""
+    return {"screenshot": shot_path, "page_source": source_path}
+
+
 def reset_click_diagnostics():
     CLICK_DIAGNOSTICS["retry_count"] = 0
     CLICK_DIAGNOSTICS["last_reason"] = ""
@@ -110,8 +181,13 @@ def emit_progress(progress_callback, event, stage="", request_id="", **kwargs):
 def save_shot(driver, name):
     ts = time.strftime("%Y%m%d_%H%M%S")
     path = os.path.join(SCREENSHOT_DIR, f"{ts}_{name}.png")
-    driver.save_screenshot(path)
-    log(f"스크린샷 저장: {path}")
+    try:
+        driver.save_screenshot(path)
+        log(f"스크린샷 저장: {path}")
+        return path
+    except Exception as exc:
+        log(f"screenshot save failed: {path}: {exc}")
+        return ""
 
 
 def sleep_step(sec=STEP_SLEEP):
@@ -146,7 +222,7 @@ def session_expired_suspected(scope):
         current_url = str(getattr(scope, "current_url", "") or "").lower()
     except Exception:
         current_url = ""
-    if "login" in current_url or "welcome" in current_url:
+    if "login" in current_url:
         return True
 
     try:
@@ -161,6 +237,92 @@ def session_expired_suspected(scope):
         "unauthorized",
     ]
     return any(term in body_text for term in session_terms)
+
+
+def wait_for_login_complete(driver, timeout=30):
+    def _ready(_driver):
+        current_url = driver_current_url(_driver).lower()
+        if "login" in current_url:
+            return False
+        try:
+            password_inputs = _driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
+            for elem in password_inputs:
+                try:
+                    if elem.is_displayed():
+                        return False
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        title = driver_title(_driver).lower()
+        body = driver_body_head(_driver, limit=1200).lower()
+        if "linehaul service" in title or "line-haul" in body or "truck dispatch" in body:
+            return True
+        return False
+
+    try:
+        return WebDriverWait(driver, timeout).until(_ready)
+    except TimeoutException as exc:
+        debug_snapshot(driver, "login_complete_timeout", include_source=True)
+        raise TimeoutException("timeout waiting for login complete detection") from exc
+
+
+def is_truck_dispatch_url(driver):
+    try:
+        current_url = str(getattr(driver, "current_url", "") or "").lower()
+    except Exception:
+        return False
+    return TRUCK_DISPATCH_URL_KEY in current_url
+
+
+def wait_for_truck_dispatch_page(driver, timeout=30):
+    log("[stage] truckDispatch readiness wait start")
+    log("[stage] selectors=" + " || ".join(selector_text(TRUCK_DISPATCH_READY_SELECTORS)))
+
+    def _ready(_driver):
+        if not is_truck_dispatch_url(_driver):
+            return False
+        if session_expired_suspected(_driver):
+            raise RuntimeError("session/login expired suspected before truckDispatch page ready")
+        for by, selector in TRUCK_DISPATCH_READY_SELECTORS:
+            try:
+                elems = _driver.find_elements(by, selector)
+            except Exception:
+                continue
+            for elem in elems:
+                try:
+                    if elem.is_displayed():
+                        log(f"[stage] truckDispatch readiness matched selector: {selector}")
+                        return elem
+                except Exception:
+                    log(f"[stage] truckDispatch readiness matched selector without display check: {selector}")
+                    return elem
+        return False
+
+    try:
+        return WebDriverWait(driver, timeout).until(_ready)
+    except TimeoutException as exc:
+        debug_snapshot(
+            driver,
+            "truck_dispatch_ready_timeout",
+            include_source=True,
+            selectors=TRUCK_DISPATCH_READY_SELECTORS,
+        )
+        reason = "timeout waiting for truckDispatch page ready"
+        if session_expired_suspected(driver):
+            reason = f"{reason}; session/login expired suspected"
+        else:
+            reason = f"{reason}; server slow response suspected"
+        raise TimeoutException(reason) from exc
+
+
+def go_to_truck_dispatch(driver, timeout=30):
+    debug_snapshot(driver, "before truckDispatch move")
+    driver.get(TRUCK_DISPATCH_URL)
+    debug_snapshot(driver, "after truckDispatch move")
+    ready_elem = wait_for_truck_dispatch_page(driver, timeout=timeout)
+    debug_snapshot(driver, "truckDispatch ready")
+    return ready_elem
 
 
 def find_first(driver, selectors, timeout=10, clickable=False, visible=False):
@@ -439,7 +601,9 @@ def login(driver):
     if not coupang_id or not coupang_pw:
         raise ValueError("환경변수 COUPANG_LS_ID / COUPANG_LS_PW 또는 COUPANG_ID / COUPANG_PW를 먼저 넣어주세요.")
 
+    debug_snapshot(driver, "before login")
     driver.get(LOGIN_URL)
+    debug_snapshot(driver, "after login page open")
     sleep_step(2)
 
     id_input = find_first(driver, [
@@ -474,45 +638,14 @@ def login(driver):
         state_probe=page_state_fingerprint,
         state_change_timeout=6,
     )
+    debug_snapshot(driver, "after login submit")
+    wait_for_login_complete(driver)
+    debug_snapshot(driver, "after login complete detection")
     sleep_step(3)
 
     # 로그인 후 웰컴페이지가 떠서 트럭디스패치로 재이동
-    progress("stage", "searching")
-    driver.get(TRUCK_DISPATCH_URL)
-    sleep_step(3)
+    go_to_truck_dispatch(driver)
     save_shot(driver, "after_login")
-
-
-def set_order_date(driver, order_date):
-    log(f"날짜 설정: {order_date}")
-
-    date_input = find_first(driver, [
-        (By.XPATH, "//label[contains(., 'Order Date')]/following::input[1]"),
-        (By.XPATH, "//input[contains(@placeholder, 'Order Date')]"),
-        (By.XPATH, "//input[contains(@class, 'calendar')]"),
-        (By.XPATH, "(//input)[1]"),
-    ], timeout=10, visible=True)
-
-    safe_click(driver, date_input)
-    sleep_step(0.5)
-
-    # 텍스트 입력
-    try:
-        clear_and_type(date_input, order_date)
-        sleep_step(0.5)
-    except Exception:
-        pass
-
-    # JS 강제 입력
-    try:
-        js_set_value(driver, date_input, order_date)
-        sleep_step(0.5)
-    except Exception:
-        pass
-
-    press_escape(driver)
-    sleep_step(0.5)
-    save_shot(driver, "date_set")
 
 
 def click_search(driver):
@@ -525,10 +658,8 @@ def click_search(driver):
         driver,
         search_btn,
         label="Search",
-        state_probe=page_state_fingerprint,
-        state_change_timeout=5,
     )
-    sleep_step(2)
+    sleep_step(SEARCH_RESULT_STABILIZE_SECONDS)
     save_shot(driver, "after_search")
 
 
@@ -649,6 +780,38 @@ def find_fixed_action_buttons(driver, rows, action_labels):
     return action_buttons
 
 
+def find_visible_result_rows(driver):
+    row_selectors = [
+        "//div[contains(@class, 'ant-table-body')]//tr[not(contains(@class, 'ant-table-placeholder'))]",
+        "//tbody[contains(@class, 'ant-table-tbody')]//tr[not(contains(@class, 'ant-table-placeholder'))]",
+        "//*[@role='row' and not(contains(@class, 'ant-table-placeholder'))]",
+    ]
+    rows = []
+    for selector in row_selectors:
+        for row in find_visible_all(driver, By.XPATH, selector):
+            row_text = ""
+            try:
+                row_text = (row.text or "").strip()
+            except Exception:
+                pass
+            if row_text and "No Data" not in row_text:
+                append_unique_element(rows, row)
+        if rows:
+            break
+    return rows
+
+
+def page_contains_text(driver, text):
+    needle = str(text or "").strip()
+    if not needle:
+        return False
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+    except Exception:
+        return False
+    return needle in str(body_text or "")
+
+
 def click_action_for_request_id(driver, request_id, action_labels):
     row_xpath = build_request_row_xpath(request_id)
     rows = []
@@ -659,7 +822,14 @@ def click_action_for_request_id(driver, request_id, action_labels):
         sleep_step(0.5)
 
     if not rows:
-        raise RuntimeError(f"Request ID row not found: {request_id}")
+        fallback_rows = find_visible_result_rows(driver)
+        if len(fallback_rows) == 1 and page_contains_text(driver, request_id):
+            log(f"Request ID row not matched by text; using single visible result row fallback for {request_id}")
+            rows = fallback_rows
+        else:
+            raise RuntimeError(
+                f"Request ID row not found: {request_id}; visible result rows={len(fallback_rows)}"
+            )
 
     action_name = "/".join(action_labels)
     action_xpath = build_action_xpath(".", action_labels)
@@ -673,9 +843,9 @@ def click_action_for_request_id(driver, request_id, action_labels):
                         action_btn,
                         label=f"{action_name} for request {request_id}",
                         state_probe=modal_state_fingerprint,
-                        state_change_timeout=6,
+                        state_change_timeout=ACTION_CLICK_STATE_TIMEOUT_SECONDS,
                     )
-                    sleep_step(2)
+                    sleep_step(POST_CONFIRM_DELAY_SECONDS)
                     save_shot(driver, f"after_{action_name.lower().replace('/', '_')}_click")
                     return
             except Exception:
@@ -690,9 +860,9 @@ def click_action_for_request_id(driver, request_id, action_labels):
             action_btn,
             label=f"{action_name} fixed action for request {request_id}",
             state_probe=modal_state_fingerprint,
-            state_change_timeout=6,
+            state_change_timeout=ACTION_CLICK_STATE_TIMEOUT_SECONDS,
         )
-        sleep_step(2)
+        sleep_step(POST_CONFIRM_DELAY_SECONDS)
         save_shot(driver, f"after_{action_name.lower().replace('/', '_')}_click")
         return
 
@@ -942,11 +1112,9 @@ def process_one(driver, row, progress_callback=None):
     if registration_mode not in {"new", "modify"}:
         raise ValueError(f"registration_mode 값 오류: {registration_mode}")
 
-    driver.get(TRUCK_DISPATCH_URL)
-    sleep_step(2)
+    progress("stage", "searching")
+    go_to_truck_dispatch(driver)
 
-    set_order_date(driver, order_date)
-    click_search(driver)
     select_registration_tab(driver, registration_mode)
     search_request_id(driver, request_id)
     progress("stage", "clicking")
@@ -1159,11 +1327,101 @@ def run_assignments_df(
 
     finally:
         if driver is not None and not DETACH_BROWSER:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception as exc:
+                log(f"driver quit failed: {exc}")
+
+
+def _load_first_debug_row(file_path):
+    if not file_path:
+        raise ValueError("debug input file is required for --debug-search-first-row")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"debug input file not found: {file_path}")
+    df = pd.read_csv(file_path, dtype=str).fillna("")
+    work_df = prepare_assignments_df(df)
+    if len(work_df) == 0:
+        raise ValueError("debug input file has no runnable rows")
+    return work_df.reset_index(drop=True).iloc[0]
+
+
+def debug_login_flow(
+    file_path=None,
+    request_id="",
+    registration_mode="new",
+    search_first_row=False,
+    confirm_only=False,
+    keep_browser=False,
+):
+    driver = None
+    try:
+        driver = build_driver()
+        debug_snapshot(driver, "debug flow start")
+        login(driver)
+        debug_snapshot(driver, "debug after truckDispatch ready", include_source=True)
+
+        if search_first_row:
+            row = _load_first_debug_row(file_path)
+            request_id = str(row.get("request_id", "") or "").strip()
+            registration_mode = str(row.get("registration_mode", registration_mode) or registration_mode).strip()
+            log(
+                "[debug] first row loaded: "
+                f"request_id={request_id}, registration_mode={registration_mode}"
+            )
+
+        mode = str(registration_mode or "new").strip().lower() or "new"
+        if mode in {"new", "modify"}:
+            log(f"[debug] selecting registration mode={mode}")
+            select_registration_tab(driver, mode)
+
+        if request_id:
+            log(f"[debug] searching request_id={request_id}")
+            search_request_id(driver, request_id)
+            debug_snapshot(driver, "debug after request search", include_source=True)
+            if confirm_only:
+                log("[debug] opening assignment action modal only; Save will not be clicked")
+                click_registration_action_for_request_id(driver, request_id, mode)
+                get_active_modal(driver, timeout=5)
+                debug_snapshot(driver, "debug after confirm action modal", include_source=True)
+
+        debug_snapshot(driver, "debug flow completed", include_source=True)
+        return 0
+    except Exception as exc:
+        log(f"[debug] debug_login_flow failed: {exc}")
+        traceback.print_exc()
+        if driver is not None:
+            debug_snapshot(driver, "debug flow failed", include_source=True, selectors=TRUCK_DISPATCH_READY_SELECTORS)
+        return 1
+    finally:
+        if driver is not None and not keep_browser:
+            try:
+                driver.quit()
+            except Exception as exc:
+                log(f"driver quit failed: {exc}")
 
 
 def main():
-    file_path = sys.argv[1] if len(sys.argv) >= 2 else "route_assignment_new.csv"
+    parser = argparse.ArgumentParser(description="Run or diagnose Coupang LS truck dispatch assignment.")
+    parser.add_argument("file_path", nargs="?", default="route_assignment_new.csv")
+    parser.add_argument("--debug-login", action="store_true", help="Only verify login -> truckDispatch readiness.")
+    parser.add_argument("--debug-search-first-row", action="store_true", help="In debug mode, search the first runnable input row only.")
+    parser.add_argument("--debug-request-id", default="", help="In debug mode, search this request_id only.")
+    parser.add_argument("--debug-registration-mode", default="new", choices=["new", "modify"])
+    parser.add_argument("--debug-confirm-only", action="store_true", help="In debug mode, open the Confirm/Edit modal but do not save.")
+    parser.add_argument("--keep-browser", action="store_true", help="Leave the browser open after debug mode.")
+    args = parser.parse_args()
+
+    if args.debug_login:
+        raise SystemExit(debug_login_flow(
+            file_path=args.file_path,
+            request_id=args.debug_request_id,
+            registration_mode=args.debug_registration_mode,
+            search_first_row=args.debug_search_first_row,
+            confirm_only=args.debug_confirm_only,
+            keep_browser=args.keep_browser,
+        ))
+
+    file_path = args.file_path
 
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"파일이 없습니다: {file_path}")
