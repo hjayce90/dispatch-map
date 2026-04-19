@@ -4,6 +4,8 @@ import json
 import math
 import hashlib
 import logging
+import html
+import subprocess
 from io import BytesIO
 from pathlib import Path
 
@@ -37,6 +39,7 @@ from auto_grouping import (
     recommend_route_groups,
     resolve_group_count,
 )
+from assign_input_builder import build_assign_input_df, default_order_date
 from services.report_xlsx import (
     TEMPLATE_REPORT_XLSX,
     build_report_export_df,
@@ -49,9 +52,14 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 logger = logging.getLogger(__name__)
 RECOMMENDATION_STATE_KEYS = (
-    "recommended_group_map",
-    "recommended_group_count",
-    "latest_group_assignment_df",
+    "recommended_groups_result",
+    "recommended_groups_meta",
+    "recommended_groups_error",
+    "recommended_groups_inputs_hash",
+    "recommended_groups_status",
+    "recommended_groups_assignment_df",
+    "recommended_groups_selected_filter",
+    "recommended_groups_dataset_key",
 )
 DRIVER_PREFERENCE_DISPLAY_COLUMNS = [
     "그룹평균퍼짐km" if column == "route_spread_km" else column
@@ -116,6 +124,10 @@ ASSIGNMENT_HISTORY_FILE = "assignment_history.csv"
 MAP_DIR = "saved_maps"
 SHARE_DIR = "shared_payloads"
 ASSIGNMENT_FILE = "route_assignments.json"
+ASSIGNMENT_PROGRESS_FILE = "assignment_progress.json"
+ASSIGNMENT_PROGRESS_NOTIFY_EVERY = 5
+MANUAL_LOCATION_MAPPING_CSV = "manual_location_mappings.csv"
+MANUAL_LOCATION_MAPPING_JSON = "manual_location_mappings.json"
 CANCEL_FILE = "cancel_management.json"
 APP_URL = "https://dispatch-map.streamlit.app"  # 본인 배포 주소로 수정
 DJANGO_API_BASE_URL = os.getenv("DJANGO_API_BASE_URL", "http://127.0.0.1:8010/api/dispatch")
@@ -412,9 +424,10 @@ def build_main_overlay_cache_key(active_dataset_key: str, selected_filter: str, 
         })
     payload = json.dumps(
         {
-            "cache_version": "main_overlay_v2",
+            "cache_version": "main_overlay_pickup_v1",
             "dataset": str(active_dataset_key or ""),
             "filter": str(selected_filter or ""),
+            "manual_location_mapping": manual_location_mapping_fingerprint(),
             "assignment": sorted(assignment_rows, key=lambda r: (r["route"], r["truck_request_id"])),
         },
         ensure_ascii=False,
@@ -431,14 +444,16 @@ def get_cached_main_map_data(cache_key: str):
         "valid_result": st.session_state.get("main_overlay_valid_result", pd.DataFrame()),
         "valid_grouped": st.session_state.get("main_overlay_valid_grouped", pd.DataFrame()),
         "route_driver_map": st.session_state.get("main_overlay_route_driver_map", {}),
+        "unmapped_df": st.session_state.get("main_overlay_unmapped_df", pd.DataFrame()),
     }
 
 
-def set_cached_main_map_data(cache_key: str, valid_result, valid_grouped, route_driver_map):
+def set_cached_main_map_data(cache_key: str, valid_result, valid_grouped, route_driver_map, unmapped_df=None):
     st.session_state["main_map_data_cache_key"] = cache_key
     st.session_state["main_overlay_valid_result"] = valid_result
     st.session_state["main_overlay_valid_grouped"] = valid_grouped
     st.session_state["main_overlay_route_driver_map"] = route_driver_map
+    st.session_state["main_overlay_unmapped_df"] = unmapped_df if isinstance(unmapped_df, pd.DataFrame) else pd.DataFrame()
 
 
 def normalize_address(addr: str) -> str:
@@ -446,6 +461,225 @@ def normalize_address(addr: str) -> str:
         return ""
     text = str(addr).strip()
     text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def clean_map_text(value) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value or "").strip()
+    if text.lower() in {"nan", "none", "null"}:
+        return ""
+    return text
+
+
+def safe_float_or_none(value):
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def manual_location_mapping_paths():
+    return [
+        BASE_DIR / MANUAL_LOCATION_MAPPING_CSV,
+        BASE_DIR / MANUAL_LOCATION_MAPPING_JSON,
+    ]
+
+
+def manual_location_mapping_fingerprint() -> str:
+    rows = []
+    for path in manual_location_mapping_paths():
+        if path.exists():
+            try:
+                stat = path.stat()
+                rows.append({"path": path.name, "size": stat.st_size, "mtime": stat.st_mtime})
+            except OSError:
+                rows.append({"path": path.name, "size": -1, "mtime": -1})
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _manual_mapping_enabled(value) -> bool:
+    text = clean_map_text(value).lower()
+    if text == "":
+        return True
+    return text not in {"0", "false", "n", "no", "off", "disabled", "사용안함", "비활성"}
+
+
+def _normalize_manual_mapping_row(row: dict) -> dict:
+    raw_address = clean_map_text(
+        row.get("raw_address", "")
+        or row.get("address", "")
+        or row.get("주소", "")
+    )
+    normalized_address = clean_map_text(
+        row.get("normalized_address", "")
+        or row.get("address_norm", "")
+        or row.get("주소정규화", "")
+    )
+    if not normalized_address and raw_address:
+        normalized_address = normalize_address(raw_address)
+
+    lat = safe_float_or_none(row.get("lat", row.get("latitude", row.get("위도", ""))))
+    lng = safe_float_or_none(row.get("lng", row.get("lon", row.get("longitude", row.get("경도", "")))))
+    if lat is None or lng is None:
+        return {}
+    if not _manual_mapping_enabled(row.get("enabled", row.get("사용", ""))):
+        return {}
+
+    return {
+        "company_id": clean_map_text(row.get("company_id", row.get("업체ID", ""))),
+        "company_name": clean_map_text(row.get("company_name", row.get("업체명", ""))),
+        "raw_address": raw_address,
+        "normalized_address": normalized_address,
+        "coords": (lat, lng),
+    }
+
+
+def load_manual_location_mappings() -> list:
+    mappings = []
+    csv_path = BASE_DIR / MANUAL_LOCATION_MAPPING_CSV
+    json_path = BASE_DIR / MANUAL_LOCATION_MAPPING_JSON
+
+    if csv_path.exists():
+        try:
+            csv_df = pd.read_csv(csv_path, dtype=str).fillna("")
+            for row in csv_df.to_dict(orient="records"):
+                normalized = _normalize_manual_mapping_row(row)
+                if normalized:
+                    mappings.append(normalized)
+        except Exception as exc:
+            logger.warning("Failed to load manual location mapping CSV: %s", exc)
+
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                rows = payload.get("rows") or payload.get("mappings") or list(payload.values())
+            elif isinstance(payload, list):
+                rows = payload
+            else:
+                rows = []
+            for row in rows:
+                if isinstance(row, dict):
+                    normalized = _normalize_manual_mapping_row(row)
+                    if normalized:
+                        mappings.append(normalized)
+        except Exception as exc:
+            logger.warning("Failed to load manual location mapping JSON: %s", exc)
+
+    return mappings
+
+
+def find_manual_location_mapping(row, mappings: list):
+    if not mappings:
+        return None
+
+    company_id = clean_map_text(row.get("company_id", ""))
+    company_name = clean_map_text(row.get("company_name", ""))
+    raw_address = clean_map_text(row.get("address", ""))
+    address_norm = clean_map_text(row.get("address_norm", "")) or normalize_address(raw_address)
+    raw_address_norm = normalize_address(raw_address)
+
+    for mapping in mappings:
+        mapping_company_id = clean_map_text(mapping.get("company_id", ""))
+        if not company_id or mapping_company_id != company_id:
+            continue
+        mapping_norm = clean_map_text(mapping.get("normalized_address", ""))
+        mapping_raw_norm = normalize_address(mapping.get("raw_address", ""))
+        if not mapping_norm and not mapping_raw_norm:
+            return mapping
+        if address_norm and mapping_norm == address_norm:
+            return mapping
+        if raw_address_norm and mapping_raw_norm == raw_address_norm:
+            return mapping
+
+    for mapping in mappings:
+        mapping_company_name = clean_map_text(mapping.get("company_name", ""))
+        if not company_name or mapping_company_name != company_name:
+            continue
+        mapping_norm = clean_map_text(mapping.get("normalized_address", ""))
+        mapping_raw_norm = normalize_address(mapping.get("raw_address", ""))
+        if address_norm and mapping_norm == address_norm:
+            return mapping
+        if raw_address_norm and mapping_raw_norm == raw_address_norm:
+            return mapping
+
+    return None
+
+
+def map_unmapped_reason(row) -> str:
+    address_norm = clean_map_text(row.get("address_norm", ""))
+    address = clean_map_text(row.get("address", ""))
+    if not address_norm:
+        return "address_norm missing"
+    if not address:
+        return "coords missing"
+    return "geocode failed; manual mapping not found"
+
+
+def apply_manual_location_mappings(df: pd.DataFrame, mappings: list, collect_unmapped: bool = False):
+    if not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return pd.DataFrame() if not isinstance(df, pd.DataFrame) else df.copy(), pd.DataFrame()
+
+    out = df.copy()
+    if "coords" not in out.columns:
+        out["coords"] = None
+    out["coords"] = out["coords"].apply(_normalize_coords)
+    out["manual_coords_applied"] = False
+
+    missing_rows = []
+    for idx, row in out.iterrows():
+        if _normalize_coords(row.get("coords")) is not None:
+            continue
+
+        mapping = find_manual_location_mapping(row, mappings)
+        if mapping:
+            out.at[idx, "coords"] = mapping["coords"]
+            out.at[idx, "manual_coords_applied"] = True
+            continue
+
+        if collect_unmapped:
+            missing_rows.append({
+                "route": clean_map_text(row.get("route", "")),
+                "truck_request_id": clean_map_text(row.get("truck_request_id", "")),
+                "company_id": clean_map_text(row.get("company_id", "")),
+                "company_name": clean_map_text(row.get("company_name", "")),
+                "address": clean_map_text(row.get("address", "")),
+                "address_norm": clean_map_text(row.get("address_norm", "")),
+                "missing_reason": map_unmapped_reason(row),
+            })
+
+    missing_df = pd.DataFrame(missing_rows)
+    if len(missing_df) > 0:
+        missing_df = missing_df.drop_duplicates(
+            subset=[c for c in ["route", "company_id", "company_name", "address_norm", "address"] if c in missing_df.columns]
+        ).reset_index(drop=True)
+    return out, missing_df
+
+
+def shorten_company_name_for_tooltip(company_name: str, max_len: int = 10) -> str:
+    text = clean_map_text(company_name) or "-"
+    for token in ["주식회사", "(주)", "㈜", "유한회사"]:
+        text = text.replace(token, "").strip()
+    for suffix in ["물류센터", "물류"]:
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)].strip()
+    if len(text) > max_len:
+        return f"{text[:max_len]}..."
     return text
 
 
@@ -478,17 +712,205 @@ def build_route_dataset_key(uploaded_filename: str, base_date: str, route_summar
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
+def _copy_recommended_group_map(group_map) -> dict:
+    if not isinstance(group_map, dict):
+        return {}
+    return {
+        str(route).strip(): str(group_name).strip()
+        for route, group_name in group_map.items()
+        if str(route).strip() and str(group_name).strip()
+    }
+
+
+def _copy_recommended_groups_assignment_df(assignment_df) -> pd.DataFrame:
+    if isinstance(assignment_df, pd.DataFrame):
+        return assignment_df.copy(deep=True)
+    if assignment_df:
+        return pd.DataFrame(assignment_df).copy(deep=True)
+    return pd.DataFrame()
+
+
+def _infer_recommended_group_count(group_map: dict, fallback: int = 0) -> int:
+    count = safe_int(fallback)
+    if count > 0:
+        return count
+
+    max_group_number = 0
+    for group_name in _copy_recommended_group_map(group_map).values():
+        match = re.search(r"(\d+)$", str(group_name).strip())
+        if match:
+            max_group_number = max(max_group_number, safe_int(match.group(1)))
+    return max_group_number
+
+
+def build_recommended_groups_inputs_hash(
+    route_feature_df: pd.DataFrame,
+    group_count_mode: str,
+    manual_group_count=None,
+) -> str:
+    normalized_rows = []
+    if isinstance(route_feature_df, pd.DataFrame) and len(route_feature_df) > 0:
+        work_df = route_feature_df.copy(deep=True)
+        sort_columns = [column for column in ["route_prefix", "route", "truck_request_id"] if column in work_df.columns]
+        if sort_columns:
+            work_df = work_df.sort_values(sort_columns).reset_index(drop=True)
+        normalized_rows = work_df.fillna("").astype(str).to_dict(orient="records")
+
+    resolved_mode = str(group_count_mode or "자동").strip() or "자동"
+    resolved_manual_count = safe_int(manual_group_count) if resolved_mode == "직접입력" else 0
+    payload = json.dumps(
+        {
+            "route_feature_rows": normalized_rows,
+            "group_count_mode": resolved_mode,
+            "manual_group_count": resolved_manual_count,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def set_recommended_groups_state(
+    group_map: dict,
+    group_count: int,
+    assignment_df: pd.DataFrame,
+    inputs_hash: str,
+    selected_filter: str = None,
+    meta: dict = None,
+):
+    recommended_group_map = _copy_recommended_group_map(group_map)
+    inferred_group_count = _infer_recommended_group_count(recommended_group_map, fallback=group_count)
+    st.session_state["recommended_groups_result"] = recommended_group_map
+    st.session_state["recommended_groups_meta"] = {
+        **(meta or {}),
+        "group_count": inferred_group_count,
+        "generated_at": pd.Timestamp.now().isoformat(),
+    }
+    st.session_state["recommended_groups_assignment_df"] = _copy_recommended_groups_assignment_df(assignment_df)
+    st.session_state["recommended_groups_inputs_hash"] = str(inputs_hash or "")
+    st.session_state["recommended_groups_status"] = "active" if recommended_group_map else "inactive"
+    st.session_state["recommended_groups_error"] = ""
+
+    normalized_filter = str(selected_filter or st.session_state.get("recommended_groups_selected_filter", "전체")).strip() or "전체"
+    st.session_state["recommended_groups_selected_filter"] = normalized_filter
+
+
+def mark_recommended_groups_error(message: str):
+    st.session_state["recommended_groups_error"] = str(message or "").strip()
+    if not _copy_recommended_group_map(st.session_state.get("recommended_groups_result", {})):
+        st.session_state["recommended_groups_status"] = "inactive"
+
+
+def mark_recommended_groups_stale(message: str = "", status: str = "stale"):
+    if status not in {"stale", "inactive"}:
+        status = "stale"
+    if st.session_state.get("recommended_groups_status") != status:
+        st.session_state["recommended_groups_status"] = status
+    if message:
+        st.session_state["recommended_groups_meta"] = {
+            **(st.session_state.get("recommended_groups_meta", {}) or {}),
+            "status_message": str(message),
+        }
+
+
 def clear_recommendation_state():
-    for key in RECOMMENDATION_STATE_KEYS:
-        st.session_state.pop(key, None)
-    st.session_state["selected_group_filter"] = "전체"
+    st.session_state["recommended_groups_error"] = ""
+    if not _copy_recommended_group_map(st.session_state.get("recommended_groups_result", {})):
+        st.session_state["recommended_groups_status"] = "inactive"
+
+
+def sync_recommended_groups_status_for_inputs(inputs_hash: str):
+    stored_hash = str(st.session_state.get("recommended_groups_inputs_hash", "") or "")
+    if not stored_hash:
+        if _copy_recommended_group_map(st.session_state.get("recommended_groups_result", {})):
+            mark_recommended_groups_stale("추천 입력 조건을 확인할 수 없어 재계산이 필요합니다.")
+        return
+    if stored_hash != str(inputs_hash or ""):
+        mark_recommended_groups_stale("추천 입력 조건이 바뀌어 재계산이 필요합니다.")
+
+
+def get_recommended_groups_projection(
+    route_feature_df: pd.DataFrame = None,
+    inputs_hash: str = "",
+) -> dict:
+    empty_assignment_df = pd.DataFrame()
+    group_map = _copy_recommended_group_map(st.session_state.get("recommended_groups_result", {}))
+    meta = st.session_state.get("recommended_groups_meta", {}) or {}
+    status = str(st.session_state.get("recommended_groups_status", "inactive") or "inactive")
+    stored_hash = str(st.session_state.get("recommended_groups_inputs_hash", "") or "")
+    is_current = bool(stored_hash and stored_hash == str(inputs_hash or ""))
+
+    if status != "active" or not is_current or not group_map:
+        return {
+            "group_map": {},
+            "group_count": 0,
+            "assignment_df": empty_assignment_df,
+            "selected_filter": "전체",
+            "status": status,
+            "error": str(st.session_state.get("recommended_groups_error", "") or ""),
+            "is_current": is_current,
+            "payload": {
+                "recommended_group_map": {},
+                "recommended_group_count": 0,
+                "selected_group_filter": "전체",
+                "group_assignment_rows": [],
+            },
+        }
+
+    if isinstance(route_feature_df, pd.DataFrame):
+        feature_df = route_feature_df.copy(deep=True)
+        group_map = filter_group_map_for_routes(feature_df, group_map)
+        if not has_complete_group_map(feature_df, group_map):
+            return {
+                "group_map": {},
+                "group_count": 0,
+                "assignment_df": empty_assignment_df,
+                "selected_filter": "전체",
+                "status": "stale",
+                "error": str(st.session_state.get("recommended_groups_error", "") or ""),
+                "is_current": False,
+                "payload": {
+                    "recommended_group_map": {},
+                    "recommended_group_count": 0,
+                    "selected_group_filter": "전체",
+                    "group_assignment_rows": [],
+                },
+            }
+    else:
+        feature_df = None
+
+    assignment_df = _copy_recommended_groups_assignment_df(
+        st.session_state.get("recommended_groups_assignment_df", pd.DataFrame())
+    )
+    if isinstance(feature_df, pd.DataFrame) and (len(assignment_df) == 0 or "추천그룹" not in assignment_df.columns):
+        assignment_df = build_group_assignment_df(feature_df.copy(deep=True), group_map)
+
+    selected_filter = str(st.session_state.get("recommended_groups_selected_filter", "전체") or "전체").strip() or "전체"
+    group_count = _infer_recommended_group_count(group_map, fallback=meta.get("group_count", 0))
+    group_assignment_rows = assignment_df.fillna("").astype(str).to_dict(orient="records") if len(assignment_df) > 0 else []
+    return {
+        "group_map": group_map,
+        "group_count": group_count,
+        "assignment_df": assignment_df.copy(deep=True),
+        "selected_filter": selected_filter,
+        "status": status,
+        "error": str(st.session_state.get("recommended_groups_error", "") or ""),
+        "is_current": True,
+        "payload": {
+            "recommended_group_map": group_map.copy(),
+            "recommended_group_count": group_count,
+            "selected_group_filter": selected_filter,
+            "group_assignment_rows": group_assignment_rows,
+        },
+    }
 
 
 def sync_recommendation_state_with_dataset(uploaded_filename: str, base_date: str, route_summary: pd.DataFrame) -> str:
     dataset_key = build_route_dataset_key(uploaded_filename, base_date, route_summary)
-    if st.session_state.get("recommendation_dataset_key") != dataset_key:
-        clear_recommendation_state()
-    st.session_state["recommendation_dataset_key"] = dataset_key
+    if st.session_state.get("recommended_groups_dataset_key") != dataset_key:
+        mark_recommended_groups_stale("추천 기준 데이터가 바뀌어 재계산이 필요합니다.", status="inactive")
+    st.session_state["recommended_groups_dataset_key"] = dataset_key
     return dataset_key
 
 
@@ -1054,6 +1476,230 @@ def send_assignment_completion_notifications(summary_text: str, memo_text: str):
         "summary": tg_resp_1,
         "memo": tg_resp_2,
     }
+
+
+def load_assignment_progress_state():
+    if not os.path.exists(ASSIGNMENT_PROGRESS_FILE):
+        return {}
+    try:
+        with open(ASSIGNMENT_PROGRESS_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        logger.warning("Failed to load assignment progress state: %s", exc)
+        return {}
+
+
+def save_assignment_progress_state(state: dict):
+    try:
+        with open(ASSIGNMENT_PROGRESS_FILE, "w", encoding="utf-8") as f:
+            json.dump(state or {}, f, ensure_ascii=False, indent=2)
+        return None
+    except Exception as exc:
+        logger.warning("Failed to save assignment progress state: %s", exc)
+        return str(exc)
+
+
+def format_assignment_progress_lines(state: dict) -> str:
+    state = state if isinstance(state, dict) else {}
+    total = safe_int(state.get("total", 0))
+    completed = safe_int(state.get("completed", 0))
+    success_count = safe_int(state.get("success_count", 0))
+    failure_count = safe_int(state.get("failure_count", 0))
+    base_date = str(state.get("base_date", "") or "").strip()
+    last_attempt = str(state.get("last_attempt_request_id", "") or "").strip()
+    last_success = str(state.get("last_success_request_id", "") or "").strip()
+    last_stage = str(state.get("last_stage", "") or "").strip()
+    retry_count = safe_int(state.get("retry_count", 0))
+    last_error = str(state.get("last_exception_message", "") or "").strip()
+    updated_at = str(state.get("updated_at", "") or "").strip()
+
+    lines = []
+    if base_date:
+        lines.append(f"기준일: {base_date}")
+    lines.append(f"전체 {total}건 중 {completed}건 완료")
+    lines.append(f"성공 {success_count}건 / 실패 {failure_count}건")
+    if last_attempt:
+        lines.append(f"마지막 처리 request_id: {last_attempt}")
+    if last_success:
+        lines.append(f"마지막 성공 request_id: {last_success}")
+    if last_stage:
+        lines.append(f"마지막 단계: {last_stage}")
+    lines.append(f"재시도 횟수: {retry_count}")
+    if last_error:
+        lines.append(f"오류: {last_error[:300]}")
+    if updated_at:
+        lines.append(f"갱신: {updated_at}")
+    return "\n".join(lines)
+
+
+def build_assignment_progress_message(title: str, state: dict) -> str:
+    state = state if isinstance(state, dict) else {}
+    total = safe_int(state.get("total", 0))
+    completed = safe_int(state.get("completed", 0))
+    success_count = safe_int(state.get("success_count", 0))
+    failure_count = safe_int(state.get("failure_count", 0))
+    last_request_id = clean_map_text(state.get("last_attempt_request_id", ""))
+    last_stage = clean_map_text(state.get("last_stage", ""))
+    last_error = clean_map_text(state.get("last_exception_message", ""))
+
+    if title == "자동할당 완료":
+        return f"[자동할당 완료]\n전체 {total}건 중 성공 {success_count}건 / 실패 {failure_count}건"
+
+    lines = [
+        "[자동할당 실패]",
+        f"전체 {total}건 중 {completed}건 처리",
+        f"성공 {success_count}건 / 실패 {failure_count}건",
+    ]
+    if last_request_id:
+        lines.append(f"마지막 request_id: {last_request_id}")
+    if last_stage:
+        lines.append(f"마지막 단계: {last_stage}")
+    if last_error:
+        lines.append(f"오류: {last_error[:300]}")
+    return "\n".join(lines)
+
+
+def send_assignment_progress_notification(title: str, state: dict):
+    try:
+        if not is_telegram_configured():
+            reason = "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing"
+            logger.warning("Skipping assignment progress Telegram notification: %s", reason)
+            return "skipped", reason
+
+        _, error = send_telegram_message(build_assignment_progress_message(title, state))
+        if error:
+            logger.warning("Telegram assignment progress notification failed: %s", error)
+            return "failed", error
+        return "sent", None
+    except Exception as exc:
+        logger.warning("Telegram assignment progress notification failed: %s", exc, exc_info=True)
+        return "failed", str(exc)
+
+
+def render_assignment_progress_state(state: dict = None, placeholder=None):
+    state = state if isinstance(state, dict) else load_assignment_progress_state()
+    if not state:
+        return
+
+    title = str(state.get("status", "") or "unknown").strip()
+    body = format_assignment_progress_lines(state)
+    target = placeholder if placeholder is not None else st
+    try:
+        target.info(f"자동할당 진행 상태: {title}\n\n{body}")
+    except Exception:
+        logger.debug("Failed to render assignment progress state.", exc_info=True)
+
+
+def make_assignment_progress_callback(
+    total_count: int,
+    base_date: str,
+    placeholder=None,
+    progress_bar=None,
+    notify_every: int = ASSIGNMENT_PROGRESS_NOTIFY_EVERY,
+):
+    started_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    state = {
+        "status": "running",
+        "base_date": str(base_date or "").strip(),
+        "total": safe_int(total_count),
+        "completed": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "last_success_request_id": "",
+        "last_attempt_request_id": "",
+        "last_stage": "queued",
+        "retry_count": 0,
+        "last_exception_message": "",
+        "started_at": started_at,
+        "updated_at": started_at,
+    }
+    def _update_ui():
+        st.session_state["assignment_progress_state"] = state.copy()
+        save_assignment_progress_state(state)
+        render_assignment_progress_state(state, placeholder=placeholder)
+        if progress_bar is not None:
+            total = max(1, safe_int(state.get("total", 0)))
+            completed = min(total, safe_int(state.get("completed", 0)))
+            try:
+                progress_bar.progress(completed / total)
+            except Exception:
+                logger.debug("Failed to update assignment progress bar.", exc_info=True)
+
+    def _notify(title: str):
+        try:
+            status, error = send_assignment_progress_notification(title, state.copy())
+            state["telegram_status"] = status
+            state["telegram_error"] = str(error or "")
+            state["telegram_notified_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_assignment_progress_state(state)
+            logger.info("Assignment progress Telegram notification status: %s", status)
+        except Exception as exc:
+            state["telegram_status"] = "failed"
+            state["telegram_error"] = str(exc)
+            state["telegram_notified_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_assignment_progress_state(state)
+            logger.warning("Telegram assignment progress notification failed: %s", exc, exc_info=True)
+
+    def callback(event_payload: dict):
+        payload = event_payload if isinstance(event_payload, dict) else {}
+        event = str(payload.get("event", "") or "").strip()
+        stage = str(payload.get("stage", "") or "").strip()
+        request_id = str(payload.get("request_id", "") or "").strip()
+        reason = str(payload.get("reason", "") or "").strip()
+        error = str(payload.get("error", "") or "").strip()
+
+        if payload.get("total") is not None:
+            state["total"] = safe_int(payload.get("total", state.get("total", 0)))
+        if payload.get("completed") is not None:
+            state["completed"] = safe_int(payload.get("completed", state.get("completed", 0)))
+        if payload.get("success_count") is not None:
+            state["success_count"] = safe_int(payload.get("success_count", state.get("success_count", 0)))
+        if payload.get("failure_count") is not None:
+            state["failure_count"] = safe_int(payload.get("failure_count", state.get("failure_count", 0)))
+        if stage:
+            state["last_stage"] = stage
+        if request_id:
+            state["last_attempt_request_id"] = request_id
+        if event == "row_saved" and request_id:
+            state["last_success_request_id"] = request_id
+        if event == "row_done" and stage == "saved" and request_id:
+            state["last_success_request_id"] = request_id
+        state["retry_count"] = max(safe_int(state.get("retry_count", 0)), safe_int(payload.get("retry_count", 0)))
+        if error or reason:
+            state["last_exception_message"] = (error or reason)[:500]
+        state["updated_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if event == "start":
+            state["status"] = "running"
+            _update_ui()
+            return
+        if event == "progress":
+            state["status"] = "running"
+            _update_ui()
+            return
+        if event == "completed":
+            has_failures = safe_int(state.get("failure_count", 0)) > 0
+            state["status"] = "failed" if has_failures else "completed"
+            state["completed"] = state["total"]
+            state["finished_at"] = state["updated_at"]
+            _update_ui()
+            if has_failures:
+                _notify("자동할당 실패")
+            else:
+                _notify("자동할당 완료")
+            return
+        if event == "aborted":
+            state["status"] = "aborted"
+            state["last_stage"] = "failed"
+            state["finished_at"] = state["updated_at"]
+            _update_ui()
+            _notify("자동할당 실패")
+            return
+
+        _update_ui()
+
+    return callback
 
 
 def build_driver_memo_report(grouped_delivery: pd.DataFrame) -> str:
@@ -1902,6 +2548,7 @@ def save_share_payload(
     assigned_summary: pd.DataFrame,
     result_delivery_df: pd.DataFrame = None,
     grouped_delivery_df: pd.DataFrame = None,
+    pickup_grouped_delivery_df: pd.DataFrame = None,
     route_prefix_map: dict = None,
     truck_request_map: dict = None,
     route_line_label: dict = None,
@@ -1916,6 +2563,7 @@ def save_share_payload(
         "assigned_summary_rows": assigned_summary.fillna("").to_dict(orient="records"),
         "result_delivery_rows": _df_to_records_for_json(result_delivery_df) if result_delivery_df is not None else [],
         "grouped_delivery_rows": _df_to_records_for_json(grouped_delivery_df) if grouped_delivery_df is not None else [],
+        "pickup_grouped_delivery_rows": _df_to_records_for_json(pickup_grouped_delivery_df) if pickup_grouped_delivery_df is not None else [],
         "route_prefix_map": route_prefix_map or {},
         "truck_request_map": truck_request_map or {},
         "route_line_label": route_line_label or {},
@@ -2711,6 +3359,25 @@ def styled_qty_value_html(value: int, kind: str) -> str:
     )
 
 
+def marker_overlap_identity(row) -> str:
+    try:
+        pickup_key = str(row.get("pickup_map_key", "") or "").strip()
+    except Exception:
+        pickup_key = ""
+    if pickup_key:
+        return pickup_key
+
+    try:
+        route = str(row.get("route", "") or "").strip()
+        address_norm = str(row.get("address_norm", "") or "").strip()
+        company_key = str(row.get("company_id", "") or "").strip() or str(row.get("company_name", "") or "").strip()
+        milkrun_no = str(row.get("milkrun_no", "") or "").strip()
+        origin_center = str(row.get("origin_center", "") or "").strip()
+        return f"{route}|{company_key}|{address_norm}|{milkrun_no}|{origin_center}"
+    except Exception:
+        return ""
+
+
 def build_overlap_info_map(valid_grouped: pd.DataFrame) -> dict:
     overlap_info_map = {}
     if len(valid_grouped) == 0:
@@ -2727,7 +3394,7 @@ def build_overlap_info_map(valid_grouped: pd.DataFrame) -> dict:
             continue
         overlap_info_map[key] = {
             "count": safe_int(len(part)),
-            "rank_map": {(str(r.get("route", "")), str(r.get("address_norm", ""))): safe_int(r.get("coord_rank", 0)) for _, r in part.iterrows()},
+            "rank_map": {marker_overlap_identity(r): safe_int(r.get("coord_rank", 0)) for _, r in part.iterrows()},
         }
 
     return overlap_info_map
@@ -2736,7 +3403,7 @@ def build_overlap_info_map(valid_grouped: pd.DataFrame) -> dict:
 def spread_overlapping_marker(lat: float, lon: float, overlap_info: dict, row: pd.Series):
     base_lat, base_lon = lat, lon
     overlap_count = safe_int(overlap_info.get("count", 1))
-    overlap_rank = safe_int(overlap_info.get("rank_map", {}).get((str(row.get("route", "")), str(row.get("address_norm", ""))), 0))
+    overlap_rank = safe_int(overlap_info.get("rank_map", {}).get(marker_overlap_identity(row), 0))
 
     if overlap_count > 1:
         angle = (2 * math.pi * overlap_rank) / overlap_count
@@ -2935,7 +3602,188 @@ def resolve_group_count(route_feature_df: pd.DataFrame, manual_group_count=None)
     return max(1, min(k, len(route_feature_df)))
 
 
-def build_map_data(result_delivery: pd.DataFrame, grouped_delivery: pd.DataFrame, assignment_df: pd.DataFrame, selected_filter: str):
+def _first_nonempty_value(values):
+    for value in values:
+        text = str(value).strip()
+        if text and text.lower() != "nan":
+            return text
+    return ""
+
+
+def _first_valid_coords_value(values):
+    for value in values:
+        coords = _normalize_coords(value)
+        if coords is not None:
+            return coords
+    return None
+
+
+def build_pickup_map_grouped_df(
+    grouped_delivery: pd.DataFrame,
+    route_prefix_map: dict = None,
+    route_camp_map: dict = None,
+    route_driver_map: dict = None,
+):
+    if not isinstance(grouped_delivery, pd.DataFrame) or len(grouped_delivery) == 0:
+        return pd.DataFrame()
+
+    work = grouped_delivery.copy()
+    route_prefix_map = route_prefix_map if isinstance(route_prefix_map, dict) else {}
+    route_camp_map = route_camp_map if isinstance(route_camp_map, dict) else {}
+    route_driver_map = route_driver_map if isinstance(route_driver_map, dict) else {}
+
+    for col in [
+        "route",
+        "company_id",
+        "company_name",
+        "address",
+        "address_norm",
+        "truck_request_id",
+        "route_prefix",
+        "assigned_driver",
+        "customer_memo",
+        "first_time",
+    ]:
+        if col not in work.columns:
+            work[col] = ""
+        work[col] = work[col].fillna("").astype(str)
+
+    for qty_col in ["ae_sum", "af_sum", "ag_sum"]:
+        if qty_col not in work.columns:
+            work[qty_col] = 0
+        work[qty_col] = pd.to_numeric(work[qty_col], errors="coerce").fillna(0)
+
+    if "stop_count" not in work.columns:
+        work["stop_count"] = 1
+    work["stop_count"] = pd.to_numeric(work["stop_count"], errors="coerce").fillna(1)
+
+    if "coords" not in work.columns:
+        work["coords"] = None
+    work["coords"] = work["coords"].apply(_normalize_coords)
+
+    work["_pickup_row_order"] = range(len(work))
+    if "house_order" in work.columns:
+        work["_pickup_sort_order"] = pd.to_numeric(work["house_order"], errors="coerce")
+    else:
+        work["_pickup_sort_order"] = pd.NA
+    work["_pickup_sort_order"] = work["_pickup_sort_order"].fillna(work["_pickup_row_order"])
+    work["_pickup_company_key"] = work.apply(
+        lambda row: str(row.get("company_id", "")).strip() or str(row.get("company_name", "")).strip(),
+        axis=1,
+    )
+    work["_pickup_address_key"] = work.apply(
+        lambda row: str(row.get("address_norm", "")).strip() or normalize_address(row.get("address", "")),
+        axis=1,
+    )
+    work["_pickup_company_key"] = work["_pickup_company_key"].replace("", "__unknown_company__")
+    work["_pickup_address_key"] = work["_pickup_address_key"].replace("", "__unknown_address__")
+
+    pickup = (
+        work.groupby(["route", "_pickup_company_key", "_pickup_address_key"], as_index=False, sort=False)
+        .agg(
+            truck_request_id=("truck_request_id", _first_nonempty_value),
+            company_id=("company_id", _first_nonempty_value),
+            company_name=("company_name", _first_nonempty_value),
+            address=("address", _first_nonempty_value),
+            address_norm=("address_norm", _first_nonempty_value),
+            coords=("coords", _first_valid_coords_value),
+            assigned_driver=("assigned_driver", _first_nonempty_value),
+            ae_sum=("ae_sum", "sum"),
+            af_sum=("af_sum", "sum"),
+            ag_sum=("ag_sum", "sum"),
+            stop_count=("stop_count", "sum"),
+            route_prefix=("route_prefix", _first_nonempty_value),
+            customer_memo=("customer_memo", _first_nonempty_value),
+            first_time=("first_time", _first_nonempty_value),
+            _pickup_sort_order=("_pickup_sort_order", "min"),
+            _pickup_row_order=("_pickup_row_order", "min"),
+        )
+        .reset_index(drop=True)
+    )
+
+    if len(pickup) == 0:
+        return pickup
+
+    if route_prefix_map:
+        pickup["route_prefix"] = pickup["route"].map(route_prefix_map).fillna(pickup["route_prefix"]).astype(str)
+    if route_driver_map:
+        pickup["assigned_driver"] = pickup["route"].map(route_driver_map).fillna(pickup["assigned_driver"]).astype(str)
+
+    pickup["camp_code"] = pickup["route"].map(route_camp_map).fillna("")
+    pickup["camp_name"] = pickup["camp_code"].map(lambda code: CAMP_INFO.get(code, {}).get("camp_name", "")).fillna("")
+    pickup["address_norm"] = pickup["address_norm"].where(
+        pickup["address_norm"].astype(str).str.strip() != "",
+        pickup["_pickup_address_key"],
+    ).astype(str)
+    pickup["box_total"] = pickup["ae_sum"] + pickup["af_sum"] + pickup["ag_sum"]
+    pickup["total_qty"] = pickup["box_total"]
+    pickup["pickup_map_grouped"] = True
+    pickup["pickup_map_key"] = pickup.apply(
+        lambda row: f"{row.get('route', '')}|{row.get('_pickup_company_key', '')}|{row.get('_pickup_address_key', '')}",
+        axis=1,
+    )
+
+    pickup = pickup.sort_values(
+        ["route", "_pickup_sort_order", "_pickup_row_order"],
+        kind="stable",
+    ).reset_index(drop=True)
+    pickup["house_order"] = pickup.groupby("route").cumcount() + 1
+    pickup["route_total"] = pickup.groupby("route")["route"].transform("count")
+    pickup["pin_label"] = pickup.apply(
+        lambda row: f"{row.get('route_prefix', '')}{safe_int(row.get('house_order', 0))}".strip()
+        or str(safe_int(row.get("house_order", 0))),
+        axis=1,
+    )
+
+    def _tooltip(row):
+        time_text = clean_map_text(row.get("first_time", ""))
+        company_name = shorten_company_name_for_tooltip(row.get("company_name", ""))
+        total = safe_int(row.get("box_total", 0))
+        small = safe_int(row.get("ae_sum", 0))
+        medium = safe_int(row.get("af_sum", 0))
+        large = safe_int(row.get("ag_sum", 0))
+        prefix = f"{time_text} " if time_text else ""
+        return f"{prefix}{company_name} {total}({small}/{medium}/{large})".strip()
+
+    def _popup(row):
+        memo = str(row.get("customer_memo", "") or "").strip()
+        memo_html = f"<br><b>메모:</b> {html.escape(memo)}" if memo else ""
+        return f"""
+        <div style="min-width:280px;max-width:400px;line-height:1.5;">
+            <b>루트:</b> {html.escape(str(row.get('route', '')))}<br>
+            <b>기사:</b> {html.escape(str(row.get('assigned_driver', '') or '미배정'))}<br>
+            <b>방문예정시간:</b> {html.escape(clean_map_text(row.get('first_time', '')) or '-')}<br>
+            <b>업체명:</b> {html.escape(str(row.get('company_name', '') or '-'))}<br>
+            <b>주소:</b> {html.escape(str(row.get('address', '') or '-'))}<br>
+            <b>총박스:</b> {safe_int(row.get('box_total', 0))}<br>
+            <b>소:</b> {safe_int(row.get('ae_sum', 0))}<br>
+            <b>중:</b> {safe_int(row.get('af_sum', 0))}<br>
+            <b>대:</b> {safe_int(row.get('ag_sum', 0))}<br>
+            <b>총건수:</b> {safe_int(row.get('stop_count', 0))}<br>
+            <b>캠프:</b> {html.escape(str(row.get('camp_name', '') or '-'))}
+            {memo_html}
+        </div>
+        """
+
+    pickup["pickup_tooltip"] = pickup.apply(_tooltip, axis=1)
+    pickup["pickup_popup_html"] = pickup.apply(_popup, axis=1)
+    pickup["hover_text"] = pickup["pickup_tooltip"]
+
+    return pickup.drop(
+        columns=["_pickup_company_key", "_pickup_address_key", "_pickup_sort_order", "_pickup_row_order"],
+        errors="ignore",
+    )
+
+
+def build_map_data(
+    result_delivery: pd.DataFrame,
+    grouped_delivery: pd.DataFrame,
+    assignment_df: pd.DataFrame,
+    selected_filter: str,
+    route_prefix_map: dict = None,
+    route_camp_map: dict = None,
+    pickup_grouped: bool = False,
+):
     route_driver_map = {}
     if len(assignment_df) > 0:
         route_driver_map = dict(zip(assignment_df["route"], assignment_df["assigned_driver"]))
@@ -2956,13 +3804,25 @@ def build_map_data(result_delivery: pd.DataFrame, grouped_delivery: pd.DataFrame
         map_result = result2[result2["assigned_driver"] == selected_filter].copy()
         map_grouped = grouped2[grouped2["assigned_driver"] == selected_filter].copy()
 
+    if pickup_grouped:
+        map_grouped = build_pickup_map_grouped_df(
+            map_grouped,
+            route_prefix_map=route_prefix_map,
+            route_camp_map=route_camp_map,
+            route_driver_map=route_driver_map,
+        )
+
+    manual_mappings = load_manual_location_mappings()
+    map_result, _ = apply_manual_location_mappings(map_result, manual_mappings, collect_unmapped=False)
+    map_grouped, unmapped_df = apply_manual_location_mappings(map_grouped, manual_mappings, collect_unmapped=True)
+
     map_result, _ = _sanitize_coords_column(map_result, log_label="build_map_data_result")
     map_grouped, _ = _sanitize_coords_column(map_grouped, log_label="build_map_data_grouped")
 
     valid_result = map_result[map_result["coords"].notna()].copy()
     valid_grouped = map_grouped[map_grouped["coords"].notna()].copy()
 
-    return valid_result, valid_grouped, route_driver_map
+    return valid_result, valid_grouped, route_driver_map, unmapped_df
 
 
 def build_dispatch_overlay_layers(
@@ -3275,6 +4135,9 @@ def build_dispatch_overlay_layers(
                 {overlap_detail}
             </div>
             """
+            pickup_popup_html = str(row.get("pickup_popup_html", "") or "").strip()
+            if pickup_popup_html:
+                popup_html = pickup_popup_html
 
             house_order = safe_int(row.get("house_order", 0))
             route_total = safe_int(row.get("route_total", 0))
@@ -3290,7 +4153,7 @@ def build_dispatch_overlay_layers(
                 pin_text = str(row.get("pin_label", ""))
                 icon_obj = make_stop_div_icon(pin_color, pin_text, size_scale=size_scale, border_color=border_color)
 
-            tooltip_text = row["hover_text"]
+            tooltip_text = str(row.get("pickup_tooltip", "") or "").strip() or row["hover_text"]
             if overlap_label:
                 tooltip_text = f"{tooltip_text} / {overlap_label}"
 
@@ -3499,8 +4362,10 @@ def build_static_map_cache_key(active_dataset_key: str, selected_filter: str, as
             )
     payload = json.dumps(
         {
+            "cache_version": "static_pickup_v1",
             "dataset_key": str(active_dataset_key or ""),
             "selected_filter": str(selected_filter or ""),
+            "manual_location_mapping": manual_location_mapping_fingerprint(),
             "assignment_rows": assignment_rows,
         },
         ensure_ascii=False,
@@ -3552,6 +4417,159 @@ def get_static_map_html(
     return map_html
 
 
+def milkrun_project_dir() -> Path:
+    return BASE_DIR.parent / "Nasil-sale-main"
+
+
+def milkrun_python_executable(project_dir: Path) -> Path:
+    venv_python = project_dir / ".venv" / "Scripts" / "python.exe"
+    return venv_python if venv_python.exists() else Path("python")
+
+
+def _extract_last_json_object(output_text: str) -> dict:
+    for line in reversed(str(output_text or "").splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            payload = json.loads(line)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            continue
+    return {}
+
+
+def load_latest_milkrun_attempt_summary(project_dir: Path, python_exe: Path) -> dict:
+    shell_code = (
+        "import json; "
+        "from milkrun.services.collection import latest_collection_attempt; "
+        "a=latest_collection_attempt(); "
+        "meta=(a.attempt_meta or {}) if a else {}; "
+        "sync=meta.get('dispatch_sync') or {}; "
+        "scrape=meta.get('scrape_save') or {}; "
+        "payload={"
+        "'status': getattr(a, 'status', '') if a else '', "
+        "'status_display': a.get_status_display() if a else '', "
+        "'target_date': a.target_date.isoformat() if a and a.target_date else '', "
+        "'message': (a.message or '') if a else '', "
+        "'item_count': int(scrape.get('item_count') or 0), "
+        "'created': bool(scrape.get('created', False)), "
+        "'route_count': int(sync.get('route_count') or 0), "
+        "'stop_count': int(sync.get('stop_count') or 0), "
+        "'source_date': sync.get('source_date') or '', "
+        "'run_id': int(sync.get('run_id') or 0), "
+        "'error_stage': meta.get('error_stage') or '', "
+        "}; "
+        "print(json.dumps(payload, ensure_ascii=False))"
+    )
+    result = subprocess.run(
+        [str(python_exe), "manage.py", "shell", "-c", shell_code],
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    if result.returncode != 0:
+        logger.warning("Failed to inspect latest milkrun attempt: %s", result.stderr or result.stdout)
+        return {}
+    return _extract_last_json_object(result.stdout)
+
+
+def run_manual_milkrun_collection() -> dict:
+    project_dir = milkrun_project_dir()
+    if not project_dir.exists():
+        return {
+            "ok": False,
+            "stage": "prepare",
+            "error": f"Milkrun project not found: {project_dir}",
+        }
+
+    python_exe = milkrun_python_executable(project_dir)
+    command = [str(python_exe), "manage.py", "collect_milkrun", "--manual"]
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    started_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(project_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "stage": "collect",
+            "started_at": started_at,
+            "finished_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "error": f"milkrun collection timed out: {exc}",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "stage": "collect",
+            "started_at": started_at,
+            "finished_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "error": str(exc),
+        }
+
+    latest_attempt = load_latest_milkrun_attempt_summary(project_dir, python_exe)
+    ok = result.returncode == 0
+    return {
+        "ok": ok,
+        "stage": "completed" if ok else "collect",
+        "started_at": started_at,
+        "finished_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "returncode": result.returncode,
+        "stdout": (result.stdout or "").strip()[-2000:],
+        "stderr": (result.stderr or "").strip()[-2000:],
+        "error": "" if ok else ((result.stderr or result.stdout or "milkrun collection failed").strip()[-1000:]),
+        "attempt": latest_attempt,
+    }
+
+
+def render_manual_milkrun_result(result: dict):
+    if not isinstance(result, dict) or not result:
+        return
+
+    attempt = result.get("attempt") if isinstance(result.get("attempt"), dict) else {}
+    target_date = attempt.get("source_date") or attempt.get("target_date") or ""
+    item_count = safe_int(attempt.get("item_count", 0))
+    route_count = safe_int(attempt.get("route_count", 0))
+    stop_count = safe_int(attempt.get("stop_count", 0))
+    status_display = clean_map_text(attempt.get("status_display", ""))
+    message = clean_map_text(attempt.get("message", ""))
+    status = clean_map_text(attempt.get("status", ""))
+
+    if result.get("ok"):
+        summary_text = (
+            f"기준일 {target_date or '-'} / "
+            f"가져온 {item_count}건 / 저장 route {route_count}건 / stop {stop_count}건"
+        )
+        if status == "skipped":
+            st.warning(f"밀크런 가져오기 건너뜀: {summary_text}")
+        elif status == "no_data":
+            st.warning(f"밀크런 데이터 없음: {summary_text}")
+        else:
+            st.success(f"밀크런 가져오기 완료: {summary_text}")
+        if status_display or message:
+            st.caption(f"{status_display} {message}".strip())
+    else:
+        stage = clean_map_text(result.get("stage", ""))
+        error = clean_map_text(result.get("error", ""))
+        st.error(f"밀크런 가져오기 실패: 단계 {stage or '-'} / 오류 {error or '-'}")
+        if result.get("stderr"):
+            with st.expander("실패 로그", expanded=False):
+                st.code(result.get("stderr", ""), language="text")
+
+
 # =========================
 # 공유 링크로 직접 열기
 # =========================
@@ -3563,7 +4581,7 @@ if shared_map:
 
     if payload and payload.get("map_html"):
         result_rows = payload.get("result_delivery_rows", [])
-        grouped_rows = payload.get("grouped_delivery_rows", [])
+        grouped_rows = payload.get("pickup_grouped_delivery_rows", []) or payload.get("grouped_delivery_rows", [])
 
         if result_rows and grouped_rows:
             shared_result_df = _records_to_df_with_coords(result_rows)
@@ -3736,6 +4754,28 @@ with st.sidebar:
     elif latest_run_error:
         st.caption(f"최근 작업 조회 실패: {latest_run_error}")
 
+    with st.expander("밀크런 수동 수집", expanded=False):
+        st.caption("기존 Django 밀크런 수집/dispatch 동기화 로직을 수동 실행합니다.")
+        last_manual_milkrun_result = st.session_state.get("manual_milkrun_result", {})
+        if isinstance(last_manual_milkrun_result, dict) and last_manual_milkrun_result.get("finished_at"):
+            st.caption(f"최근 실행: {last_manual_milkrun_result.get('finished_at')}")
+        if st.button("밀크런 가져오기", key="manual_milkrun_collect_button"):
+            st.session_state["manual_milkrun_result"] = {
+                "ok": False,
+                "stage": "running",
+                "started_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "message": "수집 중",
+            }
+            with st.spinner("밀크런 수집 중..."):
+                manual_milkrun_result = run_manual_milkrun_collection()
+            st.session_state["manual_milkrun_result"] = manual_milkrun_result
+            cached_load_latest_assignment_run_summary.clear()
+            cached_load_assignment_runs.clear()
+            cached_load_assignment_run_detail.clear()
+            render_manual_milkrun_result(manual_milkrun_result)
+        elif isinstance(last_manual_milkrun_result, dict) and last_manual_milkrun_result:
+            render_manual_milkrun_result(last_manual_milkrun_result)
+
 if "assignment_store" not in st.session_state:
     st.session_state["assignment_store"] = load_assignment_store()
     st.session_state["assignment_store_source"] = "initial_load"
@@ -3877,14 +4917,39 @@ if not uploaded_file:
                 st.session_state.get("assignment_store", {}),
             )
             if latest_recommended_group_map:
-                st.session_state["recommended_group_map"] = latest_recommended_group_map
-                if latest_recommended_group_count > 0:
-                    st.session_state["recommended_group_count"] = latest_recommended_group_count
-                if latest_group_assignment_rows:
-                    st.session_state["latest_group_assignment_df"] = pd.DataFrame(latest_group_assignment_rows)
+                restored_route_feature_df = build_route_feature_df(
+                    route_summary.copy(deep=True),
+                    grouped_delivery.copy(deep=True),
+                    camp_coords=dict(camp_coords or {}),
+                )
+                restored_auto_group_count = choose_auto_group_count(restored_route_feature_df.copy(deep=True))
+                restored_group_count = _infer_recommended_group_count(
+                    latest_recommended_group_map,
+                    fallback=latest_recommended_group_count,
+                )
+                restored_group_count_mode = "자동" if restored_group_count == restored_auto_group_count else "직접입력"
+                restored_manual_group_count = None if restored_group_count_mode == "자동" else restored_group_count
+                restored_inputs_hash = build_recommended_groups_inputs_hash(
+                    restored_route_feature_df.copy(deep=True),
+                    restored_group_count_mode,
+                    restored_manual_group_count,
+                )
+                restored_group_assignment_df = _copy_recommended_groups_assignment_df(latest_group_assignment_rows)
+                if len(restored_group_assignment_df) == 0:
+                    restored_group_assignment_df = build_group_assignment_df(
+                        restored_route_feature_df.copy(deep=True),
+                        _copy_recommended_group_map(latest_recommended_group_map),
+                    )
+                set_recommended_groups_state(
+                    group_map=latest_recommended_group_map,
+                    group_count=restored_group_count,
+                    assignment_df=restored_group_assignment_df,
+                    inputs_hash=restored_inputs_hash,
+                    selected_filter=restored_selected_group_filter,
+                    meta={"source": "restored"},
+                )
             else:
-                clear_recommendation_state()
-            st.session_state["selected_group_filter"] = restored_selected_group_filter
+                mark_recommended_groups_stale("저장된 추천그룹 데이터가 없습니다.", status="inactive")
             st.caption(f"저장된 작업을 열었습니다: {chosen_run_summary.get('name', '')}")
         elif latest_run_detail and latest_run_detail.get("routes"):
             route_preview_df = pd.DataFrame(latest_run_detail.get("routes", []))
@@ -3982,6 +5047,24 @@ if st.session_state.get("share_payload_dataset_key") != active_dataset_key:
         st.session_state.pop(share_state_key, None)
     st.session_state["share_payload_dataset_key"] = active_dataset_key
 
+recommended_groups_route_feature_df = build_route_feature_df(
+    route_summary.copy(deep=True),
+    grouped_delivery.copy(deep=True),
+    camp_coords=dict(camp_coords or {}),
+)
+recommended_groups_count_mode_state = str(st.session_state.get("recommended_groups_count_mode", "자동") or "자동")
+recommended_groups_manual_count_state = (
+    st.session_state.get("recommended_groups_manual_count", None)
+    if recommended_groups_count_mode_state == "직접입력"
+    else None
+)
+recommended_groups_inputs_hash = build_recommended_groups_inputs_hash(
+    recommended_groups_route_feature_df.copy(deep=True),
+    recommended_groups_count_mode_state,
+    recommended_groups_manual_count_state,
+)
+sync_recommended_groups_status_for_inputs(recommended_groups_inputs_hash)
+
 tab_basic, tab_recommend, tab_memo, tab_stats, tab_report = st.tabs(
     ["\uae30\ubcf8", "\ucd94\ucc9c", "\uba54\ubaa8", "\ud1b5\uacc4", "\ubcf4\uace0"]
 )
@@ -4064,36 +5147,95 @@ with tab_memo:
 with tab_recommend:
     # 추천배정 엔진 (기존 기사배정과 분리)
     st.subheader("추천배정 엔진")
-    route_feature_df = build_route_feature_df(route_summary, grouped_delivery, camp_coords=camp_coords)
-    group_count_mode = st.radio("추천그룹 수 설정", ["자동", "직접입력"], horizontal=True)
+    route_feature_df = recommended_groups_route_feature_df.copy(deep=True)
+    group_count_mode = st.radio(
+        "추천그룹 수 설정",
+        ["자동", "직접입력"],
+        horizontal=True,
+        key="recommended_groups_count_mode",
+    )
     manual_group_count = None
 
     if group_count_mode == "직접입력":
-        manual_group_count = st.number_input("추천그룹 수", min_value=1, max_value=max(1, len(route_summary)), value=2, step=1)
+        manual_group_count = st.number_input(
+            "추천그룹 수",
+            min_value=1,
+            max_value=max(1, len(route_summary)),
+            value=2,
+            step=1,
+            key="recommended_groups_manual_count",
+        )
     else:
-        auto_group_count = choose_auto_group_count(route_feature_df)
+        auto_group_count = choose_auto_group_count(route_feature_df.copy(deep=True))
         st.caption(f"자동 추천그룹 수: {auto_group_count}")
 
+    recommended_groups_inputs_hash = build_recommended_groups_inputs_hash(
+        route_feature_df.copy(deep=True),
+        group_count_mode,
+        manual_group_count,
+    )
+    sync_recommended_groups_status_for_inputs(recommended_groups_inputs_hash)
+
     if st.button("추천그룹 자동 추천 실행"):
-        recommended_group_count = resolve_group_count(route_feature_df, manual_group_count=manual_group_count)
-        recommended_group_map = recommend_route_groups(route_feature_df, manual_group_count=manual_group_count)
-        st.session_state["recommended_group_map"] = recommended_group_map
-        st.session_state["recommended_group_count"] = recommended_group_count
-        st.success("추천그룹 생성을 완료했습니다.")
+        try:
+            feature_df_for_calc = route_feature_df.copy(deep=True)
+            recommended_group_count = resolve_group_count(
+                feature_df_for_calc.copy(deep=True),
+                manual_group_count=manual_group_count,
+            )
+            recommended_group_map = recommend_route_groups(
+                feature_df_for_calc.copy(deep=True),
+                manual_group_count=manual_group_count,
+            )
+            recommended_group_map = filter_group_map_for_routes(
+                feature_df_for_calc.copy(deep=True),
+                recommended_group_map,
+            )
+            if not recommended_group_map or not has_complete_group_map(feature_df_for_calc.copy(deep=True), recommended_group_map):
+                mark_recommended_groups_error("추천 계산 결과가 현재 데이터와 맞지 않습니다. 추천그룹을 다시 계산해 주세요.")
+                st.error("추천 계산 결과가 현재 데이터와 맞지 않습니다. 기존 추천 결과는 유지했습니다.")
+            else:
+                latest_assignment_df = build_group_assignment_df(feature_df_for_calc.copy(deep=True), recommended_group_map)
+                if len(latest_assignment_df) == 0:
+                    mark_recommended_groups_error("추천 계산 결과로 표시할 그룹 배정 데이터가 없습니다.")
+                    st.error("추천 계산 결과가 비어 있습니다. 기존 추천 결과는 유지했습니다.")
+                else:
+                    set_recommended_groups_state(
+                        group_map=recommended_group_map,
+                        group_count=recommended_group_count,
+                        assignment_df=latest_assignment_df.copy(deep=True),
+                        inputs_hash=recommended_groups_inputs_hash,
+                        selected_filter="전체",
+                        meta={
+                            "group_count_mode": group_count_mode,
+                            "manual_group_count": safe_int(manual_group_count) if manual_group_count is not None else 0,
+                        },
+                    )
+                    st.success("추천그룹 생성을 완료했습니다.")
+        except Exception as exc:
+            logger.exception("Recommendation group calculation failed.")
+            mark_recommended_groups_error(f"{type(exc).__name__}: {exc}")
+            st.error("추천그룹 계산에 실패했습니다. 기존 추천 결과는 유지했습니다.")
 
-    raw_recommended_group_map = st.session_state.get("recommended_group_map", {}) or {}
-    recommended_group_map = filter_group_map_for_routes(route_feature_df, raw_recommended_group_map)
-    has_valid_recommendation = has_complete_group_map(route_feature_df, raw_recommended_group_map)
+    recommended_groups_projection = get_recommended_groups_projection(
+        route_feature_df.copy(deep=True),
+        recommended_groups_inputs_hash,
+    )
+    recommendation_error = recommended_groups_projection.get("error", "")
+    if recommendation_error:
+        st.error(f"추천그룹 오류: {recommendation_error}")
 
-    if raw_recommended_group_map and has_valid_recommendation and recommended_group_map != raw_recommended_group_map:
-        st.session_state["recommended_group_map"] = recommended_group_map
-    elif raw_recommended_group_map and not has_valid_recommendation:
-        clear_recommendation_state()
-        recommended_group_map = {}
-        st.info("현재 데이터에 맞는 추천그룹 데이터가 없습니다. 새 업로드 직후라면 '추천그룹 자동 추천 실행'을 먼저 눌러주세요.")
+    recommendation_status = str(recommended_groups_projection.get("status", "inactive"))
+    has_stored_recommendation = bool(_copy_recommended_group_map(st.session_state.get("recommended_groups_result", {})))
+    if has_stored_recommendation and recommendation_status in {"stale", "inactive"}:
+        st.warning("추천 입력 조건이 바뀌었거나 현재 데이터와 맞지 않아 추천그룹을 다시 계산해야 합니다. 직전 성공 결과는 보존되어 있습니다.")
+
+    recommended_group_map = recommended_groups_projection["group_map"]
 
     if recommended_group_map:
-        group_assignment_df = build_group_assignment_df(route_feature_df, recommended_group_map)
+        group_assignment_df = recommended_groups_projection["assignment_df"].copy(deep=True)
+        if len(group_assignment_df) == 0:
+            group_assignment_df = build_group_assignment_df(route_feature_df.copy(deep=True), recommended_group_map)
         group_summary_df = build_group_summary_df(group_assignment_df)
 
         st.subheader("추천그룹 요약")
@@ -4104,7 +5246,7 @@ with tab_recommend:
 
         with st.expander("추천그룹 수정", expanded=False):
             edit_map = default_group_edit_map(group_assignment_df)
-            recommended_group_count = safe_int(st.session_state.get("recommended_group_count", 0))
+            recommended_group_count = safe_int(recommended_groups_projection.get("group_count", 0))
             if recommended_group_count <= 0:
                 recommended_group_count = max(1, safe_int(group_assignment_df["추천그룹"].nunique()))
             group_options = [f"추천그룹 {i}" for i in range(1, recommended_group_count + 1)]
@@ -4133,24 +5275,56 @@ with tab_recommend:
                 group_submitted = st.form_submit_button("추천그룹 수정 적용")
 
             if group_submitted:
-                updated_assignment_df = apply_group_edit_map(route_feature_df, new_group_map)
-                st.session_state["recommended_group_map"] = default_group_edit_map(updated_assignment_df)
-                recommended_group_map = st.session_state["recommended_group_map"]
-                st.success("추천그룹 수동 수정을 반영했습니다.")
+                updated_assignment_df = apply_group_edit_map(route_feature_df.copy(deep=True), new_group_map)
+                updated_group_map = default_group_edit_map(updated_assignment_df)
+                if not updated_group_map or not has_complete_group_map(route_feature_df.copy(deep=True), updated_group_map):
+                    mark_recommended_groups_error("추천그룹 수동 수정 결과가 현재 데이터와 맞지 않습니다.")
+                    st.error("추천그룹 수동 수정 결과가 현재 데이터와 맞지 않아 기존 결과를 유지했습니다.")
+                else:
+                    set_recommended_groups_state(
+                        group_map=updated_group_map,
+                        group_count=recommended_group_count,
+                        assignment_df=updated_assignment_df.copy(deep=True),
+                        inputs_hash=recommended_groups_inputs_hash,
+                        selected_filter=st.session_state.get("recommended_groups_selected_filter", "전체"),
+                        meta={
+                            "group_count_mode": group_count_mode,
+                            "manual_group_count": safe_int(manual_group_count) if manual_group_count is not None else 0,
+                            "source": "manual_edit",
+                        },
+                    )
+                    recommended_groups_projection = get_recommended_groups_projection(
+                        route_feature_df.copy(deep=True),
+                        recommended_groups_inputs_hash,
+                    )
+                    recommended_group_map = recommended_groups_projection["group_map"]
+                    group_assignment_df = recommended_groups_projection["assignment_df"].copy(deep=True)
+                    st.success("추천그룹 수동 수정을 반영했습니다.")
 
         final_group_map = filter_group_map_for_routes(
-            route_feature_df,
-            st.session_state.get("recommended_group_map", recommended_group_map),
+            route_feature_df.copy(deep=True),
+            recommended_group_map,
         )
         if not final_group_map or not has_complete_group_map(route_feature_df, final_group_map):
-            clear_recommendation_state()
+            mark_recommended_groups_error("표시할 추천그룹 데이터가 현재 입력과 맞지 않습니다.")
             st.info("표시할 추천그룹 데이터가 없습니다. 추천그룹을 다시 계산해 주세요.")
         else:
-            st.session_state["recommended_group_map"] = final_group_map
-            group_map_result, group_map_grouped = build_group_map_data(result_delivery, grouped_delivery, final_group_map)
+            if final_group_map != recommended_group_map:
+                set_recommended_groups_state(
+                    group_map=final_group_map,
+                    group_count=recommended_groups_projection.get("group_count", 0),
+                    assignment_df=build_group_assignment_df(route_feature_df.copy(deep=True), final_group_map),
+                    inputs_hash=recommended_groups_inputs_hash,
+                    selected_filter=st.session_state.get("recommended_groups_selected_filter", "전체"),
+                    meta={"source": "route_filter"},
+                )
+            group_map_result, group_map_grouped = build_group_map_data(
+                result_delivery.copy(deep=True),
+                grouped_delivery.copy(deep=True),
+                final_group_map,
+            )
 
-            latest_assignment_df = build_group_assignment_df(route_feature_df, final_group_map)
-            st.session_state["latest_group_assignment_df"] = latest_assignment_df.copy()
+            latest_assignment_df = build_group_assignment_df(route_feature_df.copy(deep=True), final_group_map)
             group_detail_df = build_group_detail_stats_df(latest_assignment_df)
             assignment_store = st.session_state.get("assignment_store", {})
             assignment_store = render_group_driver_assignment_form(
@@ -4165,8 +5339,14 @@ with tab_recommend:
 
             st.subheader("추천그룹 지도")
             selectable_groups = ["전체"] + group_detail_df["추천그룹"].astype(str).tolist()
-            selected_group_index = selectable_groups.index(restored_selected_group_filter) if restored_selected_group_filter in selectable_groups else 0
-            selected_group_filter = st.selectbox("추천그룹 선택", selectable_groups, index=selected_group_index, key="selected_group_filter")
+            current_selected_group_filter = str(st.session_state.get("recommended_groups_selected_filter", "전체") or "전체")
+            selected_group_index = selectable_groups.index(current_selected_group_filter) if current_selected_group_filter in selectable_groups else 0
+            selected_group_filter = st.selectbox(
+                "추천그룹 선택",
+                selectable_groups,
+                index=selected_group_index,
+                key="recommended_groups_selected_filter",
+            )
 
             if selected_group_filter == "전체":
                 selected_info_df = group_detail_df.copy()
@@ -4207,24 +5387,24 @@ with tab_recommend:
                 )
             ensure_map_view_state(
                 dataset_key=active_dataset_key,
-                center_key="recommend_map_center",
-                zoom_key="recommend_map_zoom",
-                dataset_state_key="recommend_map_dataset_key",
+                center_key="recommended_groups_map_center",
+                zoom_key="recommended_groups_map_zoom",
+                dataset_state_key="recommended_groups_map_dataset_key",
                 default_center=group_default_center,
             )
             render_stable_folium_map(
                 overlay_layers=group_overlay_layers,
-                key="dispatch_recommend_map",
-                center_key="recommend_map_center",
-                zoom_key="recommend_map_zoom",
+                key="dispatch_recommended_groups_map",
+                center_key="recommended_groups_map_center",
+                zoom_key="recommended_groups_map_zoom",
                 height=700,
-                fallback_flag_key="recommend_map_dynamic_fallback",
+                fallback_flag_key="recommended_groups_map_dynamic_fallback",
                 use_spiderfier=True,
             )
 
             with st.expander("기사 선호 예상 순위 (참고용)", expanded=False):
                 st.caption("추천그룹별 물량·스톱·예상시간·퍼짐 기준의 휴리스틱 참고 순위입니다.")
-                preference_df = build_driver_preference_df(route_feature_df, final_group_map)
+                preference_df = build_driver_preference_df(route_feature_df.copy(deep=True), final_group_map)
                 preference_display_df = build_driver_preference_display_df(preference_df)
                 if len(preference_display_df) == 0:
                     st.info("표시할 선호예상 데이터가 없습니다.")
@@ -4242,7 +5422,11 @@ with tab_basic:
     form_container = st.container()
 
     assignment_store = st.session_state["assignment_store"]
-    latest_group_assignment_df = st.session_state.get("latest_group_assignment_df", pd.DataFrame())
+    recommended_groups_projection_for_view = get_recommended_groups_projection(
+        recommended_groups_route_feature_df.copy(deep=True),
+        recommended_groups_inputs_hash,
+    )
+    latest_group_assignment_df = recommended_groups_projection_for_view["assignment_df"].copy(deep=True)
     with form_container:
         assignment_store = render_assignment_form(
             route_summary,
@@ -4301,15 +5485,19 @@ with tab_basic:
             valid_result = cached_main_map_data["valid_result"]
             valid_grouped = cached_main_map_data["valid_grouped"]
             route_driver_map = cached_main_map_data["route_driver_map"]
+            map_unmapped_df = cached_main_map_data.get("unmapped_df", pd.DataFrame())
             st.session_state["main_overlay_cache_status"] = "data_hit"
         else:
-            valid_result, valid_grouped, route_driver_map = build_map_data(
+            valid_result, valid_grouped, route_driver_map, map_unmapped_df = build_map_data(
                 result_delivery=result_delivery,
                 grouped_delivery=grouped_delivery,
                 assignment_df=assignment_df,
-                selected_filter=selected_filter
+                selected_filter=selected_filter,
+                route_prefix_map=route_prefix_map,
+                route_camp_map=route_camp_map,
+                pickup_grouped=True,
             )
-            set_cached_main_map_data(main_overlay_cache_key, valid_result, valid_grouped, route_driver_map)
+            set_cached_main_map_data(main_overlay_cache_key, valid_result, valid_grouped, route_driver_map, map_unmapped_df)
             st.session_state["main_overlay_cache_status"] = "data_miss"
 
         st.write(f"캐시 주소 수: {len(cache)}")
@@ -4318,6 +5506,17 @@ with tab_basic:
 
         marker_count = len(valid_grouped)
         st.write(f"지도에 찍힌 배송 핀 수: {marker_count}")
+        unmapped_count = safe_int(len(map_unmapped_df)) if isinstance(map_unmapped_df, pd.DataFrame) else 0
+        if unmapped_count > 0:
+            st.warning(f"지도 미표시 업체 {unmapped_count}건")
+            with st.expander("지도 미표시 업체 목록", expanded=False):
+                display_cols = [
+                    c for c in ["route", "company_name", "address", "missing_reason"]
+                    if c in map_unmapped_df.columns
+                ]
+                st.dataframe(map_unmapped_df[display_cols] if display_cols else map_unmapped_df, use_container_width=True)
+        else:
+            st.caption("지도 미표시 업체 0건")
 
         static_map_cache_key = build_static_map_cache_key(active_dataset_key, selected_filter, assignment_df)
         if st.session_state.pop("map_force_refresh", False):
@@ -4387,6 +5586,15 @@ with tab_basic:
             st.caption("HTML 지도 다운로드가 필요할 때만 생성 버튼을 눌러 주세요.")
 
 with tab_stats:
+    recommended_groups_projection_for_view = get_recommended_groups_projection(
+        recommended_groups_route_feature_df.copy(deep=True),
+        recommended_groups_inputs_hash,
+    )
+    latest_group_assignment_df = recommended_groups_projection_for_view["assignment_df"].copy(deep=True)
+    group_route_map = {}
+    if len(latest_group_assignment_df) > 0 and "route" in latest_group_assignment_df.columns and "추천그룹" in latest_group_assignment_df.columns:
+        group_route_map = dict(zip(latest_group_assignment_df["route"], latest_group_assignment_df["추천그룹"]))
+
     view_assignment_df = assignment_df.copy()
     if group_route_map:
         view_assignment_df["추천그룹"] = view_assignment_df["route"].map(group_route_map).fillna("")
@@ -4424,22 +5632,25 @@ with tab_stats:
         else:
             st.warning(f"저장할 배정 데이터가 없어 {base_date_str} 이력은 0건으로 덮어쓰기되었습니다.")
 
-    shared_result_delivery = result_delivery.copy()
-    shared_grouped_delivery = grouped_delivery.copy()
+    recommended_groups_payload = recommended_groups_projection_for_view["payload"]
+    shared_result_delivery = result_delivery.copy(deep=True)
+    shared_grouped_delivery = grouped_delivery.copy(deep=True)
     shared_result_delivery["assigned_driver"] = shared_result_delivery["route"].map(route_driver_map).fillna("")
     shared_grouped_delivery["assigned_driver"] = shared_grouped_delivery["route"].map(route_driver_map).fillna("")
     shared_result_delivery["추천그룹"] = shared_result_delivery["route"].map(group_route_map).fillna("")
     shared_grouped_delivery["추천그룹"] = shared_grouped_delivery["route"].map(group_route_map).fillna("")
 
+    shared_pickup_grouped_delivery = build_pickup_map_grouped_df(
+        shared_grouped_delivery,
+        route_prefix_map=route_prefix_map,
+        route_camp_map=route_camp_map,
+        route_driver_map=route_driver_map,
+    )
+
     backend_run_id = safe_int(st.session_state.get("backend_run_id", 0))
     share_group_key = hashlib.sha1(
         json.dumps(
-            {
-                "recommended_group_map": st.session_state.get("recommended_group_map", {}),
-                "recommended_group_count": safe_int(st.session_state.get("recommended_group_count", 0)),
-                "selected_group_filter": st.session_state.get("selected_group_filter", "전체"),
-                "group_assignment_rows": latest_group_assignment_df.fillna("").astype(str).to_dict(orient="records") if len(latest_group_assignment_df) > 0 else [],
-            },
+            recommended_groups_payload,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -4478,12 +5689,13 @@ with tab_stats:
                 view_assigned_summary,
                 result_delivery_df=shared_result_delivery,
                 grouped_delivery_df=shared_grouped_delivery,
+                pickup_grouped_delivery_df=shared_pickup_grouped_delivery,
                 route_prefix_map=route_prefix_map,
                 truck_request_map=truck_request_map,
                 route_line_label=route_line_label,
                 route_camp_map=route_camp_map,
                 camp_coords=camp_coords,
-                group_assignment_df=latest_group_assignment_df,
+                group_assignment_df=latest_group_assignment_df.copy(deep=True),
             )
 
             snapshot_payload = {
@@ -4492,16 +5704,17 @@ with tab_stats:
                 "assigned_summary_rows": view_assigned_summary.fillna("").to_dict(orient="records") if len(view_assigned_summary) > 0 else [],
                 "result_delivery_rows": _df_to_records_for_json(shared_result_delivery),
                 "grouped_delivery_rows": _df_to_records_for_json(shared_grouped_delivery),
+                "pickup_grouped_delivery_rows": _df_to_records_for_json(shared_pickup_grouped_delivery),
                 "route_prefix_map": route_prefix_map,
                 "truck_request_map": truck_request_map,
                 "route_line_label": route_line_label,
                 "route_camp_map": route_camp_map,
                 "camp_coords": camp_coords,
                 "selected_filter": selected_filter,
-                "recommended_group_map": st.session_state.get("recommended_group_map", {}),
-                "recommended_group_count": safe_int(st.session_state.get("recommended_group_count", 0)),
-                "selected_group_filter": st.session_state.get("selected_group_filter", "전체"),
-                "group_assignment_rows": latest_group_assignment_df.fillna("").to_dict(orient="records") if len(latest_group_assignment_df) > 0 else [],
+                "recommended_group_map": recommended_groups_payload["recommended_group_map"],
+                "recommended_group_count": recommended_groups_payload["recommended_group_count"],
+                "selected_group_filter": recommended_groups_payload["selected_group_filter"],
+                "group_assignment_rows": recommended_groups_payload["group_assignment_rows"],
             }
             snapshot_save_payload, snapshot_save_error = sync_run_snapshot_to_backend(backend_run_id, snapshot_payload, snapshot_kind="recent")
             if snapshot_save_error:
@@ -4615,6 +5828,169 @@ with tab_stats:
         file_name="route_assignment.csv",
         mime="text/csv"
     )
+
+    with st.expander("쿠팡 자동반영용 CSV 생성", expanded=False):
+        coupang_col1, coupang_col2 = st.columns(2)
+        with coupang_col1:
+            coupang_order_date = st.date_input(
+                "Order Date",
+                value=pd.Timestamp(default_order_date()).date(),
+                key="coupang_assign_order_date",
+            )
+        with coupang_col2:
+            coupang_registration_mode = st.selectbox(
+                "registration_mode",
+                ["new", "modify"],
+                index=0,
+                key="coupang_assign_registration_mode",
+            )
+
+        def render_coupang_assign_downloads(source_df: pd.DataFrame, key_prefix: str):
+            drivers_csv_path = BASE_DIR / DRIVER_FILE
+            if not drivers_csv_path.exists():
+                st.error(f"drivers.csv 파일을 찾을 수 없습니다: {drivers_csv_path}")
+                return
+
+            try:
+                drivers_df = pd.read_csv(drivers_csv_path, dtype=str).fillna("")
+                success_df, error_df = build_assign_input_df(
+                    source_df,
+                    drivers_df,
+                    order_date=pd.Timestamp(coupang_order_date).strftime("%Y-%m-%d"),
+                    registration_mode=coupang_registration_mode,
+                )
+            except Exception as exc:
+                st.error(f"쿠팡 자동반영용 CSV 생성 실패: {exc}")
+                return
+
+            st.caption(f"실행 대상 {len(success_df)}건 / 확인 필요 {len(error_df)}건")
+            if len(success_df) > 0:
+                st.download_button(
+                    "coupang_assign_input.csv 다운로드",
+                    data=success_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                    file_name="coupang_assign_input.csv",
+                    mime="text/csv",
+                    key=f"{key_prefix}_success_download",
+                )
+            else:
+                st.warning("assign_bot 실행 대상 행이 없습니다.")
+
+            if len(error_df) > 0:
+                st.dataframe(error_df, use_container_width=True)
+                st.download_button(
+                    "coupang_assign_errors.csv 다운로드",
+                    data=error_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                    file_name="coupang_assign_errors.csv",
+                    mime="text/csv",
+                    key=f"{key_prefix}_error_download",
+                )
+
+        if st.button("현재 배정 결과로 쿠팡 CSV 생성", key="coupang_assign_build_from_current"):
+            render_coupang_assign_downloads(export_df.copy(), "coupang_assign_current")
+
+        render_assignment_progress_state()
+
+        def run_coupang_assignments_now(source_df: pd.DataFrame, key_prefix: str):
+            drivers_csv_path = BASE_DIR / DRIVER_FILE
+            if not drivers_csv_path.exists():
+                st.error(f"drivers.csv file not found: {drivers_csv_path}")
+                return
+
+            try:
+                drivers_df = pd.read_csv(drivers_csv_path, dtype=str).fillna("")
+                success_df, error_df = build_assign_input_df(
+                    source_df,
+                    drivers_df,
+                    order_date=pd.Timestamp(coupang_order_date).strftime("%Y-%m-%d"),
+                    registration_mode=coupang_registration_mode,
+                )
+            except Exception as exc:
+                st.error(f"Failed to prepare Coupang assignments: {exc}")
+                return
+
+            if len(error_df) > 0:
+                st.error(f"Cannot run Coupang assignment because {len(error_df)} rows need review.")
+                st.dataframe(error_df, use_container_width=True)
+                return
+            if len(success_df) == 0:
+                st.warning("No Coupang assignment rows to run.")
+                return
+
+            try:
+                import importlib
+                import assign_bot as assign_bot_module
+                assign_bot_module = importlib.reload(assign_bot_module)
+                run_assignments_df = assign_bot_module.run_assignments_df
+            except Exception as exc:
+                st.error(f"Failed to load assign_bot: {exc}")
+                return
+
+            progress_placeholder = st.empty()
+            progress_bar = st.progress(0)
+            progress_callback = make_assignment_progress_callback(
+                total_count=len(success_df),
+                base_date=pd.Timestamp(coupang_order_date).strftime("%Y-%m-%d"),
+                placeholder=progress_placeholder,
+                progress_bar=progress_bar,
+            )
+            result_file_path = BASE_DIR / "assign_results.csv"
+
+            with st.spinner(f"Running Coupang assignment for {len(success_df)} rows..."):
+                try:
+                    results_df = run_assignments_df(
+                        success_df,
+                        result_file=str(result_file_path),
+                        progress_callback=progress_callback,
+                        progress_interval=ASSIGNMENT_PROGRESS_NOTIFY_EVERY,
+                        raise_on_abort=False,
+                    )
+                except Exception as exc:
+                    progress_callback({
+                        "event": "aborted",
+                        "stage": "failed",
+                        "total": len(success_df),
+                        "completed": 0,
+                        "success_count": 0,
+                        "failure_count": 0,
+                        "error": str(exc),
+                    })
+                    st.error(f"Coupang assignment aborted: {exc}")
+                    return
+
+            st.session_state[f"{key_prefix}_results"] = results_df
+            latest_progress = st.session_state.get("assignment_progress_state", {})
+            failed_df = results_df[results_df["status"].astype(str) != "success"].copy()
+            if isinstance(latest_progress, dict) and latest_progress.get("status") == "aborted":
+                st.error(
+                    "Coupang assignment aborted. "
+                    f"Last stage: {latest_progress.get('last_stage', '')}, "
+                    f"error: {latest_progress.get('last_exception_message', '')}"
+                )
+            elif len(failed_df) > 0:
+                st.error(f"Coupang assignment finished with {len(failed_df)} failed rows.")
+            else:
+                st.success(f"Coupang assignment completed: {len(results_df)} rows.")
+            st.caption(f"Intermediate results saved to {result_file_path}")
+            st.dataframe(results_df, use_container_width=True)
+
+        if st.button("쿠팡 자동반영 바로 실행", key="coupang_assign_run_current"):
+            run_coupang_assignments_now(export_df.copy(), "coupang_assign_current_run")
+
+        uploaded_assignment_csv = st.file_uploader(
+            "이미 내려받은 기사 배정표 CSV 업로드",
+            type=["csv"],
+            key="coupang_assign_uploaded_csv",
+        )
+        if uploaded_assignment_csv is not None and st.button(
+            "업로드 CSV로 쿠팡 CSV 생성",
+            key="coupang_assign_build_from_upload",
+        ):
+            try:
+                uploaded_assignment_df = pd.read_csv(uploaded_assignment_csv, dtype=str).fillna("")
+            except Exception as exc:
+                st.error(f"업로드 CSV 읽기 실패: {exc}")
+            else:
+                render_coupang_assign_downloads(uploaded_assignment_df, "coupang_assign_upload")
 
 with tab_report:
     st.divider()
