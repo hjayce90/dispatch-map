@@ -25,10 +25,17 @@ TRUCK_DISPATCH_READY_SELECTORS = [
     (By.XPATH, "//button[contains(., 'Search')]"),
     (By.XPATH, "//span[contains(., 'Search')]/ancestor::button[1]"),
 ]
-SEARCH_CLICK_STATE_TIMEOUT_SECONDS = 1
-SEARCH_RESULT_STABILIZE_SECONDS = 3
+REQUEST_SEARCH_MAX_WAIT_SECONDS = 8
+REQUEST_SEARCH_POLL_INTERVAL_SECONDS = 0.1
+REQUEST_SEARCH_RESULT_SETTLE_SECONDS = 0.2
+PROCESSED_TAB_MAX_WAIT_SECONDS = 3
+PROCESSED_TAB_POLL_INTERVAL_SECONDS = 0.1
+PROCESSED_TAB_SETTLE_SECONDS = 0.1
 POST_CONFIRM_DELAY_SECONDS = 0.4
 ACTION_CLICK_STATE_TIMEOUT_SECONDS = 2
+SEARCH_DRIVER_STABILIZE_SECONDS = 0.2
+DRIVER_LOOKUP_MAX_WAIT_SECONDS = 1.2
+DRIVER_LOOKUP_POLL_INTERVAL_SECONDS = 0.2
 
 SCREENSHOT_DIR = "bot_screenshots"
 DEBUG_SOURCE_CHARS = 20000
@@ -659,8 +666,6 @@ def click_search(driver):
         search_btn,
         label="Search",
     )
-    sleep_step(SEARCH_RESULT_STABILIZE_SECONDS)
-    save_shot(driver, "after_search")
 
 
 def select_registration_tab(driver, registration_mode):
@@ -682,10 +687,12 @@ def select_registration_tab(driver, registration_mode):
         driver,
         tab,
         label=f"registration tab {target}",
-        state_probe=page_state_fingerprint,
-        state_change_timeout=5,
     )
-    sleep_step(2)
+    tab_result = wait_for_processed_tab_ready(driver, tab)
+    log(
+        f"[timing] processed tab settled in {tab_result['elapsed']:.2f}s "
+        f"(overlay_seen={tab_result['overlay_seen']})"
+    )
     save_shot(driver, f"tab_{target.lower()}")
 
 
@@ -703,6 +710,12 @@ def search_request_id(driver, request_id):
     sleep_step(0.5)
 
     click_search(driver)
+    search_result = wait_for_request_search_result(driver, request_id)
+    log(
+        f"[timing] request search settled in {search_result['elapsed']:.2f}s "
+        f"(state={search_result['state']}, overlay_seen={search_result['overlay_seen']})"
+    )
+    save_shot(driver, "after_search")
 
 
 def build_request_row_xpath(request_id):
@@ -812,6 +825,185 @@ def page_contains_text(driver, text):
     return needle in str(body_text or "")
 
 
+def document_class_names(driver):
+    try:
+        result = driver.execute_script("""
+            return {
+                html: (document.documentElement && document.documentElement.className) || '',
+                body: (document.body && document.body.className) || '',
+            };
+        """)
+        if isinstance(result, dict):
+            return str(result.get("html") or ""), str(result.get("body") or "")
+    except Exception:
+        pass
+    return "", ""
+
+
+def element_state_snapshot(driver, elem):
+    try:
+        result = driver.execute_script("""
+            const el = arguments[0];
+            if (!el) return null;
+            return {
+                className: el.className || '',
+                ariaSelected: el.getAttribute('aria-selected') || '',
+                text: (el.innerText || el.textContent || '').trim(),
+            };
+        """, elem)
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
+def has_request_search_loading_overlay(driver):
+    html_class, body_class = document_class_names(driver)
+    combined_classes = f"{html_class} {body_class}".lower()
+    if any(token in combined_classes for token in ["nprogress-busy", "ant-spin-blur", "loading", "spinner"]):
+        return True
+
+    try:
+        nprogress_busy = driver.execute_script("""
+            return !!document.querySelector(
+                '#nprogress, .nprogress-busy, .pace-active, .pace-running, .ant-spin-spinning'
+            );
+        """)
+        if nprogress_busy:
+            return True
+    except Exception:
+        pass
+
+    selectors = [
+        (By.XPATH, "//*[contains(@class, 'ant-spin-spinning') and not(contains(@style, 'display: none'))]"),
+        (By.XPATH, "//*[contains(@class, 'ant-spin-blur')]"),
+        (By.XPATH, "//*[@aria-busy='true']"),
+        (By.XPATH, "//*[contains(@class, 'loading') or contains(@class, 'spinner')]"),
+    ]
+    for by, selector in selectors:
+        for elem in find_visible_all(driver, by, selector):
+            if element_has_visible_rect(driver, elem):
+                return True
+    return False
+
+
+def has_no_data_placeholder(driver):
+    selectors = [
+        (By.XPATH, "//*[contains(@class, 'ant-empty') and contains(., 'No Data')]"),
+        (By.XPATH, "//td[contains(., 'No Data')]"),
+        (By.XPATH, "//*[contains(@class, 'ant-table-placeholder') and contains(., 'No Data')]"),
+    ]
+    for by, selector in selectors:
+        if find_visible_all(driver, by, selector):
+            return True
+    return False
+
+
+def is_processed_tab_active(driver, tab=None):
+    tab_state = element_state_snapshot(driver, tab) if tab is not None else {}
+    class_name = str(tab_state.get("className") or "").lower()
+    aria_selected = str(tab_state.get("ariaSelected") or "").lower()
+    if aria_selected == "true" or "active" in class_name or "selected" in class_name:
+        return True
+
+    if page_contains_text(driver, "CONFIRMED") and page_contains_text(driver, "BACK"):
+        return True
+
+    selectors = [
+        (By.XPATH, "//*[@role='tab' and contains(., 'Processed') and (@aria-selected='true' or contains(@class, 'active') or contains(@class, 'selected'))]"),
+        (By.XPATH, "//*[contains(@class, 'active') and contains(., 'Processed')]"),
+        (By.XPATH, "//*[normalize-space()='CONFIRMED']"),
+        (By.XPATH, "//*[normalize-space()='BACK']"),
+    ]
+    for by, selector in selectors:
+        if find_visible_all(driver, by, selector):
+            return True
+    return False
+
+
+def wait_for_processed_tab_ready(driver, tab=None):
+    started = time.monotonic()
+    deadline = started + PROCESSED_TAB_MAX_WAIT_SECONDS
+    overlay_seen = False
+
+    while True:
+        if has_request_search_loading_overlay(driver):
+            overlay_seen = True
+        if is_processed_tab_active(driver, tab=tab):
+            if PROCESSED_TAB_SETTLE_SECONDS > 0:
+                sleep_step(PROCESSED_TAB_SETTLE_SECONDS)
+            return {
+                "overlay_seen": overlay_seen,
+                "elapsed": time.monotonic() - started,
+            }
+
+        if time.monotonic() >= deadline:
+            break
+        sleep_step(PROCESSED_TAB_POLL_INTERVAL_SECONDS)
+
+    raise RuntimeError(
+        f"processed tab readiness timeout (overlay_seen={overlay_seen})"
+    )
+
+
+def resolve_request_search_state(driver, request_id):
+    row_xpath = build_request_row_xpath(request_id)
+    rows = find_visible_all(driver, By.XPATH, row_xpath)
+    if rows:
+        return {"state": "matched", "rows": len(rows)}
+
+    fallback_rows = find_visible_result_rows(driver)
+    if len(fallback_rows) == 1 and page_contains_text(driver, request_id):
+        return {"state": "matched_fallback", "rows": 1}
+
+    if has_no_data_placeholder(driver):
+        return {"state": "no_data", "rows": 0}
+
+    if has_request_search_loading_overlay(driver):
+        return {"state": "loading", "rows": len(fallback_rows)}
+
+    return {"state": "pending", "rows": len(fallback_rows)}
+
+
+def wait_for_request_search_result(driver, request_id):
+    started = time.monotonic()
+    deadline = started + REQUEST_SEARCH_MAX_WAIT_SECONDS
+    overlay_seen = False
+    last_state = {"state": "pending", "rows": 0}
+
+    while True:
+        current_state = resolve_request_search_state(driver, request_id)
+        last_state = current_state
+        state_name = current_state["state"]
+
+        if state_name == "loading":
+            if not overlay_seen:
+                overlay_seen = True
+                log("[search] loading overlay detected after Search click")
+        elif state_name in {"matched", "matched_fallback", "no_data"}:
+            if REQUEST_SEARCH_RESULT_SETTLE_SECONDS > 0:
+                sleep_step(REQUEST_SEARCH_RESULT_SETTLE_SECONDS)
+            return {
+                "state": state_name,
+                "overlay_seen": overlay_seen,
+                "elapsed": time.monotonic() - started,
+                "rows": current_state.get("rows", 0),
+            }
+
+        if time.monotonic() >= deadline:
+            break
+        sleep_step(REQUEST_SEARCH_POLL_INTERVAL_SECONDS)
+
+    reason = (
+        "request search timed out after loading overlay"
+        if overlay_seen
+        else "request search timed out without loading overlay"
+    )
+    raise RuntimeError(
+        f"{reason}: request_id={request_id}, "
+        f"last_state={last_state.get('state')}, visible_rows={last_state.get('rows', 0)}"
+    )
+
+
 def click_action_for_request_id(driver, request_id, action_labels):
     row_xpath = build_request_row_xpath(request_id)
     rows = []
@@ -910,55 +1102,63 @@ def click_search_driver(driver, modal):
         (By.XPATH, ".//span[contains(., 'Search Driver')]/ancestor::button[1]"),
     ], timeout=10, clickable=True)
 
+    log(f"[timing] Search Driver stabilize target={SEARCH_DRIVER_STABILIZE_SECONDS}s")
     safe_click(
         driver,
         btn,
         label="Search Driver",
-        state_probe=page_state_fingerprint,
-        state_change_timeout=5,
     )
-    sleep_step(2)
+    sleep_step(SEARCH_DRIVER_STABILIZE_SECONDS)
     save_shot(driver, "after_search_driver")
 
 
-def check_driver_lookup(driver, modal):
-    fail = find_all(modal, [
-        (By.XPATH, ".//*[contains(text(), 'Failed to fetch Worker Details.')]"),
-    ])
-    if fail:
-        return False, "Failed to fetch Worker Details."
+def _first_visible_input_value(scope, selectors):
+    for by, selector in selectors:
+        try:
+            elems = scope.find_elements(by, selector)
+        except Exception:
+            continue
+        for elem in elems:
+            try:
+                if elem.is_displayed():
+                    return (elem.get_attribute("value") or "").strip()
+            except Exception:
+                continue
+    return ""
 
+
+def _lookup_driver_contact_values(modal):
     name_val = ""
     phone_val = ""
 
-    try:
-        name_input = find_first(modal, [
-            (By.XPATH, ".//label[contains(., 'Worker Name')]/following::input[1]"),
-            (By.XPATH, ".//label[contains(., 'Name')]/following::input[1]"),
-        ], timeout=3, visible=True)
-        name_val = (name_input.get_attribute("value") or "").strip()
-    except Exception:
-        pass
-
-    try:
-        phone_input = find_first(modal, [
-            (By.XPATH, ".//label[contains(., 'Phone Number')]/following::input[1]"),
-            (By.XPATH, ".//label[contains(., 'Phone')]/following::input[1]"),
-        ], timeout=3, visible=True)
-        phone_val = (phone_input.get_attribute("value") or "").strip()
-    except Exception:
-        pass
-
-    if name_val or phone_val:
-        return True, ""
-
-    sleep_step(1.5)
-
-    fail = find_all(modal, [
-        (By.XPATH, ".//*[contains(text(), 'Failed to fetch Worker Details.')]"),
+    name_val = _first_visible_input_value(modal, [
+        (By.XPATH, ".//label[contains(., 'Worker Name')]/following::input[1]"),
+        (By.XPATH, ".//label[contains(., 'Name')]/following::input[1]"),
     ])
-    if fail:
-        return False, "Failed to fetch Worker Details."
+    phone_val = _first_visible_input_value(modal, [
+        (By.XPATH, ".//label[contains(., 'Phone Number')]/following::input[1]"),
+        (By.XPATH, ".//label[contains(., 'Phone')]/following::input[1]"),
+    ])
+
+    return name_val, phone_val
+
+
+def check_driver_lookup(driver, modal):
+    deadline = time.monotonic() + DRIVER_LOOKUP_MAX_WAIT_SECONDS
+    while True:
+        fail = find_all(modal, [
+            (By.XPATH, ".//*[contains(text(), 'Failed to fetch Worker Details.')]"),
+        ])
+        if fail:
+            return False, "Failed to fetch Worker Details."
+
+        name_val, phone_val = _lookup_driver_contact_values(modal)
+        if name_val or phone_val:
+            return True, ""
+
+        if time.monotonic() >= deadline:
+            break
+        sleep_step(DRIVER_LOOKUP_POLL_INTERVAL_SECONDS)
 
     return False, "이름/전화번호 자동채움 확인 실패"
 
@@ -1351,6 +1551,8 @@ def debug_login_flow(
     registration_mode="new",
     search_first_row=False,
     confirm_only=False,
+    driver_lookup_only=False,
+    worker_login_id="",
     keep_browser=False,
 ):
     driver = None
@@ -1360,13 +1562,18 @@ def debug_login_flow(
         login(driver)
         debug_snapshot(driver, "debug after truckDispatch ready", include_source=True)
 
+        worker_login_id = str(worker_login_id or "").strip()
+        plate_number = ""
         if search_first_row:
             row = _load_first_debug_row(file_path)
             request_id = str(row.get("request_id", "") or "").strip()
             registration_mode = str(row.get("registration_mode", registration_mode) or registration_mode).strip()
+            if not worker_login_id:
+                worker_login_id = str(row.get("worker_login_id", "") or "").strip()
+            plate_number = str(row.get("plate_number", "") or "").strip()
             log(
                 "[debug] first row loaded: "
-                f"request_id={request_id}, registration_mode={registration_mode}"
+                f"request_id={request_id}, registration_mode={registration_mode}, worker_login_id={worker_login_id}"
             )
 
         mode = str(registration_mode or "new").strip().lower() or "new"
@@ -1378,11 +1585,21 @@ def debug_login_flow(
             log(f"[debug] searching request_id={request_id}")
             search_request_id(driver, request_id)
             debug_snapshot(driver, "debug after request search", include_source=True)
-            if confirm_only:
+            if confirm_only or driver_lookup_only:
                 log("[debug] opening assignment action modal only; Save will not be clicked")
                 click_registration_action_for_request_id(driver, request_id, mode)
-                get_active_modal(driver, timeout=5)
+                modal = get_active_modal(driver, timeout=5)
                 debug_snapshot(driver, "debug after confirm action modal", include_source=True)
+                if driver_lookup_only:
+                    if not worker_login_id:
+                        raise ValueError("debug driver lookup requires worker_login_id from the input row")
+                    fill_worker_login_id(driver, modal, worker_login_id)
+                    click_search_driver(driver, modal)
+                    ok, reason = check_driver_lookup(driver, modal)
+                    log(f"[debug] driver lookup result: ok={ok}, reason={reason}")
+                    debug_snapshot(driver, "debug after driver lookup", include_source=True)
+                    if not ok:
+                        raise RuntimeError(f"driver lookup failed: {reason}")
 
         debug_snapshot(driver, "debug flow completed", include_source=True)
         return 0
@@ -1408,6 +1625,8 @@ def main():
     parser.add_argument("--debug-request-id", default="", help="In debug mode, search this request_id only.")
     parser.add_argument("--debug-registration-mode", default="new", choices=["new", "modify"])
     parser.add_argument("--debug-confirm-only", action="store_true", help="In debug mode, open the Confirm/Edit modal but do not save.")
+    parser.add_argument("--debug-driver-lookup-only", action="store_true", help="In debug mode, open the modal and run Search Driver but do not save.")
+    parser.add_argument("--debug-worker-login-id", default="", help="In debug mode, worker_login_id for Search Driver lookup.")
     parser.add_argument("--keep-browser", action="store_true", help="Leave the browser open after debug mode.")
     args = parser.parse_args()
 
@@ -1418,6 +1637,8 @@ def main():
             registration_mode=args.debug_registration_mode,
             search_first_row=args.debug_search_first_row,
             confirm_only=args.debug_confirm_only,
+            driver_lookup_only=args.debug_driver_lookup_only,
+            worker_login_id=args.debug_worker_login_id,
             keep_browser=args.keep_browser,
         ))
 
