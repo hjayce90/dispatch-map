@@ -1018,15 +1018,59 @@ def build_driver_preference_display_df(preference_df: pd.DataFrame) -> pd.DataFr
     return display_df.reindex(columns=DRIVER_PREFERENCE_DISPLAY_COLUMNS)
 
 
-def load_drivers():
-    if os.path.exists(DRIVER_FILE):
-        try:
-            df = pd.read_csv(DRIVER_FILE)
-            if "driver_name" in df.columns:
-                return df["driver_name"].dropna().astype(str).tolist()
-        except Exception:
-            return []
-    return []
+DRIVER_RECORD_COLUMNS = ["driver_name", "worker_login_id", "plate_number"]
+
+
+def _normalize_driver_records_df(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame(columns=DRIVER_RECORD_COLUMNS)
+
+    work_df = df.copy()
+    for column in DRIVER_RECORD_COLUMNS:
+        if column not in work_df.columns:
+            work_df[column] = ""
+        work_df[column] = work_df[column].fillna("").astype(str).str.strip()
+
+    work_df = work_df[DRIVER_RECORD_COLUMNS].copy()
+    work_df = work_df[work_df["driver_name"] != ""].drop_duplicates(subset=["driver_name", "worker_login_id"], keep="first")
+    return work_df.reset_index(drop=True)
+
+
+def _driver_names_from_df(df: pd.DataFrame) -> list[str]:
+    if not isinstance(df, pd.DataFrame) or "driver_name" not in df.columns:
+        return []
+    return df["driver_name"].dropna().astype(str).str.strip().loc[lambda s: s != ""].tolist()
+
+
+def load_driver_records_local() -> pd.DataFrame:
+    drivers_csv_path = BASE_DIR / DRIVER_FILE
+    if not drivers_csv_path.exists():
+        return pd.DataFrame(columns=DRIVER_RECORD_COLUMNS)
+    try:
+        df = pd.read_csv(drivers_csv_path, dtype=str).fillna("")
+    except Exception:
+        return pd.DataFrame(columns=DRIVER_RECORD_COLUMNS)
+    return _normalize_driver_records_df(df)
+
+
+def _driver_records_df_from_backend_payload(payload) -> pd.DataFrame:
+    if not isinstance(payload, list):
+        return pd.DataFrame(columns=DRIVER_RECORD_COLUMNS)
+
+    rows = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        rows.append({
+            "driver_name": str(row.get("name", "") or row.get("driver_name", "")).strip(),
+            "worker_login_id": str(row.get("worker_login_id", "")).strip(),
+            "plate_number": str(row.get("plate_number", "")).strip(),
+        })
+    return _normalize_driver_records_df(pd.DataFrame(rows))
+
+
+def load_driver_names_from_local():
+    return _driver_names_from_df(load_driver_records_local())
 
 
 def _dispatch_api_url(path: str) -> str:
@@ -1057,17 +1101,20 @@ def _dispatch_api_post(path: str, payload: dict):
         return None, str(exc)
 
 
-def load_drivers_from_backend():
+def fetch_driver_records_from_backend():
     payload, error = _dispatch_api_get("drivers/")
-    if error or not isinstance(payload, list):
-        return []
+    if error:
+        return pd.DataFrame(columns=DRIVER_RECORD_COLUMNS), str(error)
+    return _driver_records_df_from_backend_payload(payload), None
 
-    driver_names = []
-    for row in payload:
-        name = str(row.get("name", "")).strip()
-        if name:
-            driver_names.append(name)
-    return driver_names
+
+def load_driver_records_from_backend():
+    driver_records_df, _ = fetch_driver_records_from_backend()
+    return driver_records_df
+
+
+def load_driver_names_from_backend():
+    return _driver_names_from_df(load_driver_records_from_backend())
 
 
 def load_latest_assignment_run_summary():
@@ -1134,11 +1181,47 @@ def _format_run_option_label(row: dict) -> str:
     return f"{source_date} | {name} | {filename}{suffix}"
 
 
+def load_driver_records_prefer_backend():
+    backend_driver_records, backend_error = fetch_driver_records_from_backend()
+    if backend_error is None:
+        return backend_driver_records, "django"
+    return load_driver_records_local(), "local"
+
+
 def load_drivers_prefer_backend():
-    backend_drivers = load_drivers_from_backend()
-    if backend_drivers:
-        return backend_drivers, "django"
-    return load_drivers(), "local"
+    driver_records, source = load_driver_records_prefer_backend()
+    return _driver_names_from_df(driver_records), source
+
+
+def sync_driver_records_to_backend(driver_records_df: pd.DataFrame):
+    work_df = _normalize_driver_records_df(driver_records_df)
+    if len(work_df) == 0:
+        return None, "no driver records to sync"
+
+    payload = {
+        "drivers": [
+            {
+                "name": row["driver_name"],
+                "worker_login_id": row["worker_login_id"],
+                "plate_number": row["plate_number"],
+            }
+            for _, row in work_df.iterrows()
+        ]
+    }
+    return _dispatch_api_post("drivers/upsert/", payload)
+
+
+def load_driver_records_for_assignment_input():
+    driver_records_df, driver_source = load_driver_records_prefer_backend()
+    if len(driver_records_df) > 0:
+        return driver_records_df, driver_source, None
+
+    drivers_csv_path = BASE_DIR / DRIVER_FILE
+    return (
+        pd.DataFrame(columns=DRIVER_RECORD_COLUMNS),
+        driver_source,
+        f"기사 목록을 불러오지 못했습니다. Django drivers API와 로컬 drivers.csv를 모두 확인해 주세요: {drivers_csv_path}",
+    )
 
 
 def _build_backend_route_rows(route_summary: pd.DataFrame):
@@ -4730,7 +4813,8 @@ if shared_map:
 # =========================
 # 시작
 # =========================
-drivers, driver_source = load_drivers_prefer_backend()
+driver_records_df, driver_source = load_driver_records_prefer_backend()
+drivers = _driver_names_from_df(driver_records_df)
 latest_run_summary, latest_run_error = cached_load_latest_assignment_run_summary()
 today_run_options, today_run_error = [], None
 recent_run_options, recent_run_error = [], None
@@ -4745,6 +4829,40 @@ with st.sidebar:
         st.success(f"기사 목록 연동됨 ({len(drivers)}명)")
     else:
         st.warning("Django 기사 목록 연결 실패, 로컬 drivers.csv 사용 중")
+
+    with st.expander("기사 목록 관리", expanded=False):
+        st.caption("기사 정보의 기준값은 Django Driver입니다. drivers.csv는 import/export 및 fallback 용도로만 사용합니다.")
+        if len(driver_records_df) > 0:
+            driver_export_df = driver_records_df.copy()
+            st.download_button(
+                "현재 기사목록 CSV 다운로드",
+                data=driver_export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="drivers_export.csv",
+                mime="text/csv",
+                key="driver_records_export_download",
+            )
+        else:
+            st.caption("내보낼 기사 목록이 없습니다.")
+
+        local_drivers_csv_path = BASE_DIR / DRIVER_FILE
+        if local_drivers_csv_path.exists():
+            st.caption(f"로컬 import 원본: {local_drivers_csv_path}")
+            if st.button("로컬 drivers.csv를 Django에 반영", key="sync_local_drivers_to_backend_button"):
+                local_driver_records_df = load_driver_records_local()
+                backend_sync_payload, backend_sync_error = sync_driver_records_to_backend(local_driver_records_df)
+                if backend_sync_error:
+                    st.error(f"기사 목록 동기화 실패: {backend_sync_error}")
+                else:
+                    driver_records_df, driver_source = load_driver_records_prefer_backend()
+                    drivers = _driver_names_from_df(driver_records_df)
+                    created_count = safe_int((backend_sync_payload or {}).get("created_count", 0))
+                    updated_count = safe_int((backend_sync_payload or {}).get("updated_count", 0))
+                    synced_count = safe_int((backend_sync_payload or {}).get("synced_count", created_count + updated_count))
+                    st.success(
+                        f"기사 목록 동기화 완료 ({synced_count}건, 생성 {created_count}건 / 갱신 {updated_count}건)"
+                    )
+        else:
+            st.caption(f"로컬 import 원본 없음: {local_drivers_csv_path}")
 
     if latest_run_summary:
         st.caption(
@@ -5846,16 +5964,15 @@ with tab_stats:
             )
 
         def render_coupang_assign_downloads(source_df: pd.DataFrame, key_prefix: str):
-            drivers_csv_path = BASE_DIR / DRIVER_FILE
-            if not drivers_csv_path.exists():
-                st.error(f"drivers.csv 파일을 찾을 수 없습니다: {drivers_csv_path}")
+            driver_records_for_assign_df, driver_records_for_assign_source, driver_records_error = load_driver_records_for_assignment_input()
+            if driver_records_error:
+                st.error(driver_records_error)
                 return
 
             try:
-                drivers_df = pd.read_csv(drivers_csv_path, dtype=str).fillna("")
                 success_df, error_df = build_assign_input_df(
                     source_df,
-                    drivers_df,
+                    driver_records_for_assign_df,
                     order_date=pd.Timestamp(coupang_order_date).strftime("%Y-%m-%d"),
                     registration_mode=coupang_registration_mode,
                 )
@@ -5863,6 +5980,8 @@ with tab_stats:
                 st.error(f"쿠팡 자동반영용 CSV 생성 실패: {exc}")
                 return
 
+            source_label = "Django Driver" if driver_records_for_assign_source == "django" else "local drivers.csv fallback"
+            st.caption(f"기사 기준값: {source_label}")
             st.caption(f"실행 대상 {len(success_df)}건 / 확인 필요 {len(error_df)}건")
             if len(success_df) > 0:
                 st.download_button(
@@ -5891,22 +6010,24 @@ with tab_stats:
         render_assignment_progress_state()
 
         def run_coupang_assignments_now(source_df: pd.DataFrame, key_prefix: str):
-            drivers_csv_path = BASE_DIR / DRIVER_FILE
-            if not drivers_csv_path.exists():
-                st.error(f"drivers.csv file not found: {drivers_csv_path}")
+            driver_records_for_assign_df, driver_records_for_assign_source, driver_records_error = load_driver_records_for_assignment_input()
+            if driver_records_error:
+                st.error(driver_records_error)
                 return
 
             try:
-                drivers_df = pd.read_csv(drivers_csv_path, dtype=str).fillna("")
                 success_df, error_df = build_assign_input_df(
                     source_df,
-                    drivers_df,
+                    driver_records_for_assign_df,
                     order_date=pd.Timestamp(coupang_order_date).strftime("%Y-%m-%d"),
                     registration_mode=coupang_registration_mode,
                 )
             except Exception as exc:
                 st.error(f"Failed to prepare Coupang assignments: {exc}")
                 return
+
+            source_label = "Django Driver" if driver_records_for_assign_source == "django" else "local drivers.csv fallback"
+            st.caption(f"Driver source: {source_label}")
 
             if len(error_df) > 0:
                 st.error(f"Cannot run Coupang assignment because {len(error_df)} rows need review.")
