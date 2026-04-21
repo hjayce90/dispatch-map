@@ -31,11 +31,19 @@ REQUEST_SEARCH_RESULT_SETTLE_SECONDS = 0.2
 PROCESSED_TAB_MAX_WAIT_SECONDS = 3
 PROCESSED_TAB_POLL_INTERVAL_SECONDS = 0.1
 PROCESSED_TAB_SETTLE_SECONDS = 0.1
-POST_CONFIRM_DELAY_SECONDS = 0.4
+REQUEST_ACTION_ROW_MAX_WAIT_SECONDS = 1.5
+REQUEST_ACTION_ROW_POLL_INTERVAL_SECONDS = 0.1
+MODAL_READY_MAX_WAIT_SECONDS = 3
+MODAL_READY_POLL_INTERVAL_SECONDS = 0.1
+FIELD_VALUE_MAX_WAIT_SECONDS = 0.4
+FIELD_VALUE_POLL_INTERVAL_SECONDS = 0.05
+POST_CONFIRM_DELAY_SECONDS = 0.1
 ACTION_CLICK_STATE_TIMEOUT_SECONDS = 2
 SEARCH_DRIVER_STABILIZE_SECONDS = 0.2
 DRIVER_LOOKUP_MAX_WAIT_SECONDS = 1.2
 DRIVER_LOOKUP_POLL_INTERVAL_SECONDS = 0.2
+SAVE_RESULT_MAX_WAIT_SECONDS = 8
+SAVE_RESULT_POLL_INTERVAL_SECONDS = 0.1
 
 SCREENSHOT_DIR = "bot_screenshots"
 DEBUG_SOURCE_CHARS = 20000
@@ -385,6 +393,13 @@ def find_visible_all(scope, by, selector):
         except Exception:
             pass
     return visible
+
+
+ACTIVE_MODAL_SELECTORS = [
+    (By.XPATH, "//*[@role='dialog' and .//button[contains(., 'Save')]]"),
+    (By.XPATH, "//*[contains(@class, 'modal') and .//button[contains(., 'Save')]]"),
+    (By.XPATH, "//*[contains(@class, 'Modal') and .//button[contains(., 'Save')]]"),
+]
 
 
 def element_has_visible_rect(driver, elem):
@@ -745,6 +760,31 @@ def get_row_key(row):
         return ""
 
 
+def wait_for_request_rows(driver, request_id):
+    row_xpath = build_request_row_xpath(request_id)
+    deadline = time.monotonic() + REQUEST_ACTION_ROW_MAX_WAIT_SECONDS
+    last_fallback_rows = []
+
+    while True:
+        rows = find_visible_all(driver, By.XPATH, row_xpath)
+        if rows:
+            return rows
+
+        fallback_rows = find_visible_result_rows(driver)
+        last_fallback_rows = fallback_rows
+        if len(fallback_rows) == 1 and page_contains_text(driver, request_id):
+            log(f"Request ID row not matched by text; using single visible result row fallback for {request_id}")
+            return fallback_rows
+
+        if time.monotonic() >= deadline:
+            break
+        sleep_step(REQUEST_ACTION_ROW_POLL_INTERVAL_SECONDS)
+
+    raise RuntimeError(
+        f"Request ID row not found: {request_id}; visible result rows={len(last_fallback_rows)}"
+    )
+
+
 def build_action_xpath(prefix, action_labels):
     parts = []
     for label in action_labels:
@@ -945,6 +985,21 @@ def wait_for_processed_tab_ready(driver, tab=None):
     )
 
 
+def wait_for_active_modal(driver, timeout=MODAL_READY_MAX_WAIT_SECONDS):
+    deadline = time.monotonic() + timeout
+    while True:
+        for by, selector in ACTIVE_MODAL_SELECTORS:
+            elems = find_visible_all(driver, by, selector)
+            for elem in elems:
+                if element_has_visible_rect(driver, elem):
+                    return elem
+        if time.monotonic() >= deadline:
+            break
+        sleep_step(MODAL_READY_POLL_INTERVAL_SECONDS)
+
+    raise TimeoutException("timeout while waiting active modal")
+
+
 def resolve_request_search_state(driver, request_id):
     row_xpath = build_request_row_xpath(request_id)
     rows = find_visible_all(driver, By.XPATH, row_xpath)
@@ -1004,24 +1059,8 @@ def wait_for_request_search_result(driver, request_id):
     )
 
 
-def click_action_for_request_id(driver, request_id, action_labels):
-    row_xpath = build_request_row_xpath(request_id)
-    rows = []
-    for _ in range(10):
-        rows = find_visible_all(driver, By.XPATH, row_xpath)
-        if rows:
-            break
-        sleep_step(0.5)
-
-    if not rows:
-        fallback_rows = find_visible_result_rows(driver)
-        if len(fallback_rows) == 1 and page_contains_text(driver, request_id):
-            log(f"Request ID row not matched by text; using single visible result row fallback for {request_id}")
-            rows = fallback_rows
-        else:
-            raise RuntimeError(
-                f"Request ID row not found: {request_id}; visible result rows={len(fallback_rows)}"
-            )
+def click_action_for_request_id(driver, request_id, action_labels, wait_for_modal=False):
+    rows = wait_for_request_rows(driver, request_id)
 
     action_name = "/".join(action_labels)
     action_xpath = build_action_xpath(".", action_labels)
@@ -1034,12 +1073,14 @@ def click_action_for_request_id(driver, request_id, action_labels):
                         driver,
                         action_btn,
                         label=f"{action_name} for request {request_id}",
-                        state_probe=modal_state_fingerprint,
-                        state_change_timeout=ACTION_CLICK_STATE_TIMEOUT_SECONDS,
                     )
-                    sleep_step(POST_CONFIRM_DELAY_SECONDS)
+                    modal = None
+                    if wait_for_modal:
+                        modal = wait_for_active_modal(driver, timeout=MODAL_READY_MAX_WAIT_SECONDS)
+                        if POST_CONFIRM_DELAY_SECONDS > 0:
+                            sleep_step(POST_CONFIRM_DELAY_SECONDS)
                     save_shot(driver, f"after_{action_name.lower().replace('/', '_')}_click")
-                    return
+                    return modal
             except Exception:
                 continue
 
@@ -1051,32 +1092,46 @@ def click_action_for_request_id(driver, request_id, action_labels):
             driver,
             action_btn,
             label=f"{action_name} fixed action for request {request_id}",
-            state_probe=modal_state_fingerprint,
-            state_change_timeout=ACTION_CLICK_STATE_TIMEOUT_SECONDS,
         )
-        sleep_step(POST_CONFIRM_DELAY_SECONDS)
+        modal = None
+        if wait_for_modal:
+            modal = wait_for_active_modal(driver, timeout=MODAL_READY_MAX_WAIT_SECONDS)
+            if POST_CONFIRM_DELAY_SECONDS > 0:
+                sleep_step(POST_CONFIRM_DELAY_SECONDS)
         save_shot(driver, f"after_{action_name.lower().replace('/', '_')}_click")
-        return
+        return modal
 
     raise RuntimeError(f"{action_name} button not found in Request ID row: {request_id}")
 
 
-def click_edit_for_request_id(driver, request_id):
-    click_action_for_request_id(driver, request_id, ("Edit",))
+def click_edit_for_request_id(driver, request_id, wait_for_modal=False):
+    return click_action_for_request_id(driver, request_id, ("Edit",), wait_for_modal=wait_for_modal)
 
 
-def click_registration_action_for_request_id(driver, request_id, registration_mode):
+def click_registration_action_for_request_id(driver, request_id, registration_mode, wait_for_modal=False):
     mode = str(registration_mode).strip().lower()
     action_labels = ("Confirm",) if mode == "new" else ("Edit",)
-    click_action_for_request_id(driver, request_id, action_labels)
+    return click_action_for_request_id(driver, request_id, action_labels, wait_for_modal=wait_for_modal)
 
 
 def get_active_modal(driver, timeout=10):
-    return find_first(driver, [
-        (By.XPATH, "//*[@role='dialog' and .//button[contains(., 'Save')]]"),
-        (By.XPATH, "//*[contains(@class, 'modal') and .//button[contains(., 'Save')]]"),
-        (By.XPATH, "//*[contains(@class, 'Modal') and .//button[contains(., 'Save')]]"),
-    ], timeout=timeout, visible=True)
+    return wait_for_active_modal(driver, timeout=timeout)
+
+
+def wait_for_input_value(driver, elem, expected_value, timeout=FIELD_VALUE_MAX_WAIT_SECONDS):
+    expected = str(expected_value or "").strip()
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            current = (elem.get_attribute("value") or "").strip()
+        except Exception:
+            current = ""
+        if current == expected:
+            return True
+        if time.monotonic() >= deadline:
+            break
+        sleep_step(FIELD_VALUE_POLL_INTERVAL_SECONDS)
+    return False
 
 
 def fill_worker_login_id(driver, modal, worker_login_id):
@@ -1090,9 +1145,11 @@ def fill_worker_login_id(driver, modal, worker_login_id):
     ], timeout=10, visible=True)
 
     safe_click(driver, worker_input)
-    sleep_step(0.3)
     clear_and_type(worker_input, worker_login_id)
-    sleep_step(0.5)
+    if not wait_for_input_value(driver, worker_input, worker_login_id):
+        js_set_value(driver, worker_input, worker_login_id)
+        if not wait_for_input_value(driver, worker_input, worker_login_id):
+            raise RuntimeError("worker_login_id value was not applied to the modal input")
     save_shot(driver, "worker_id_filled")
 
 
@@ -1173,9 +1230,11 @@ def fill_plate_number(driver, modal, plate_number):
     ], timeout=10, visible=True)
 
     safe_click(driver, plate_input)
-    sleep_step(0.3)
     clear_and_type(plate_input, plate_number)
-    sleep_step(0.5)
+    if not wait_for_input_value(driver, plate_input, plate_number):
+        js_set_value(driver, plate_input, plate_number)
+        if not wait_for_input_value(driver, plate_input, plate_number):
+            raise RuntimeError("plate_number value was not applied to the modal input")
     save_shot(driver, "plate_filled")
 
 
@@ -1253,28 +1312,29 @@ def click_save(driver, modal):
         state_probe=modal_state_fingerprint,
         state_change_timeout=6,
     )
-    sleep_step(2)
+    deadline = time.monotonic() + SAVE_RESULT_MAX_WAIT_SECONDS
+    while True:
+        if _is_modal_closed(modal):
+            return True, ""
 
-    try:
-        WebDriverWait(driver, 8).until(lambda _driver: _is_modal_closed(modal))
-        return True, ""
-    except TimeoutException:
-        pass
+        success_texts = _visible_texts(driver, [
+            (By.XPATH, "//*[contains(@class, 'message') and (contains(., 'Success') or contains(., 'success') or contains(., 'Saved') or contains(., 'saved'))]"),
+            (By.XPATH, "//*[contains(@class, 'toast') and (contains(., 'Success') or contains(., 'success') or contains(., 'Saved') or contains(., 'saved'))]"),
+        ])
+        if success_texts:
+            return True, ""
 
-    success_texts = _visible_texts(driver, [
-        (By.XPATH, "//*[contains(@class, 'message') and (contains(., 'Success') or contains(., 'success') or contains(., 'Saved') or contains(., 'saved'))]"),
-        (By.XPATH, "//*[contains(@class, 'toast') and (contains(., 'Success') or contains(., 'success') or contains(., 'Saved') or contains(., 'saved'))]"),
-    ])
-    if success_texts:
-        return True, ""
+        error_texts = _visible_texts(modal, [
+            (By.XPATH, ".//*[contains(@class, 'error') or contains(@class, 'Error')]"),
+            (By.XPATH, ".//*[contains(., 'Failed') or contains(., 'failed') or contains(., 'Error') or contains(., 'error')]"),
+        ])
+        if error_texts:
+            save_shot(driver, "save_failed_popup_still_open")
+            return False, "; ".join(dict.fromkeys(error_texts))
 
-    error_texts = _visible_texts(modal, [
-        (By.XPATH, ".//*[contains(@class, 'error') or contains(@class, 'Error')]"),
-        (By.XPATH, ".//*[contains(., 'Failed') or contains(., 'failed') or contains(., 'Error') or contains(., 'error')]"),
-    ])
-    if error_texts:
-        save_shot(driver, "save_failed_popup_still_open")
-        return False, "; ".join(dict.fromkeys(error_texts))
+        if time.monotonic() >= deadline:
+            break
+        sleep_step(SAVE_RESULT_POLL_INTERVAL_SECONDS)
 
     save_shot(driver, "save_failed_popup_still_open")
     return False, "save failed: modal still open and no success confirmation"
@@ -1318,10 +1378,9 @@ def process_one(driver, row, progress_callback=None):
     select_registration_tab(driver, registration_mode)
     search_request_id(driver, request_id)
     progress("stage", "clicking")
-    click_registration_action_for_request_id(driver, request_id, registration_mode)
+    modal = click_registration_action_for_request_id(driver, request_id, registration_mode, wait_for_modal=True)
 
     progress("stage", "waiting_response")
-    modal = get_active_modal(driver)
     fill_worker_login_id(driver, modal, worker_login_id)
     click_search_driver(driver, modal)
 
@@ -1587,8 +1646,7 @@ def debug_login_flow(
             debug_snapshot(driver, "debug after request search", include_source=True)
             if confirm_only or driver_lookup_only:
                 log("[debug] opening assignment action modal only; Save will not be clicked")
-                click_registration_action_for_request_id(driver, request_id, mode)
-                modal = get_active_modal(driver, timeout=5)
+                modal = click_registration_action_for_request_id(driver, request_id, mode, wait_for_modal=True)
                 debug_snapshot(driver, "debug after confirm action modal", include_source=True)
                 if driver_lookup_only:
                     if not worker_login_id:
