@@ -4750,7 +4750,7 @@ def load_latest_milkrun_attempt_summary(project_dir: Path, python_exe: Path) -> 
     return _extract_last_json_object(result.stdout)
 
 
-def run_manual_milkrun_collection() -> dict:
+def run_manual_milkrun_collection(target_date: str | None = None) -> dict:
     project_dir = milkrun_project_dir()
     if not project_dir.exists():
         return {
@@ -4761,6 +4761,9 @@ def run_manual_milkrun_collection() -> dict:
 
     python_exe = milkrun_python_executable(project_dir)
     command = [str(python_exe), "manage.py", "collect_milkrun", "--manual"]
+    target_date_text = str(target_date or "").strip()
+    if target_date_text:
+        command.extend(["--target-date", target_date_text])
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     started_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4805,6 +4808,7 @@ def run_manual_milkrun_collection() -> dict:
         "stderr": (result.stderr or "").strip()[-2000:],
         "error": "" if ok else ((result.stderr or result.stdout or "milkrun collection failed").strip()[-1000:]),
         "attempt": latest_attempt,
+        "requested_target_date": target_date_text,
     }
 
 
@@ -5069,15 +5073,28 @@ with st.sidebar:
         last_manual_milkrun_result = st.session_state.get("manual_milkrun_result", {})
         if isinstance(last_manual_milkrun_result, dict) and last_manual_milkrun_result.get("finished_at"):
             st.caption(f"최근 실행: {last_manual_milkrun_result.get('finished_at')}")
+        default_milkrun_collect_date = pd.Timestamp.now().date()
+        if latest_run_summary and latest_run_summary.get("source_date"):
+            try:
+                default_milkrun_collect_date = pd.Timestamp(latest_run_summary.get("source_date")).date()
+            except Exception:
+                default_milkrun_collect_date = pd.Timestamp.now().date()
+        manual_milkrun_target_date = st.date_input(
+            "수집 날짜",
+            value=default_milkrun_collect_date,
+            key="manual_milkrun_target_date",
+        )
         if st.button("밀크런 가져오기", key="manual_milkrun_collect_button"):
+            manual_milkrun_target_date_text = pd.Timestamp(manual_milkrun_target_date).strftime("%Y-%m-%d")
             st.session_state["manual_milkrun_result"] = {
                 "ok": False,
                 "stage": "running",
                 "started_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "message": "수집 중",
+                "requested_target_date": manual_milkrun_target_date_text,
             }
-            with st.spinner("밀크런 수집 중..."):
-                manual_milkrun_result = run_manual_milkrun_collection()
+            with st.spinner(f"{manual_milkrun_target_date_text} 밀크런 수집 중..."):
+                manual_milkrun_result = run_manual_milkrun_collection(manual_milkrun_target_date_text)
             st.session_state["manual_milkrun_result"] = manual_milkrun_result
             cached_load_latest_assignment_run_summary.clear()
             cached_load_assignment_runs.clear()
