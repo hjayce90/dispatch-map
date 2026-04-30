@@ -81,11 +81,20 @@ COUPANG_PW = os.getenv("COUPANG_LS_PW", "").strip() or os.getenv("COUPANG_PW", "
 # 비워두면 시스템 PATH의 chromedriver 사용
 CHROMEDRIVER_PATH = ""
 
-# 브라우저 보이게
-HEADLESS = False
+def env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
 
-# 세션 종료 후 브라우저 창 유지
-DETACH_BROWSER = True
+# 기본은 서버에서 창을 띄우지 않고 실행 후 Chrome을 닫는다.
+HEADLESS = env_bool("COUPANG_ASSIGN_HEADLESS", True)
+DETACH_BROWSER = env_bool("COUPANG_ASSIGN_DETACH_BROWSER", False)
 
 STEP_SLEEP = 1.0
 CLICK_DIAGNOSTICS = {
@@ -215,6 +224,7 @@ def build_driver():
         options.add_argument("--headless=new")
 
     options.add_argument("--start-maximized")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("detach", DETACH_BROWSER)
 

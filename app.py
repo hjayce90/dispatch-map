@@ -186,7 +186,7 @@ PIN_EDGE_BORDER_COLOR = "#111111"
 os.makedirs(MAP_DIR, exist_ok=True)
 os.makedirs(SHARE_DIR, exist_ok=True)
 
-uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx"], key="dispatch_upload_file")
+uploaded_file = None
 
 def _normalize_coords(coords):
     if isinstance(coords, str):
@@ -1785,6 +1785,196 @@ def make_assignment_progress_callback(
     return callback
 
 
+def render_route_dashboard(route_summary: pd.DataFrame):
+    st.subheader("라우트 대시보드")
+    if not isinstance(route_summary, pd.DataFrame) or len(route_summary) == 0:
+        st.info("표시할 라우트 데이터가 없습니다.")
+        return
+
+    route_count = (
+        safe_int(route_summary["route"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique())
+        if "route" in route_summary.columns
+        else safe_int(len(route_summary))
+    )
+    small_total = safe_int(pd.to_numeric(route_summary.get("소형합", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    medium_total = safe_int(pd.to_numeric(route_summary.get("중형합", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    large_total = safe_int(pd.to_numeric(route_summary.get("대형합", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    if "총합" in route_summary.columns:
+        box_total = safe_int(pd.to_numeric(route_summary["총합"], errors="coerce").fillna(0).sum())
+    else:
+        box_total = small_total + medium_total + large_total
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("라우트개수", route_count)
+    m2.metric("박스총개수", box_total)
+    m3.metric("소형", small_total)
+    m4.metric("중형", medium_total)
+    m5.metric("대형", large_total)
+
+
+def render_coupang_assignment_panel(export_df: pd.DataFrame):
+    st.subheader("쿠팡 자동반영용 CSV 생성")
+    col1, col2 = st.columns(2)
+    with col1:
+        order_date = st.date_input(
+            "Order Date",
+            value=pd.Timestamp(default_order_date()).date(),
+            key="coupang_assign_order_date",
+        )
+    with col2:
+        registration_mode = st.selectbox(
+            "registration_mode",
+            ["new", "modify"],
+            index=0,
+            key="coupang_assign_registration_mode",
+        )
+
+    def render_downloads(source_df: pd.DataFrame, key_prefix: str):
+        driver_df, driver_source, driver_error = load_driver_records_for_assignment_input()
+        if driver_error:
+            st.error(driver_error)
+            return
+        try:
+            success_df, error_df = build_assign_input_df(
+                source_df,
+                driver_df,
+                order_date=pd.Timestamp(order_date).strftime("%Y-%m-%d"),
+                registration_mode=registration_mode,
+            )
+        except Exception as exc:
+            st.error(f"쿠팡 자동반영용 CSV 생성 실패: {exc}")
+            return
+
+        source_label = "Django Driver" if driver_source == "django" else "local drivers.csv fallback"
+        st.caption(f"기사 기준값: {source_label}")
+        st.caption(f"실행 대상 {len(success_df)}건 / 확인 필요 {len(error_df)}건")
+        if len(success_df) > 0:
+            st.download_button(
+                "coupang_assign_input.csv 다운로드",
+                data=success_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="coupang_assign_input.csv",
+                mime="text/csv",
+                key=f"{key_prefix}_success_download",
+            )
+        else:
+            st.warning("assign_bot 실행 대상 행이 없습니다.")
+        if len(error_df) > 0:
+            st.dataframe(error_df, use_container_width=True)
+            st.download_button(
+                "coupang_assign_errors.csv 다운로드",
+                data=error_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="coupang_assign_errors.csv",
+                mime="text/csv",
+                key=f"{key_prefix}_error_download",
+            )
+
+    if st.button("현재 배정 결과로 쿠팡 CSV 생성", key="coupang_assign_build_from_current"):
+        render_downloads(export_df.copy(), "coupang_assign_current")
+
+    status_placeholder = st.empty()
+    progress_bar_placeholder = st.empty()
+    render_assignment_progress_state(placeholder=status_placeholder)
+
+    def run_now(source_df: pd.DataFrame, key_prefix: str):
+        driver_df, driver_source, driver_error = load_driver_records_for_assignment_input()
+        if driver_error:
+            st.error(driver_error)
+            return
+        try:
+            success_df, error_df = build_assign_input_df(
+                source_df,
+                driver_df,
+                order_date=pd.Timestamp(order_date).strftime("%Y-%m-%d"),
+                registration_mode=registration_mode,
+            )
+        except Exception as exc:
+            st.error(f"Failed to prepare Coupang assignments: {exc}")
+            return
+
+        st.caption(f"Driver source: {'Django Driver' if driver_source == 'django' else 'local drivers.csv fallback'}")
+        if len(error_df) > 0:
+            st.error(f"Cannot run Coupang assignment because {len(error_df)} rows need review.")
+            st.dataframe(error_df, use_container_width=True)
+            return
+        if len(success_df) == 0:
+            st.warning("No Coupang assignment rows to run.")
+            return
+
+        try:
+            import importlib
+            import assign_bot as assign_bot_module
+            assign_bot_module = importlib.reload(assign_bot_module)
+            run_assignments_df = assign_bot_module.run_assignments_df
+        except Exception as exc:
+            st.error(f"Failed to load assign_bot: {exc}")
+            return
+
+        progress_bar = progress_bar_placeholder.progress(0)
+        progress_callback = make_assignment_progress_callback(
+            total_count=len(success_df),
+            base_date=pd.Timestamp(order_date).strftime("%Y-%m-%d"),
+            placeholder=status_placeholder,
+            progress_bar=progress_bar,
+        )
+        result_file_path = BASE_DIR / "assign_results.csv"
+        with st.spinner(f"Running Coupang assignment for {len(success_df)} rows..."):
+            try:
+                results_df = run_assignments_df(
+                    success_df,
+                    result_file=str(result_file_path),
+                    progress_callback=progress_callback,
+                    progress_interval=ASSIGNMENT_PROGRESS_NOTIFY_EVERY,
+                    raise_on_abort=False,
+                )
+            except Exception as exc:
+                progress_callback({
+                    "event": "aborted",
+                    "stage": "failed",
+                    "total": len(success_df),
+                    "completed": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "error": str(exc),
+                })
+                st.error(f"Coupang assignment aborted: {exc}")
+                return
+
+        st.session_state[f"{key_prefix}_results"] = results_df
+        latest_progress = st.session_state.get("assignment_progress_state", {})
+        failed_df = results_df[results_df["status"].astype(str) != "success"].copy()
+        if isinstance(latest_progress, dict) and latest_progress.get("status") == "aborted":
+            st.error(
+                "Coupang assignment aborted. "
+                f"Last stage: {latest_progress.get('last_stage', '')}, "
+                f"error: {latest_progress.get('last_exception_message', '')}"
+            )
+        elif len(failed_df) > 0:
+            st.error(f"Coupang assignment finished with {len(failed_df)} failed rows.")
+        else:
+            st.success(f"Coupang assignment completed: {len(results_df)} rows.")
+        st.caption(f"Intermediate results saved to {result_file_path}")
+        st.dataframe(results_df, use_container_width=True)
+
+    if st.button("쿠팡 자동반영 바로 실행", key="coupang_assign_run_current"):
+        run_now(export_df.copy(), "coupang_assign_current_run")
+
+    uploaded_assignment_csv = st.file_uploader(
+        "이미 내려받은 기사 배정표 CSV 업로드",
+        type=["csv"],
+        key="coupang_assign_uploaded_csv",
+    )
+    if uploaded_assignment_csv is not None and st.button(
+        "업로드 CSV로 쿠팡 CSV 생성",
+        key="coupang_assign_build_from_upload",
+    ):
+        try:
+            uploaded_assignment_df = pd.read_csv(uploaded_assignment_csv, dtype=str).fillna("")
+        except Exception as exc:
+            st.error(f"업로드 CSV 읽기 실패: {exc}")
+        else:
+            render_downloads(uploaded_assignment_df, "coupang_assign_upload")
+
+
 def build_driver_memo_report(grouped_delivery: pd.DataFrame) -> str:
     if len(grouped_delivery) == 0:
         return "[기사별 업체 메모]\n표시할 메모가 없습니다."
@@ -2585,7 +2775,7 @@ def build_cancel_management_df(grouped_delivery: pd.DataFrame, route_driver_map:
         "취소건수", "취소수량", "정산제외", "취소사유", "address_norm", "cancel_key",
     ]
     existing_cols = [c for c in cols if c in work_df.columns]
-    sort_cols = [c for c in ["assigned_driver", "origin_center", "milkrun_no", "route_prefix", "route", "house_order"] if c in work_df.columns]
+    sort_cols = [c for c in ["assigned_driver", "company_name", "milkrun_no", "route_prefix", "route", "house_order"] if c in work_df.columns]
     return work_df[existing_cols].sort_values(by=sort_cols).reset_index(drop=True)
 
 
@@ -4819,11 +5009,13 @@ latest_run_summary, latest_run_error = cached_load_latest_assignment_run_summary
 today_run_options, today_run_error = [], None
 recent_run_options, recent_run_error = [], None
 
-if uploaded_file is not None:
-    st.caption(f"업로드 파일: {uploaded_file.name}")
-
 with st.sidebar:
     st.subheader("백엔드 상태")
+    with st.expander("파일 업로드 / 관리", expanded=False):
+        uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx"], key="dispatch_upload_file")
+        if uploaded_file is not None:
+            st.caption(f"업로드 파일: {uploaded_file.name}")
+
     st.caption(f"Django API: {DJANGO_API_BASE_URL}")
     if driver_source == "django":
         st.success(f"기사 목록 연동됨 ({len(drivers)}명)")
@@ -5183,8 +5375,10 @@ recommended_groups_inputs_hash = build_recommended_groups_inputs_hash(
 )
 sync_recommended_groups_status_for_inputs(recommended_groups_inputs_hash)
 
-tab_basic, tab_recommend, tab_memo, tab_stats, tab_report = st.tabs(
-    ["\uae30\ubcf8", "\ucd94\ucc9c", "\uba54\ubaa8", "\ud1b5\uacc4", "\ubcf4\uace0"]
+render_route_dashboard(route_summary=route_summary)
+
+tab_basic, tab_recommend, tab_stats, tab_assign, tab_memo, tab_report = st.tabs(
+    ["기본", "추천", "통계", "할당", "메모", "보고"]
 )
 
 with tab_memo:
@@ -5354,14 +5548,6 @@ with tab_recommend:
         group_assignment_df = recommended_groups_projection["assignment_df"].copy(deep=True)
         if len(group_assignment_df) == 0:
             group_assignment_df = build_group_assignment_df(route_feature_df.copy(deep=True), recommended_group_map)
-        group_summary_df = build_group_summary_df(group_assignment_df)
-
-        st.subheader("추천그룹 요약")
-        if len(group_summary_df) == 0:
-            st.info("표시할 추천그룹 데이터가 없습니다.")
-        else:
-            st.dataframe(group_summary_df, use_container_width=True)
-
         with st.expander("추천그룹 수정", expanded=False):
             edit_map = default_group_edit_map(group_assignment_df)
             recommended_group_count = safe_int(recommended_groups_projection.get("group_count", 0))
@@ -5436,14 +5622,7 @@ with tab_recommend:
                     selected_filter=st.session_state.get("recommended_groups_selected_filter", "전체"),
                     meta={"source": "route_filter"},
                 )
-            group_map_result, group_map_grouped = build_group_map_data(
-                result_delivery.copy(deep=True),
-                grouped_delivery.copy(deep=True),
-                final_group_map,
-            )
-
             latest_assignment_df = build_group_assignment_df(route_feature_df.copy(deep=True), final_group_map)
-            group_detail_df = build_group_detail_stats_df(latest_assignment_df)
             assignment_store = st.session_state.get("assignment_store", {})
             assignment_store = render_group_driver_assignment_form(
                 route_summary=route_summary,
@@ -5455,71 +5634,6 @@ with tab_recommend:
             )
             st.session_state["assignment_store"] = assignment_store
 
-            st.subheader("추천그룹 지도")
-            selectable_groups = ["전체"] + group_detail_df["추천그룹"].astype(str).tolist()
-            current_selected_group_filter = str(st.session_state.get("recommended_groups_selected_filter", "전체") or "전체")
-            selected_group_index = selectable_groups.index(current_selected_group_filter) if current_selected_group_filter in selectable_groups else 0
-            selected_group_filter = st.selectbox(
-                "추천그룹 선택",
-                selectable_groups,
-                index=selected_group_index,
-                key="recommended_groups_selected_filter",
-            )
-
-            if selected_group_filter == "전체":
-                selected_info_df = group_detail_df.copy()
-                route_count = safe_int(selected_info_df["라우트개수"].sum())
-                box_total = safe_int(selected_info_df["박스총개수"].sum())
-                small_total = safe_int(selected_info_df["소형합"].sum())
-                medium_total = safe_int(selected_info_df["중형합"].sum())
-                large_total = safe_int(selected_info_df["대형합"].sum())
-            else:
-                selected_info_df = group_detail_df[group_detail_df["추천그룹"] == selected_group_filter]
-                if len(selected_info_df) == 0:
-                    route_count = box_total = small_total = medium_total = large_total = 0
-                else:
-                    row = selected_info_df.iloc[0]
-                    route_count = safe_int(row["라우트개수"])
-                    box_total = safe_int(row["박스총개수"])
-                    small_total = safe_int(row["소형합"])
-                    medium_total = safe_int(row["중형합"])
-                    large_total = safe_int(row["대형합"])
-
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("라우트개수", route_count)
-            m2.metric("박스총개수", box_total)
-            m3.metric("소형", small_total)
-            m4.metric("중형", medium_total)
-            m5.metric("대형", large_total)
-
-            st.caption("추천그룹 지도와 지표는 선택한 그룹 기준으로 표시됩니다.")
-
-            with st.spinner("추천그룹 지도 레이어 준비 중..."):
-                group_overlay_layers, group_default_center = build_group_overlay_layers(
-                    valid_result=group_map_result,
-                    valid_grouped=group_map_grouped,
-                    route_prefix_map=route_prefix_map,
-                    route_camp_map=route_camp_map,
-                    camp_coords=camp_coords,
-                    selected_group=selected_group_filter,
-                )
-            ensure_map_view_state(
-                dataset_key=active_dataset_key,
-                center_key="recommended_groups_map_center",
-                zoom_key="recommended_groups_map_zoom",
-                dataset_state_key="recommended_groups_map_dataset_key",
-                default_center=group_default_center,
-            )
-            render_stable_folium_map(
-                overlay_layers=group_overlay_layers,
-                key="dispatch_recommended_groups_map",
-                center_key="recommended_groups_map_center",
-                zoom_key="recommended_groups_map_zoom",
-                height=700,
-                fallback_flag_key="recommended_groups_map_dynamic_fallback",
-                use_spiderfier=True,
-            )
-
             with st.expander("기사 선호 예상 순위 (참고용)", expanded=False):
                 st.caption("추천그룹별 물량·스톱·예상시간·퍼짐 기준의 휴리스틱 참고 순위입니다.")
                 preference_df = build_driver_preference_df(route_feature_df.copy(deep=True), final_group_map)
@@ -5529,10 +5643,7 @@ with tab_recommend:
                 else:
                     st.dataframe(preference_display_df, use_container_width=True)
     else:
-        st.subheader("추천그룹 요약")
-        st.info("표시할 추천그룹 데이터가 없습니다. 새 업로드 데이터이거나 그룹 계산 전 상태면 '추천그룹 자동 추천 실행' 후 확인하세요.")
-        with st.expander("기사 선호 예상 순위 (참고용)", expanded=False):
-            st.info("표시할 선호예상 데이터가 없습니다.")
+        pass
 
 with tab_basic:
     summary_container = st.container()
@@ -5677,32 +5788,6 @@ with tab_basic:
                 )
         components.html(main_map_html, height=900, scrolling=True)
 
-        if st.button("다운로드용 HTML 지도 생성/갱신", key="build_download_map_html"):
-            with st.spinner("다운로드용 HTML 지도 생성 중..."):
-                get_static_map_html(
-                    cache_key=static_map_cache_key,
-                    html_filename=html_filename,
-                    valid_result=valid_result,
-                    valid_grouped=valid_grouped,
-                    route_prefix_map=route_prefix_map,
-                    truck_request_map=truck_request_map,
-                    route_line_label=route_line_label,
-                    route_driver_map=route_driver_map,
-                    route_camp_map=route_camp_map,
-                    camp_coords=camp_coords,
-                )
-
-        download_map_html = get_cached_static_map_html(static_map_cache_key)
-        if download_map_html:
-            st.download_button(
-                label=f"지도 다운로드 (HTML) - {html_filename}",
-                data=download_map_html,
-                file_name=html_filename,
-                mime="text/html"
-            )
-        else:
-            st.caption("HTML 지도 다운로드가 필요할 때만 생성 버튼을 눌러 주세요.")
-
 with tab_stats:
     recommended_groups_projection_for_view = get_recommended_groups_projection(
         recommended_groups_route_feature_df.copy(deep=True),
@@ -5729,16 +5814,15 @@ with tab_stats:
     check_live_today_stats_consistency(assignment_df, stats_df)
 
     st.subheader("기사별 배정 통계")
-    with st.expander("기사별 배정 통계 (최근 7일/30일)", expanded=True):
-        st.caption("오늘물량은 현재 화면의 최신 배정 기준이고, 최근근무일/7일/30일 평균은 assignment_history.csv 이력 기준입니다.")
-        if recent_work_date_str:
-            st.caption(f"최근근무일(1일) 기준일: {recent_work_date_str}")
-        else:
-            st.caption("최근근무일(1일) 기준일: 없음")
-        if len(stats_df) == 0:
-            st.info("표시할 기사 통계가 없습니다.")
-        else:
-            st.dataframe(stats_df, use_container_width=True)
+    st.caption("오늘물량은 현재 화면의 최신 배정 기준이고, 최근근무일/7일/30일 평균은 assignment_history.csv 이력 기준입니다.")
+    if recent_work_date_str:
+        st.caption(f"최근근무일(1일) 기준일: {recent_work_date_str}")
+    else:
+        st.caption("최근근무일(1일) 기준일: 없음")
+    if len(stats_df) == 0:
+        st.info("표시할 기사 통계가 없습니다.")
+    else:
+        st.dataframe(stats_df, use_container_width=True)
 
     st.caption(f"배정 이력 저장 기준일: {base_date_str} (동일 날짜 재저장 시 덮어쓰기)")
     if st.button("배정 이력 저장"):
@@ -5887,13 +5971,13 @@ with tab_stats:
         external_box_total = safe_int(assigned_box_rows.loc[~nasil_driver_mask, "box_total"].sum())
 
     telegram_summary_text = (
-        f"[배차 저장 완료]\n"
-        f"기준일: {base_date_str}\n"
-        f"총박스: {total_box_total}\n"
-        f"나실 할당: {nasil_box_total}\n"
-        f"기사 할당: {external_box_total}\n"
-        f"오늘 근무기사님 인원수: {safe_int(view_assignment_df['assigned_driver'].fillna('').astype(str).str.strip().replace('', pd.NA).dropna().nunique()) if len(view_assignment_df) > 0 and 'assigned_driver' in view_assignment_df.columns else 0}\n"
-        f"공유지도: {share_url}"
+        f"[배차 완료]\n"
+        f"기준📅: {base_date_str}\n"
+        f"전체📦: {total_box_total}\n"
+        f"나실🚚: {nasil_box_total}\n"
+        f"기사🚛: {external_box_total}\n"
+        f"근무👥: {safe_int(view_assignment_df['assigned_driver'].fillna('').astype(str).str.strip().replace('', pd.NA).dropna().nunique()) if len(view_assignment_df) > 0 and 'assigned_driver' in view_assignment_df.columns else 0}\n"
+        f"지도🧭: {share_url}"
     )
     telegram_memo_text = build_driver_memo_report(shared_grouped_delivery)
 
@@ -5947,171 +6031,8 @@ with tab_stats:
         mime="text/csv"
     )
 
-    with st.expander("쿠팡 자동반영용 CSV 생성", expanded=False):
-        coupang_col1, coupang_col2 = st.columns(2)
-        with coupang_col1:
-            coupang_order_date = st.date_input(
-                "Order Date",
-                value=pd.Timestamp(default_order_date()).date(),
-                key="coupang_assign_order_date",
-            )
-        with coupang_col2:
-            coupang_registration_mode = st.selectbox(
-                "registration_mode",
-                ["new", "modify"],
-                index=0,
-                key="coupang_assign_registration_mode",
-            )
-
-        def render_coupang_assign_downloads(source_df: pd.DataFrame, key_prefix: str):
-            driver_records_for_assign_df, driver_records_for_assign_source, driver_records_error = load_driver_records_for_assignment_input()
-            if driver_records_error:
-                st.error(driver_records_error)
-                return
-
-            try:
-                success_df, error_df = build_assign_input_df(
-                    source_df,
-                    driver_records_for_assign_df,
-                    order_date=pd.Timestamp(coupang_order_date).strftime("%Y-%m-%d"),
-                    registration_mode=coupang_registration_mode,
-                )
-            except Exception as exc:
-                st.error(f"쿠팡 자동반영용 CSV 생성 실패: {exc}")
-                return
-
-            source_label = "Django Driver" if driver_records_for_assign_source == "django" else "local drivers.csv fallback"
-            st.caption(f"기사 기준값: {source_label}")
-            st.caption(f"실행 대상 {len(success_df)}건 / 확인 필요 {len(error_df)}건")
-            if len(success_df) > 0:
-                st.download_button(
-                    "coupang_assign_input.csv 다운로드",
-                    data=success_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-                    file_name="coupang_assign_input.csv",
-                    mime="text/csv",
-                    key=f"{key_prefix}_success_download",
-                )
-            else:
-                st.warning("assign_bot 실행 대상 행이 없습니다.")
-
-            if len(error_df) > 0:
-                st.dataframe(error_df, use_container_width=True)
-                st.download_button(
-                    "coupang_assign_errors.csv 다운로드",
-                    data=error_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-                    file_name="coupang_assign_errors.csv",
-                    mime="text/csv",
-                    key=f"{key_prefix}_error_download",
-                )
-
-        if st.button("현재 배정 결과로 쿠팡 CSV 생성", key="coupang_assign_build_from_current"):
-            render_coupang_assign_downloads(export_df.copy(), "coupang_assign_current")
-
-        render_assignment_progress_state()
-
-        def run_coupang_assignments_now(source_df: pd.DataFrame, key_prefix: str):
-            driver_records_for_assign_df, driver_records_for_assign_source, driver_records_error = load_driver_records_for_assignment_input()
-            if driver_records_error:
-                st.error(driver_records_error)
-                return
-
-            try:
-                success_df, error_df = build_assign_input_df(
-                    source_df,
-                    driver_records_for_assign_df,
-                    order_date=pd.Timestamp(coupang_order_date).strftime("%Y-%m-%d"),
-                    registration_mode=coupang_registration_mode,
-                )
-            except Exception as exc:
-                st.error(f"Failed to prepare Coupang assignments: {exc}")
-                return
-
-            source_label = "Django Driver" if driver_records_for_assign_source == "django" else "local drivers.csv fallback"
-            st.caption(f"Driver source: {source_label}")
-
-            if len(error_df) > 0:
-                st.error(f"Cannot run Coupang assignment because {len(error_df)} rows need review.")
-                st.dataframe(error_df, use_container_width=True)
-                return
-            if len(success_df) == 0:
-                st.warning("No Coupang assignment rows to run.")
-                return
-
-            try:
-                import importlib
-                import assign_bot as assign_bot_module
-                assign_bot_module = importlib.reload(assign_bot_module)
-                run_assignments_df = assign_bot_module.run_assignments_df
-            except Exception as exc:
-                st.error(f"Failed to load assign_bot: {exc}")
-                return
-
-            progress_placeholder = st.empty()
-            progress_bar = st.progress(0)
-            progress_callback = make_assignment_progress_callback(
-                total_count=len(success_df),
-                base_date=pd.Timestamp(coupang_order_date).strftime("%Y-%m-%d"),
-                placeholder=progress_placeholder,
-                progress_bar=progress_bar,
-            )
-            result_file_path = BASE_DIR / "assign_results.csv"
-
-            with st.spinner(f"Running Coupang assignment for {len(success_df)} rows..."):
-                try:
-                    results_df = run_assignments_df(
-                        success_df,
-                        result_file=str(result_file_path),
-                        progress_callback=progress_callback,
-                        progress_interval=ASSIGNMENT_PROGRESS_NOTIFY_EVERY,
-                        raise_on_abort=False,
-                    )
-                except Exception as exc:
-                    progress_callback({
-                        "event": "aborted",
-                        "stage": "failed",
-                        "total": len(success_df),
-                        "completed": 0,
-                        "success_count": 0,
-                        "failure_count": 0,
-                        "error": str(exc),
-                    })
-                    st.error(f"Coupang assignment aborted: {exc}")
-                    return
-
-            st.session_state[f"{key_prefix}_results"] = results_df
-            latest_progress = st.session_state.get("assignment_progress_state", {})
-            failed_df = results_df[results_df["status"].astype(str) != "success"].copy()
-            if isinstance(latest_progress, dict) and latest_progress.get("status") == "aborted":
-                st.error(
-                    "Coupang assignment aborted. "
-                    f"Last stage: {latest_progress.get('last_stage', '')}, "
-                    f"error: {latest_progress.get('last_exception_message', '')}"
-                )
-            elif len(failed_df) > 0:
-                st.error(f"Coupang assignment finished with {len(failed_df)} failed rows.")
-            else:
-                st.success(f"Coupang assignment completed: {len(results_df)} rows.")
-            st.caption(f"Intermediate results saved to {result_file_path}")
-            st.dataframe(results_df, use_container_width=True)
-
-        if st.button("쿠팡 자동반영 바로 실행", key="coupang_assign_run_current"):
-            run_coupang_assignments_now(export_df.copy(), "coupang_assign_current_run")
-
-        uploaded_assignment_csv = st.file_uploader(
-            "이미 내려받은 기사 배정표 CSV 업로드",
-            type=["csv"],
-            key="coupang_assign_uploaded_csv",
-        )
-        if uploaded_assignment_csv is not None and st.button(
-            "업로드 CSV로 쿠팡 CSV 생성",
-            key="coupang_assign_build_from_upload",
-        ):
-            try:
-                uploaded_assignment_df = pd.read_csv(uploaded_assignment_csv, dtype=str).fillna("")
-            except Exception as exc:
-                st.error(f"업로드 CSV 읽기 실패: {exc}")
-            else:
-                render_coupang_assign_downloads(uploaded_assignment_df, "coupang_assign_upload")
+with tab_assign:
+    render_coupang_assignment_panel(export_df)
 
 with tab_report:
     st.divider()
@@ -6135,6 +6056,54 @@ with tab_report:
                 (visible_cancel_df["취소수량"] > 0)
                 | visible_settlement_excluded
                 | (visible_cancel_df["취소사유"].astype(str).str.strip() != "")
+            ].copy()
+
+        with st.form("report_search_form", clear_on_submit=False):
+            search_col1, search_col2, search_col3 = st.columns([1.4, 1.4, 0.4])
+            with search_col1:
+                report_milkrun_search = st.text_input(
+                    "밀크런번호 검색",
+                    key="report_milkrun_search",
+                    placeholder="밀크런번호",
+                ).strip()
+            with search_col2:
+                report_company_search = st.text_input(
+                    "업체명 검색",
+                    key="report_company_search",
+                    placeholder="업체명",
+                ).strip()
+            with search_col3:
+                st.write("")
+                st.form_submit_button("검색 적용")
+
+        def _normalized_report_search_series(df: pd.DataFrame, column: str) -> pd.Series:
+            if column not in df.columns:
+                return pd.Series("", index=df.index, dtype="object")
+            return (
+                df[column]
+                .fillna("")
+                .astype(str)
+                .str.replace(r"\s+", "", regex=True)
+                .str.casefold()
+            )
+
+        if report_milkrun_search and "milkrun_no" in visible_cancel_df.columns:
+            report_milkrun_query = re.sub(r"\s+", "", report_milkrun_search).casefold()
+            visible_cancel_df = visible_cancel_df[
+                _normalized_report_search_series(visible_cancel_df, "milkrun_no").str.contains(
+                    re.escape(report_milkrun_query),
+                    na=False,
+                    regex=True,
+                )
+            ].copy()
+        if report_company_search and "company_name" in visible_cancel_df.columns:
+            report_company_query = re.sub(r"\s+", "", report_company_search).casefold()
+            visible_cancel_df = visible_cancel_df[
+                _normalized_report_search_series(visible_cancel_df, "company_name").str.contains(
+                    re.escape(report_company_query),
+                    na=False,
+                    regex=True,
+                )
             ].copy()
 
         report_export_df = build_report_export_df(cancel_df)
@@ -6216,7 +6185,7 @@ with tab_report:
             st.session_state["cancel_store"] = updated_store
             st.success("취소건 관리 내용을 저장했습니다.")
 
-        with st.expander("취소 입력 요약", expanded=False):
+        with st.expander("취소 입력 요약", expanded=True):
             saved_cancel_df = build_cancel_management_df(
                 grouped_delivery=grouped_delivery,
                 route_driver_map=route_driver_map,
