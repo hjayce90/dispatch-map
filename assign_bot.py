@@ -92,8 +92,8 @@ def env_bool(name, default=False):
         return False
     return bool(default)
 
-# 기본은 서버에서 창을 띄우지 않고 실행 후 Chrome을 닫는다.
-HEADLESS = env_bool("COUPANG_ASSIGN_HEADLESS", True)
+# 쿠팡 인증 페이지가 headless Chrome을 차단할 수 있어 기본은 일반 창으로 실행한다.
+HEADLESS = env_bool("COUPANG_ASSIGN_HEADLESS", False)
 DETACH_BROWSER = env_bool("COUPANG_ASSIGN_DETACH_BROWSER", False)
 
 STEP_SLEEP = 1.0
