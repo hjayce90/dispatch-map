@@ -4021,17 +4021,19 @@ def build_pickup_map_grouped_df(
     def _popup(row):
         memo = str(row.get("customer_memo", "") or "").strip()
         memo_html = f"<br><b>메모:</b> {html.escape(memo)}" if memo else ""
+        small_qty = safe_int(row.get("ae_sum", 0))
+        medium_qty = safe_int(row.get("af_sum", 0))
+        large_qty = safe_int(row.get("ag_sum", 0))
         return f"""
         <div style="min-width:280px;max-width:400px;line-height:1.5;">
             <b>루트:</b> {html.escape(str(row.get('route', '')))}<br>
+            <b>구분:</b> {html.escape(str(row.get('route_prefix', '') or '-'))}<br>
             <b>기사:</b> {html.escape(str(row.get('assigned_driver', '') or '미배정'))}<br>
             <b>방문예정시간:</b> {html.escape(clean_map_text(row.get('first_time', '')) or '-')}<br>
             <b>업체명:</b> {html.escape(str(row.get('company_name', '') or '-'))}<br>
             <b>주소:</b> {html.escape(str(row.get('address', '') or '-'))}<br>
             <b>총박스:</b> {safe_int(row.get('box_total', 0))}<br>
-            <b>소:</b> {safe_int(row.get('ae_sum', 0))}<br>
-            <b>중:</b> {safe_int(row.get('af_sum', 0))}<br>
-            <b>대:</b> {safe_int(row.get('ag_sum', 0))}<br>
+            <b>소중대:</b> {small_qty}/{medium_qty}/{large_qty}<br>
             <b>총건수:</b> {safe_int(row.get('stop_count', 0))}<br>
             <b>캠프:</b> {html.escape(str(row.get('camp_name', '') or '-'))}
             {memo_html}
@@ -4264,10 +4266,12 @@ def build_dispatch_overlay_layers(
                 bundle_html = f"<br>동일 route 동일 주소 {bundle_count}건 묶음" if bundle_count > 1 else ""
                 overlap_html = f"<br>동일위치 {overlap_count}건" if overlap_count > 1 else ""
                 popup_html = (
-                    f"<b>{row.get('route', '')}</b> / {driver_name or '미배정'}<br>"
+                    f"<b>루트:</b> {row.get('route', '')}<br>"
+                    f"<b>구분:</b> {row.get('route_prefix', '') or stop_label}<br>"
+                    f"<b>기사:</b> {driver_name or '미배정'}<br>"
                     f"{row.get('company_name', '')}<br>"
                     f"{row.get('address', '')}<br>"
-                    f"물량 {safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}"
+                    f"소중대: {safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}"
                     f"{memo_html}{bundle_html}{overlap_html}"
                 )
                 tooltip_text = (
@@ -4404,7 +4408,7 @@ def build_dispatch_overlay_layers(
                 <b>업체메모:</b> {str(row.get('customer_memo', '')).strip() or '-'}<br>
                 <b>집순서:</b> {safe_int(row['house_order'])}/{safe_int(row['route_total'])}<br>
                 <b>건수:</b> {safe_int(row['stop_count'])}<br>
-                <b>물량:</b> {safe_int(row['ae_sum'])}.{safe_int(row['af_sum'])}.{safe_int(row['ag_sum'])}<br>
+                <b>소중대:</b> {safe_int(row['ae_sum'])}/{safe_int(row['af_sum'])}/{safe_int(row['ag_sum'])}<br>
                 {overlap_detail}
             </div>
             """
@@ -4567,9 +4571,11 @@ def build_group_overlay_layers(
             popup_html = f"""
             <div style="min-width:280px;max-width:380px;line-height:1.45;">
                 <b>추천그룹:</b> {str(row.get('추천그룹', '')).replace('추천그룹 ', '추천그룹')}<br>
+                <b>루트:</b> {row.get('route', '')}<br>
+                <b>구분:</b> {row.get('route_prefix', '')}<br>
                 <b>주소:</b> {row.get('address', '')}<br>
                 <b>업체명:</b> {row.get('company_name', '')}<br>
-                <b>물량(소/중/대):</b> {safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}
+                <b>소중대:</b> {safe_int(row.get('ae_sum', 0))}/{safe_int(row.get('af_sum', 0))}/{safe_int(row.get('ag_sum', 0))}
             </div>
             """
 
